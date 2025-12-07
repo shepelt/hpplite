@@ -23,6 +23,9 @@ if(HPPLITE_ENABLE_ZMQ)
     endif()
 endif()
 
+# libcurl (for M3 Web3 integration)
+pkg_check_modules(CURL REQUIRED libcurl)
+
 # Find threads
 find_package(Threads REQUIRED)
 
@@ -64,6 +67,12 @@ set(HPPLITE_SOURCES
     crypto.c
     node.c
     l1_mock.c
+    # M3 Web3 integration
+    cJSON.c
+    keccak256.c
+    rlp.c
+    abi.c
+    eth_client.c
 )
 
 # Add ZMQ networking source if enabled
@@ -76,6 +85,7 @@ add_library(hpplite STATIC ${HPPLITE_SOURCES})
 target_include_directories(hpplite PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${SECP256K1_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
 )
 
 target_compile_definitions(hpplite PUBLIC
@@ -91,6 +101,7 @@ endif()
 target_link_libraries(hpplite PUBLIC
     sqlite3
     ${SECP256K1_LIBRARIES}
+    ${CURL_LIBRARIES}
 )
 
 # Add ZMQ libraries
@@ -101,6 +112,7 @@ endif()
 
 target_link_directories(hpplite PUBLIC
     ${SECP256K1_LIBRARY_DIRS}
+    ${CURL_LIBRARY_DIRS}
 )
 
 # Test executables
@@ -143,6 +155,17 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_m2_nodes hpplite Threads::Threads)
     endif()
 
+    # M3 Web3 tests (isolated, no network required)
+    add_executable(test_keccak test_keccak.c keccak256.c)
+
+    add_executable(test_rlp test_rlp.c rlp.c)
+
+    add_executable(test_abi test_abi.c abi.c keccak256.c)
+
+    # M3 eth_client test (requires network)
+    add_executable(test_eth_client test_eth_client.c)
+    target_link_libraries(test_eth_client hpplite)
+
     # Add tests to CTest
     enable_testing()
     add_test(NAME test_hpplite COMMAND test_hpplite)
@@ -156,6 +179,12 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_m2_multiprocess COMMAND test_m2_multiprocess)
         add_test(NAME test_m2_nodes COMMAND test_m2_nodes)
     endif()
+
+    # M3 Web3 tests (no network required)
+    add_test(NAME test_keccak COMMAND test_keccak)
+    add_test(NAME test_rlp COMMAND test_rlp)
+    add_test(NAME test_abi COMMAND test_abi)
+    # Note: test_eth_client requires network, not in ctest
 endif()
 
 # Benchmarks (not in ctest, run with 'make speedtest')
@@ -175,6 +204,7 @@ message(STATUS "")
 message(STATUS "HPPLite Configuration:")
 message(STATUS "  SQLite dir: ${SQLITE_DIR}")
 message(STATUS "  secp256k1: ${SECP256K1_LIBRARIES}")
+message(STATUS "  libcurl: ${CURL_LIBRARIES}")
 message(STATUS "  ZeroMQ: ${HPPLITE_ENABLE_ZMQ}")
 message(STATUS "  Build tests: ${HPPLITE_BUILD_TESTS}")
 message(STATUS "")
