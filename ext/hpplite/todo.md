@@ -125,29 +125,32 @@ Real Ethereum L1, owner-controlled contract
 
 ## Milestone 3 Tasks ← CURRENT
 
-### L1 Contract (Solidity)
-- [ ] HPPLite.sol - owner-controlled membership
+### L1 Contract (Solidity) ✓
+- [x] HPPLite.sol - owner-controlled membership
   - `owner` - contract admin
   - `setSequencer(address)` - owner only
   - `addWitness(address)` / `removeWitness(address)` - owner only
   - `submitCheckpoint(...)` - sequencer only
   - `getState()` - public view (sequencer, witnesses, config)
-- [ ] Deploy script (hardhat or foundry)
-- [ ] Test on local devnet (anvil/hardhat node)
+- [x] Deploy script (Foundry)
+- [x] Test suite (13/13 passing)
 
-### Web3 Integration (C)
-- [ ] Ethereum JSON-RPC client (minimal, C-based)
+### Web3 Integration (C) ✓
+- [x] Ethereum JSON-RPC client (`eth_client.c`)
   - `eth_call` - read contract state
   - `eth_sendRawTransaction` - submit checkpoints
   - `eth_getTransactionReceipt` - confirm tx
-- [ ] Transaction signing (secp256k1 + RLP encoding)
-- [ ] ABI encoding/decoding for contract calls
+- [x] Keccak-256 hashing (`keccak256.c`)
+- [x] RLP encoding (`rlp.c`)
+- [x] ABI encoding/decoding (`abi.c`)
+- [x] cJSON vendored for JSON parsing
+- [x] Tests: test_keccak, test_rlp, test_abi, test_eth_client
+- [x] Tested against anvil and HPP Sepolia
 
 ### Node Integration
-- [ ] Replace L1 mock with real L1 client
-- [ ] Config file for RPC endpoint, contract address, keyfile
-- [ ] Test against local devnet (anvil)
-- [ ] Test against testnet (Sepolia)
+- [ ] Replace L1 mock with real L1 client (l1_eth.c)
+- [ ] Deploy contract to HPP Sepolia
+- [ ] End-to-end test with real L1
 
 ---
 
@@ -164,20 +167,20 @@ ext/hpplite/
 ├── l1_mock.c            # L1 mock implementation (M1 shared memory)
 ├── l1_service.h/c       # L1 mock ZMQ service (M2 multi-process)
 ├── zmq_transport.h/c    # ZeroMQ transport layer (M2)
+├── eth_client.h/c       # Ethereum JSON-RPC client (M3)
+├── keccak256.h/c        # Keccak-256 hashing (M3)
+├── rlp.h/c              # RLP encoding (M3)
+├── abi.h/c              # ABI encoding/decoding (M3)
+├── cJSON.h/c            # JSON parser (vendored, M3)
+├── contracts/           # Solidity contracts (M3)
+│   ├── src/HPPLite.sol
+│   ├── test/HPPLite.t.sol
+│   └── script/Deploy.s.sol
+├── .env.example         # Config template
 ├── hpplite_rollup.md    # Rollup model documentation
 ├── todo.md              # This file
 ├── test_*.c             # Tests (run via ctest)
-│   ├── test_hpplite.c
-│   ├── test_batch.c
-│   ├── test_sequencer.c
-│   ├── test_integrated.c
-│   ├── test_node.c
-│   ├── test_l1_mock.c
-│   ├── test_m1_integration.c
-│   ├── test_m2_multiprocess.c
-│   └── test_m2_nodes.c
 └── bench_*.c            # Benchmarks (run via make speedtest)
-    └── bench_replay.c
 ```
 
 ## Key Concepts
@@ -203,6 +206,6 @@ ctest --output-on-failure   # Run tests (9/9 passing)
 make speedtest              # Run benchmark (optional)
 ```
 
-**Dependencies:** CMake, pkg-config, libsecp256k1, libzmq (required for M2+)
+**Dependencies:** CMake, pkg-config, libsecp256k1, libzmq, libcurl
 
-**Test status:** 9/9 passing | **Benchmark:** ~1500 batches/sec
+**Test status:** 12/12 passing | **Benchmark:** ~1500 batches/sec
