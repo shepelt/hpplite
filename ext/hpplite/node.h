@@ -16,6 +16,10 @@
 #include "l1_interface.h"
 #include <stdint.h>
 
+#ifdef HPPLITE_ENABLE_ZMQ
+#include "zmq_transport.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -78,7 +82,7 @@ typedef struct HppliteNodeConfig {
     char *dbPath;                   /* SQLite database path */
 
     /* Network */
-    char *bindAddress;              /* Address to bind (e.g., "tcp://*:5555") */
+    char *bindAddress;              /* Address to bind, e.g. tcp on port 5555 */
     char *sequencerAddress;         /* Sequencer address to connect to */
 
     /* Thresholds */
@@ -112,11 +116,9 @@ typedef struct HppliteNode {
     HppliteKeypair keypair;
 
     /* Networking (ZeroMQ) */
-    void *zmqContext;
-    void *zmqPublisher;     /* PUB socket (sequencer broadcasts) */
-    void *zmqSubscriber;    /* SUB socket (witness receives) */
-    void *zmqDealer;        /* DEALER socket (send attestations) */
-    void *zmqRouter;        /* ROUTER socket (receive attestations) */
+#ifdef HPPLITE_ENABLE_ZMQ
+    HppliteZmqTransport *zmqTransport;
+#endif
 
     /* Sequencer state */
     HpplitePendingCommit *pendingCommits;

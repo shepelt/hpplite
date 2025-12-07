@@ -6,6 +6,9 @@
 */
 
 #include "node.h"
+#ifdef HPPLITE_ENABLE_ZMQ
+#include "zmq_transport.h"
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -199,6 +202,59 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node);
 }
 
+#ifdef HPPLITE_ENABLE_ZMQ
+/*
+** ZMQ callback: batch received (witness side)
+*/
+static void on_zmq_batch(void *arg, HppliteBatch *batch, const char *batchRef) {
+    HppliteNode *node = (HppliteNode*)arg;
+    if (!node || !batch) return;
+
+    /* Verify the batch */
+    hpplite_node_verify_batch(node, batch, batchRef);
+}
+
+/*
+** ZMQ callback: attestation received (sequencer side)
+*/
+static void on_zmq_attestation(void *arg, const unsigned char *data, int dataLen) {
+    HppliteNode *node = (HppliteNode*)arg;
+    HppliteAttestation *att;
+
+    if (!node || !data) return;
+
+    /* Parse attestation message */
+    att = hpplite_node_parse_attestation_msg(data, dataLen);
+    if (att) {
+        hpplite_node_receive_attestation(node, att);
+        free_attestation(att);
+    }
+}
+
+/*
+** ZMQ callback: checkpoint received (witness side)
+*/
+static void on_zmq_checkpoint(void *arg, HppliteCheckpoint *cp) {
+    HppliteNode *node = (HppliteNode*)arg;
+    if (!node || !cp) return;
+
+    /* Attest the checkpoint if we've verified all batches */
+    hpplite_node_attest_checkpoint(node, cp);
+
+    /* Note: caller frees cp */
+}
+
+/*
+** ZMQ callback: checkpoint attestation received (sequencer side)
+*/
+static void on_zmq_cp_attestation(void *arg, const HppliteCheckpointAttestation *att) {
+    HppliteNode *node = (HppliteNode*)arg;
+    if (!node || !att) return;
+
+    hpplite_node_receive_checkpoint_attestation(node, att);
+}
+#endif /* HPPLITE_ENABLE_ZMQ */
+
 /*
 ** Set node role (sequencer or witness).
 */
@@ -223,16 +279,77 @@ int hpplite_node_start(HppliteNode *node) {
     if (!node) return -1;
     if (node->state == HPPLITE_STATE_RUNNING) return 0;
 
-    /* TODO: Initialize ZeroMQ sockets based on role */
-    /*
-    if (node->role == HPPLITE_ROLE_SEQUENCER) {
-        // Create PUB socket for broadcasting batches
-        // Create ROUTER socket for receiving attestations
-    } else if (node->role == HPPLITE_ROLE_WITNESS) {
-        // Create SUB socket for receiving batches
-        // Create DEALER socket for sending attestations
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Initialize ZeroMQ transport based on role */
+    if (node->config.bindAddress || node->config.sequencerAddress) {
+        HppliteZmqConfig zmqConfig;
+        memset(&zmqConfig, 0, sizeof(zmqConfig));
+        zmqConfig.identity = node->config.nodeId;
+        zmqConfig.recvTimeout = node->config.batchTimeoutMs;
+
+        if (node->role == HPPLITE_ROLE_SEQUENCER && node->config.bindAddress) {
+            /* Parse bind address for PUB and ROUTER ports */
+            /* Assume format "tcp://addr:PORT" - ROUTER will be PORT+1 */
+            zmqConfig.pubEndpoint = node->config.bindAddress;
+
+            /* Auto-increment port for ROUTER socket */
+            const char *lastColon = strrchr(node->config.bindAddress, ':');
+            if (lastColon) {
+                int port = atoi(lastColon + 1);
+                int prefixLen = (int)(lastColon - node->config.bindAddress);
+                char *routerEndpoint = sqlite3_mprintf("%.*s:%d", prefixLen,
+                    node->config.bindAddress, port + 1);
+                zmqConfig.routerEndpoint = routerEndpoint;
+            } else {
+                zmqConfig.routerEndpoint = node->config.bindAddress;
+            }
+
+            node->zmqTransport = hpplite_zmq_create_sequencer(&zmqConfig);
+            if (!node->zmqTransport) {
+                return -1;
+            }
+
+            /* Set callbacks */
+            hpplite_zmq_set_callbacks(
+                node->zmqTransport,
+                node,
+                NULL,  /* Sequencer doesn't receive batches */
+                on_zmq_attestation,
+                NULL,  /* Sequencer doesn't receive checkpoints */
+                on_zmq_cp_attestation
+            );
+        } else if (node->role == HPPLITE_ROLE_WITNESS && node->config.sequencerAddress) {
+            zmqConfig.sequencerPubAddr = node->config.sequencerAddress;
+
+            /* Auto-increment port for ROUTER connection */
+            const char *lastColon = strrchr(node->config.sequencerAddress, ':');
+            if (lastColon) {
+                int port = atoi(lastColon + 1);
+                int prefixLen = (int)(lastColon - node->config.sequencerAddress);
+                char *routerAddr = sqlite3_mprintf("%.*s:%d", prefixLen,
+                    node->config.sequencerAddress, port + 1);
+                zmqConfig.sequencerRouterAddr = routerAddr;
+            } else {
+                zmqConfig.sequencerRouterAddr = node->config.sequencerAddress;
+            }
+
+            node->zmqTransport = hpplite_zmq_create_witness(&zmqConfig);
+            if (!node->zmqTransport) {
+                return -1;
+            }
+
+            /* Set callbacks */
+            hpplite_zmq_set_callbacks(
+                node->zmqTransport,
+                node,
+                on_zmq_batch,
+                NULL,  /* Witness doesn't receive attestations */
+                on_zmq_checkpoint,
+                NULL   /* Witness doesn't receive cp attestations */
+            );
+        }
     }
-    */
+#endif
 
     node->state = HPPLITE_STATE_RUNNING;
     return 0;
@@ -245,14 +362,13 @@ void hpplite_node_stop(HppliteNode *node) {
     if (!node) return;
     if (node->state != HPPLITE_STATE_RUNNING) return;
 
-    /* TODO: Close ZeroMQ sockets */
-    /*
-    if (node->zmqPublisher) zmq_close(node->zmqPublisher);
-    if (node->zmqSubscriber) zmq_close(node->zmqSubscriber);
-    if (node->zmqDealer) zmq_close(node->zmqDealer);
-    if (node->zmqRouter) zmq_close(node->zmqRouter);
-    if (node->zmqContext) zmq_ctx_destroy(node->zmqContext);
-    */
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Destroy ZeroMQ transport */
+    if (node->zmqTransport) {
+        hpplite_zmq_destroy(node->zmqTransport);
+        node->zmqTransport = NULL;
+    }
+#endif
 
     node->state = HPPLITE_STATE_STOPPED;
 }
@@ -265,26 +381,17 @@ int hpplite_node_process(HppliteNode *node, int timeoutMs) {
 
     if (!node || node->state != HPPLITE_STATE_RUNNING) return -1;
 
-    (void)timeoutMs; /* TODO: use for zmq_poll timeout */
-
-    /* TODO: Poll ZeroMQ sockets and process messages */
-    /*
-    zmq_pollitem_t items[] = {
-        { node->zmqSubscriber, 0, ZMQ_POLLIN, 0 },
-        { node->zmqRouter, 0, ZMQ_POLLIN, 0 },
-    };
-    int rc = zmq_poll(items, 2, timeoutMs);
-    if (rc > 0) {
-        if (items[0].revents & ZMQ_POLLIN) {
-            // Handle incoming batch (witness)
-            eventsProcessed++;
-        }
-        if (items[1].revents & ZMQ_POLLIN) {
-            // Handle incoming attestation (sequencer)
-            eventsProcessed++;
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Poll ZeroMQ transport for incoming messages */
+    if (node->zmqTransport) {
+        int rc = hpplite_zmq_poll(node->zmqTransport, timeoutMs);
+        if (rc > 0) {
+            eventsProcessed += rc;
         }
     }
-    */
+#else
+    (void)timeoutMs;
+#endif
 
     /* Check for pending commits that have enough attestations */
     if (node->role == HPPLITE_ROLE_SEQUENCER) {
@@ -395,15 +502,12 @@ uint64_t hpplite_node_flush_batch(HppliteNode *node) {
         node->onBatchProduced(node->callbackArg, batch);
     }
 
-    /* TODO: Broadcast batch to witnesses via ZeroMQ */
-    /*
-    int msgSize;
-    unsigned char *msg = hpplite_node_serialize_batch_msg(node, batch, batchRef, &msgSize);
-    if (msg) {
-        zmq_send(node->zmqPublisher, msg, msgSize, 0);
-        sqlite3_free(msg);
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Broadcast batch to witnesses via ZeroMQ */
+    if (node->zmqTransport) {
+        hpplite_zmq_broadcast_batch(node->zmqTransport, batch, batchRef);
     }
-    */
+#endif
 
     uint64_t height = batch->height;
     hpplite_batch_free(batch);
@@ -530,16 +634,12 @@ int hpplite_node_connect_sequencer(HppliteNode *node, const char *address) {
     if (!node) return -1;
     if (node->role != HPPLITE_ROLE_WITNESS) return -1;
 
-    /* Store sequencer address */
+    /* Store sequencer address - used when node is started */
     sqlite3_free(node->config.sequencerAddress);
     node->config.sequencerAddress = node_strdup(address);
 
-    /* TODO: Connect ZeroMQ SUB socket to sequencer PUB socket */
-    /*
-    int rc = zmq_connect(node->zmqSubscriber, address);
-    if (rc != 0) return -1;
-    zmq_setsockopt(node->zmqSubscriber, ZMQ_SUBSCRIBE, "", 0);
-    */
+    /* Note: ZMQ connection happens in hpplite_node_start().
+     * If node is already running, it needs to be restarted to connect. */
 
     return 0;
 }
@@ -656,15 +756,17 @@ int hpplite_node_submit_attestation(
 
     node->attestationsSent++;
 
-    /* TODO: Send attestation to sequencer via ZeroMQ */
-    /*
-    int msgSize;
-    unsigned char *msg = hpplite_node_serialize_attestation_msg(node, &att, &msgSize);
-    if (msg) {
-        zmq_send(node->zmqDealer, msg, msgSize, 0);
-        sqlite3_free(msg);
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Send attestation to sequencer via ZeroMQ */
+    if (node->zmqTransport) {
+        int msgSize;
+        unsigned char *msg = hpplite_node_serialize_attestation_msg(node, &att, &msgSize);
+        if (msg) {
+            hpplite_zmq_send_attestation(node->zmqTransport, msg, msgSize);
+            sqlite3_free(msg);
+        }
     }
-    */
+#endif
 
     return 0;
 }
@@ -1137,6 +1239,13 @@ HppliteCheckpoint *hpplite_node_create_checkpoint(HppliteNode *node) {
     }
     node->nCpAttestations = 0;
 
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Broadcast checkpoint to witnesses */
+    if (node->zmqTransport) {
+        hpplite_zmq_broadcast_checkpoint(node->zmqTransport, cp);
+    }
+#endif
+
     return cp;
 }
 
@@ -1322,15 +1431,12 @@ int hpplite_node_attest_checkpoint(
     node->checkpointFromHeight = 0;
     memset(node->checkpointPreRoot, 0, HPPLITE_HASH_SIZE);
 
-    /* TODO: Send attestation to sequencer via ZeroMQ */
-    /*
-    int msgSize;
-    unsigned char *msg = hpplite_node_serialize_cp_attestation_msg(node, &att, &msgSize);
-    if (msg) {
-        zmq_send(node->zmqDealer, msg, msgSize, 0);
-        sqlite3_free(msg);
+#ifdef HPPLITE_ENABLE_ZMQ
+    /* Send checkpoint attestation to sequencer via ZeroMQ */
+    if (node->zmqTransport) {
+        hpplite_zmq_send_cp_attestation(node->zmqTransport, &att);
     }
-    */
+#endif
 
     return 0;
 }
