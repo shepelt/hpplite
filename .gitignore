@@ -8,6 +8,10 @@ ext/hpplite/build/
 # Data directory
 ext/hpplite/data/
 
+# Foundry
+ext/hpplite/contracts/out/
+ext/hpplite/contracts/cache/
+
 # Editor
 *.swp
 *~
