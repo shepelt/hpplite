@@ -1,0 +1,14 @@
+# Private config (contains keys)
+ext/hpplite/.env
+
+# Build directories
+build/
+ext/hpplite/build/
+
+# Data directory
+ext/hpplite/data/
+
+# Editor
+*.swp
+*~
+*.dSYM/
