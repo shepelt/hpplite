@@ -67,12 +67,12 @@ set(HPPLITE_SOURCES
     crypto.c
     node.c
     l1_mock.c
-    # M3 Web3 integration
-    cJSON.c
-    keccak256.c
-    rlp.c
-    abi.c
-    eth_client.c
+    # M3 Web3 integration (eth/ subdirectory)
+    eth/cJSON.c
+    eth/keccak256.c
+    eth/rlp.c
+    eth/abi.c
+    eth/eth_client.c
 )
 
 # Add ZMQ networking source if enabled
@@ -84,6 +84,7 @@ add_library(hpplite STATIC ${HPPLITE_SOURCES})
 
 target_include_directories(hpplite PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/eth
     ${SECP256K1_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
 )
@@ -155,15 +156,15 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_m2_nodes hpplite Threads::Threads)
     endif()
 
-    # M3 Web3 tests (isolated, no network required)
-    add_executable(test_keccak test_keccak.c keccak256.c)
+    # M3 Web3 tests (eth/ subdirectory)
+    add_executable(test_keccak eth/test_keccak.c eth/keccak256.c)
 
-    add_executable(test_rlp test_rlp.c rlp.c)
+    add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
 
-    add_executable(test_abi test_abi.c abi.c keccak256.c)
+    add_executable(test_abi eth/test_abi.c eth/abi.c eth/keccak256.c)
 
     # M3 eth_client test (requires network)
-    add_executable(test_eth_client test_eth_client.c)
+    add_executable(test_eth_client eth/test_eth_client.c)
     target_link_libraries(test_eth_client hpplite)
 
     # Add tests to CTest
