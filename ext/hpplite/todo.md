@@ -37,8 +37,8 @@ Separate processes, ZeroMQ communication, L1 mock as dedicated process
           └───────────────┘
 ```
 
-### Milestone 3: Web3 Integration
-Real Ethereum L1, production deployment
+### Milestone 3: Web3 Integration ← CURRENT
+Real Ethereum L1, owner-controlled contract
 ```
 ┌─────────┐   ┌─────────┐   ┌─────────┐
 │   Seq   │   │  Wit1   │   │  Wit2   │
@@ -48,8 +48,8 @@ Real Ethereum L1, production deployment
                    │ JSON-RPC
                    ▼
           ┌───────────────┐
-          │   Ethereum    │
-          │   (L1 chain)  │
+          │ HPPLite.sol   │  ← owner controls membership
+          │  (Ethereum)   │  ← sequencer submits checkpoints
           └───────────────┘
 ```
 
@@ -124,10 +124,30 @@ Real Ethereum L1, production deployment
 - Adversarial/Byzantine testing
 
 ## Milestone 3 Tasks ← CURRENT
-- [ ] Web3/Ethereum RPC client
-- [ ] Real L1 contract deployment
-- [ ] Production configuration
-- [ ] Sync protocol for new nodes
+
+### L1 Contract (Solidity)
+- [ ] HPPLite.sol - owner-controlled membership
+  - `owner` - contract admin
+  - `setSequencer(address)` - owner only
+  - `addWitness(address)` / `removeWitness(address)` - owner only
+  - `submitCheckpoint(...)` - sequencer only
+  - `getState()` - public view (sequencer, witnesses, config)
+- [ ] Deploy script (hardhat or foundry)
+- [ ] Test on local devnet (anvil/hardhat node)
+
+### Web3 Integration (C)
+- [ ] Ethereum JSON-RPC client (minimal, C-based)
+  - `eth_call` - read contract state
+  - `eth_sendRawTransaction` - submit checkpoints
+  - `eth_getTransactionReceipt` - confirm tx
+- [ ] Transaction signing (secp256k1 + RLP encoding)
+- [ ] ABI encoding/decoding for contract calls
+
+### Node Integration
+- [ ] Replace L1 mock with real L1 client
+- [ ] Config file for RPC endpoint, contract address, keyfile
+- [ ] Test against local devnet (anvil)
+- [ ] Test against testnet (Sepolia)
 
 ---
 
