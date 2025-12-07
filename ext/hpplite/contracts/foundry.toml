@@ -1,0 +1,9 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.20"
+
+[rpc_endpoints]
+hpp_sepolia = "https://sepolia.hpp.io"
+anvil = "http://localhost:8545"
