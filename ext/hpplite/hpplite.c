@@ -847,11 +847,43 @@ static void stopTimerThread(HppliteOpenState *state) {
 
     /* Signal thread to stop */
     state->timerRunning = 0;
+}
 
-    /* Wait for thread to finish */
-    pthread_join(state->timerThread, NULL);
+/* Forward declaration */
+static uint64_t doFlushLocked(HppliteOpenState *state);
 
+/*
+** Close hook callback - called automatically by sqlite3_close()
+** This performs all HPPLite cleanup before SQLite tears down the connection.
+*/
+static void hpplite_close_hook(void *pArg, sqlite3 *db) {
+    (void)pArg;  /* Unused - we look up state by db */
+
+    HppliteOpenState *state = findOpenState(db);
+    if (!state) return;
+
+    /* Stop background timer thread first */
+    if (state->timerRunning) {
+        state->timerRunning = 0;
+        pthread_join(state->timerThread, NULL);
+    }
+
+    /* Flush any pending changes */
+    pthread_mutex_lock(&state->flushMutex);
+    doFlushLocked(state);
+    pthread_mutex_unlock(&state->flushMutex);
+
+    /* Shutdown HPPLite context */
+    if (state->ctx) {
+        hpplite_shutdown(state->ctx);
+        state->ctx = NULL;
+    }
+
+    /* Destroy mutex before freeing state */
     pthread_mutex_destroy(&state->flushMutex);
+
+    /* Remove from registry (frees state) */
+    removeOpenState(db);
 }
 
 sqlite3 *hpplite_open(const char *uri) {
@@ -922,6 +954,9 @@ sqlite3 *hpplite_open(const char *uri) {
     state->next = g_openDatabases;
     g_openDatabases = state;
 
+    /* Register close hook for automatic cleanup when sqlite3_close() is called */
+    sqlite3_close_hook(db, hpplite_close_hook, NULL);
+
     /* Start background timer thread for automatic flushing */
     startTimerThread(state);
 
@@ -929,25 +964,11 @@ sqlite3 *hpplite_open(const char *uri) {
 }
 
 int hpplite_close(sqlite3 *db) {
-    if (!db) return SQLITE_OK;
-
-    HppliteOpenState *state = findOpenState(db);
-    if (state) {
-        /* Stop background timer thread first */
-        stopTimerThread(state);
-
-        /* Flush any pending changes */
-        hpplite_flush(db);
-
-        /* Shutdown HPPLite context */
-        if (state->ctx) {
-            hpplite_shutdown(state->ctx);
-        }
-
-        /* Remove from registry (frees state) */
-        removeOpenState(db);
-    }
-
+    /*
+    ** With the close hook registered, sqlite3_close() will automatically
+    ** trigger hpplite_close_hook() which handles all cleanup.
+    ** This function is kept for API compatibility.
+    */
     return sqlite3_close(db);
 }
 
@@ -1076,6 +1097,105 @@ void hpplite_state_root(sqlite3 *db, unsigned char *out) {
     } else {
         memset(out, 0, HPPLITE_HASH_SIZE);
     }
+}
+
+/*
+** Auto-extension callback - called automatically on every sqlite3_open()
+** Checks URI parameters and initializes HPPLite if enabled.
+*/
+static int hpplite_auto_init(
+    sqlite3 *db,
+    char **pzErrMsg,
+    const sqlite3_api_routines *pApi
+) {
+    (void)pzErrMsg;
+    (void)pApi;
+
+    /* Get the URI used to open this database */
+    const char *filename = sqlite3_db_filename(db, "main");
+    if (!filename) return SQLITE_OK;
+
+    /* Check if HPPLite is enabled via URI parameter */
+    const char *hppliteParam = sqlite3_uri_parameter(filename, "hpplite");
+    if (!hppliteParam || strcmp(hppliteParam, "on") != 0) {
+        /* HPPLite not enabled for this connection */
+        return SQLITE_OK;
+    }
+
+    /* Load configuration from URI */
+    HppliteConfig *config = hpplite_config_load(filename);
+    if (!config) return SQLITE_OK;
+
+    /* Initialize HPPLite context */
+    HppliteCtx *ctx;
+    int rc = hpplite_init(db, &ctx);
+    if (rc != SQLITE_OK) {
+        hpplite_config_free(config);
+        return SQLITE_OK;  /* Don't fail the open, just skip HPPLite */
+    }
+
+    /* Create open state */
+    HppliteOpenState *state = calloc(1, sizeof(HppliteOpenState));
+    if (!state) {
+        hpplite_shutdown(ctx);
+        hpplite_config_free(config);
+        return SQLITE_OK;
+    }
+
+    state->db = db;
+    state->ctx = ctx;
+    state->config = config;
+    state->lastFlushTime = currentTimeMs();
+
+    /* Initialize lastFlushedRoot to current state (genesis) */
+    hpplite_get_state_root(ctx, state->lastFlushedRoot);
+
+    /* Initialize crypto if we have a private key */
+    if (config->hasPrivkey) {
+        state->crypto = hpplite_crypto_init();
+        if (state->crypto) {
+            hpplite_crypto_keypair_from_privkey(state->crypto, &state->keypair, config->privkey);
+        }
+    }
+
+    /* Initialize storage */
+    hpplite_storage_init(config->dataDir, &state->storage);
+
+    /* Initialize timer thread state */
+    state->timerRunning = 0;
+
+    /* Add to global registry */
+    state->next = g_openDatabases;
+    g_openDatabases = state;
+
+    /* Register close hook for automatic cleanup */
+    sqlite3_close_hook(db, hpplite_close_hook, NULL);
+
+    /* Start background timer thread for automatic flushing */
+    startTimerThread(state);
+
+    return SQLITE_OK;
+}
+
+/*
+** Register HPPLite as an auto-extension.
+** Call this once at application startup to enable transparent HPPLite support.
+** After registration, any sqlite3_open() with ?hpplite=on will automatically
+** initialize HPPLite.
+**
+** Example:
+**   hpplite_register();
+**   sqlite3_open_v2("file:db.sqlite?hpplite=on&role=sequencer", &db, flags, NULL);
+*/
+void hpplite_register(void) {
+    sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
+}
+
+/*
+** Unregister HPPLite auto-extension.
+*/
+void hpplite_unregister(void) {
+    sqlite3_cancel_auto_extension((void(*)(void))hpplite_auto_init);
 }
 
 /*

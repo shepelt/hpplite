@@ -377,6 +377,14 @@ int hpplite_l1_poll(HppliteL1 *l1) {
     return 0;
 }
 
+int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
+    (void)l1;
+    (void)tx_hash;
+    (void)timeout_secs;
+    /* Mock always succeeds immediately */
+    return 1;
+}
+
 /* === Mock-specific functions for testing === */
 
 /*

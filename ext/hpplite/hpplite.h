@@ -243,12 +243,15 @@ struct HppliteConfig;
 ** The returned handle works like normal sqlite3* - just use sqlite3_exec(), etc.
 ** Batches are created automatically based on the interval setting.
 **
-** When done, call hpplite_close(db) instead of sqlite3_close().
+** When done, either sqlite3_close(db) or hpplite_close(db) will work.
+** The close hook automatically flushes pending batches and cleans up.
 */
 sqlite3 *hpplite_open(const char *uri);
 
 /*
-** Close HPPLite database (frees HPPLite resources + calls sqlite3_close).
+** Close HPPLite database.
+** This is equivalent to sqlite3_close() when HPPLite close hook is registered.
+** Kept for API compatibility.
 */
 int hpplite_close(sqlite3 *db);
 
@@ -283,6 +286,25 @@ uint64_t hpplite_check_flush(sqlite3 *db);
 ** Get current state root.
 */
 void hpplite_state_root(sqlite3 *db, unsigned char *out);
+
+/*
+** Register HPPLite as an auto-extension.
+** Call this once at application startup to enable transparent HPPLite support.
+** After registration, any sqlite3_open_v2() with ?hpplite=on will automatically
+** initialize HPPLite.
+**
+** Example:
+**   hpplite_register();
+**   sqlite3_open_v2("file:db.sqlite?hpplite=on&role=sequencer", &db, flags, NULL);
+**   sqlite3_exec(db, "INSERT ...", ...);  // Changes tracked automatically
+**   sqlite3_close(db);  // Flushes pending batch automatically
+*/
+void hpplite_register(void);
+
+/*
+** Unregister HPPLite auto-extension.
+*/
+void hpplite_unregister(void);
 
 /*
 ** Pubkey size for signatures

@@ -3,19 +3,21 @@
 **
 ** Demonstrates:
 ** - Using hpplite_open() with URI parameters
+** - OR using hpplite_register() + standard sqlite3_open_v2()
 ** - Standard SQLite API (sqlite3_exec) for database operations
 ** - Automatic state root tracking
-** - Manual batch creation
+** - Manual and automatic batch creation
+** - Transparent close via sqlite3_close() or hpplite_close()
 **
 ** Build:
 **   cd ../build && make
 **   gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
 **       ../build/libhpplite.a ../build/libsqlite3.a \
-**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq
+**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq -lpthread
 **
 ** Or if using the makefile in build directory:
 **   make && gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
-**       libhpplite.a libsqlite3.a -lsecp256k1 -lcurl -lzmq
+**       libhpplite.a libsqlite3.a -lsecp256k1 -lcurl -lzmq -lpthread
 */
 
 #include "hpplite.h"
@@ -129,9 +131,59 @@ int main(void) {
     snprintf(cmd, sizeof(cmd), "ls -la %s/batches/", DATA_DIR);
     system(cmd);
 
-    /* Close - any pending changes are flushed automatically */
-    hpplite_close(db);
-    printf("\nDone!\n");
+    /* Close - any pending changes are flushed automatically.
+     * Using standard sqlite3_close() - the close hook handles cleanup! */
+    sqlite3_close(db);
+    printf("\nDone with hpplite_open() approach!\n");
 
+    /*
+     * =========================================================
+     * Alternative: Auto-Extension Approach
+     * =========================================================
+     *
+     * For fully transparent SQLite integration, use hpplite_register()
+     * once at startup. Then standard sqlite3_open_v2() + sqlite3_close()
+     * works automatically!
+     */
+    printf("\n--- Auto-Extension Demo ---\n\n");
+
+    /* Register HPPLite as auto-extension (call once at app startup) */
+    hpplite_register();
+
+    /* Now use standard SQLite API - HPPLite auto-initializes! */
+    sqlite3 *db2;
+    rc = sqlite3_open_v2(
+        "file:" DATA_DIR "/auto.db?hpplite=on&role=sequencer&datadir=" DATA_DIR,
+        &db2,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+        NULL
+    );
+    if (rc != SQLITE_OK) {
+        printf("ERROR: sqlite3_open_v2 failed\n");
+        return 1;
+    }
+
+    /* HPPLite is active - verify by getting context */
+    if (hpplite_context(db2)) {
+        printf("HPPLite auto-initialized via sqlite3_open_v2!\n");
+    }
+
+    /* Standard SQLite operations - changes tracked automatically */
+    sqlite3_exec(db2, "CREATE TABLE auto_test(id INT, val TEXT)", NULL, NULL, NULL);
+    sqlite3_exec(db2, "INSERT INTO auto_test VALUES(1, 'transparent')", NULL, NULL, NULL);
+
+    hpplite_state_root(db2, stateRoot);
+    printf("State root: ");
+    print_hex(stateRoot, 32);
+    printf("\n");
+
+    /* Standard sqlite3_close - close hook flushes pending batch! */
+    sqlite3_close(db2);
+    printf("Closed with sqlite3_close() - close hook handled cleanup!\n");
+
+    /* Unregister when done */
+    hpplite_unregister();
+
+    printf("\nAll done!\n");
     return 0;
 }
