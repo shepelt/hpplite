@@ -302,6 +302,54 @@ int hpplite_l1_get_da_state(
     uint8_t latest_batch_hash[32]
 );
 
+/* === Peer Discovery Functions === */
+
+/*
+** Set endpoint for this node (sequencer or witness).
+** Returns transaction hash on success, NULL on failure.
+*/
+char *hpplite_l1_set_endpoint(
+    HppliteL1 *l1,
+    const char *endpoint,       /* ZMQ address: "tcp://host:port" */
+    uint32_t node_version       /* Protocol version: 0x00010000 = 1.0.0 */
+);
+
+/*
+** Get sequencer endpoint for witness connections.
+** Returns 0 on success, -1 on error.
+** endpoint_out should be at least 257 bytes.
+*/
+int hpplite_l1_get_sequencer_endpoint(
+    HppliteL1 *l1,
+    char *endpoint_out,
+    size_t endpoint_out_len,
+    uint32_t *version_out
+);
+
+/*
+** Peer discovery info
+*/
+typedef struct HpplitePeerInfo {
+    unsigned char address[20];
+    char *endpoint;            /* ZMQ address */
+    uint32_t version;
+} HpplitePeerInfo;
+
+/*
+** Get all witness endpoints.
+** Caller must free with hpplite_l1_free_peers().
+*/
+int hpplite_l1_get_witness_endpoints(
+    HppliteL1 *l1,
+    HpplitePeerInfo **peers_out,
+    int *count_out
+);
+
+/*
+** Free peer info array
+*/
+void hpplite_l1_free_peers(HpplitePeerInfo *peers, int count);
+
 /* === Mock-specific functions for testing === */
 
 /*

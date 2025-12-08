@@ -141,10 +141,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *master_key = getenv("HPPLITE_PRIVATE_KEY");
-    if (!master_key) master_key = getenv("HPPLITE_MASTER_KEY");
+    const char *master_key = test_util_get_master_key();
     if (!master_key) {
-        printf("ERROR: HPPLITE_PRIVATE_KEY not set\n");
+        printf("ERROR: HPPLITE_PRIVATE_KEY not set (env or .env file)\n");
         return 1;
     }
 

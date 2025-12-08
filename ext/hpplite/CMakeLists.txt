@@ -88,7 +88,11 @@ endif()
 
 # Add ZMQ networking source if enabled
 if(HPPLITE_ENABLE_ZMQ)
-    list(APPEND HPPLITE_SOURCES zmq_transport.c l1_service.c)
+    list(APPEND HPPLITE_SOURCES zmq_transport.c)
+    # l1_service is mock L1 over ZMQ - only include with mock L1
+    if(NOT HPPLITE_USE_REAL_L1)
+        list(APPEND HPPLITE_SOURCES l1_service.c)
+    endif()
 endif()
 
 add_library(hpplite STATIC ${HPPLITE_SOURCES})
@@ -144,37 +148,38 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_node tests/unit/test_node.c)
     target_link_libraries(test_node hpplite)
 
-    add_executable(test_l1_mock tests/unit/test_l1_mock.c)
-    target_link_libraries(test_l1_mock hpplite)
-
-    add_executable(test_checkpoint_flow tests/unit/test_checkpoint_flow.c)
-    target_link_libraries(test_checkpoint_flow hpplite)
-
     add_executable(test_da_uri tests/unit/test_da_uri.c)
     target_link_libraries(test_da_uri hpplite)
 
     add_executable(test_simple_open tests/unit/test_simple_open.c)
     target_link_libraries(test_simple_open hpplite)
 
-    add_executable(test_witness tests/unit/test_witness.c)
-    target_link_libraries(test_witness hpplite)
-
-    add_executable(test_reconstruct tests/unit/test_reconstruct.c)
-    target_link_libraries(test_reconstruct hpplite)
-
-    add_executable(test_multinode tests/unit/test_multinode.c)
-    target_link_libraries(test_multinode hpplite)
-
-    add_executable(test_bugs tests/unit/test_bugs.c)
-    target_link_libraries(test_bugs hpplite)
-
-    # test_full_e2e uses mock L1 - only build when not using real L1
+    # Tests that use mock L1 - only build when not using real L1
     if(NOT HPPLITE_USE_REAL_L1)
+        add_executable(test_l1_mock tests/unit/test_l1_mock.c)
+        target_link_libraries(test_l1_mock hpplite)
+
+        add_executable(test_checkpoint_flow tests/unit/test_checkpoint_flow.c)
+        target_link_libraries(test_checkpoint_flow hpplite)
+
+        add_executable(test_witness tests/unit/test_witness.c)
+        target_link_libraries(test_witness hpplite)
+
+        add_executable(test_reconstruct tests/unit/test_reconstruct.c)
+        target_link_libraries(test_reconstruct hpplite)
+
+        add_executable(test_multinode tests/unit/test_multinode.c)
+        target_link_libraries(test_multinode hpplite)
+
+        add_executable(test_bugs tests/unit/test_bugs.c)
+        target_link_libraries(test_bugs hpplite)
+
         add_executable(test_full_e2e tests/unit/test_full_e2e.c)
         target_link_libraries(test_full_e2e hpplite)
     endif()
 
-    if(HPPLITE_ENABLE_ZMQ)
+    # ZMQ tests use l1_service which requires mock L1
+    if(HPPLITE_ENABLE_ZMQ AND NOT HPPLITE_USE_REAL_L1)
         add_executable(test_zmq tests/unit/test_zmq.c)
         target_link_libraries(test_zmq hpplite Threads::Threads)
 
@@ -214,18 +219,24 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_hpplite COMMAND test_hpplite)
     add_test(NAME test_batch COMMAND test_batch)
     add_test(NAME test_node COMMAND test_node)
-    add_test(NAME test_l1_mock COMMAND test_l1_mock)
-    add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
     add_test(NAME test_da_uri COMMAND test_da_uri)
     add_test(NAME test_simple_open COMMAND test_simple_open)
-    add_test(NAME test_witness COMMAND test_witness)
-    add_test(NAME test_reconstruct COMMAND test_reconstruct)
-    add_test(NAME test_multinode COMMAND test_multinode)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
 
-    if(HPPLITE_ENABLE_ZMQ)
+    # Mock L1 tests - only register when not using real L1
+    if(NOT HPPLITE_USE_REAL_L1)
+        add_test(NAME test_l1_mock COMMAND test_l1_mock)
+        add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
+        add_test(NAME test_witness COMMAND test_witness)
+        add_test(NAME test_reconstruct COMMAND test_reconstruct)
+        add_test(NAME test_multinode COMMAND test_multinode)
+        add_test(NAME test_bugs COMMAND test_bugs)
+        add_test(NAME test_full_e2e COMMAND test_full_e2e)
+    endif()
+
+    if(HPPLITE_ENABLE_ZMQ AND NOT HPPLITE_USE_REAL_L1)
         add_test(NAME test_zmq COMMAND test_zmq)
         add_test(NAME test_zmq_nodes COMMAND test_zmq_nodes)
     endif()
@@ -248,16 +259,19 @@ if(HPPLITE_BUILD_EXAMPLES)
 endif()
 
 # Benchmarks (not in ctest, run with 'make speedtest')
-add_executable(bench_replay bench_replay.c)
-target_link_libraries(bench_replay hpplite)
+# bench_replay uses mock L1
+if(NOT HPPLITE_USE_REAL_L1)
+    add_executable(bench_replay bench_replay.c)
+    target_link_libraries(bench_replay hpplite)
 
-# speedtest target (like SQLite's make speedtest)
-add_custom_target(speedtest
-    COMMAND bench_replay --batches 100 --stats
-    DEPENDS bench_replay
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running HPPLite replay benchmark..."
-)
+    # speedtest target (like SQLite's make speedtest)
+    add_custom_target(speedtest
+        COMMAND bench_replay --batches 100 --stats
+        DEPENDS bench_replay
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Running HPPLite replay benchmark..."
+    )
+endif()
 
 # Print configuration
 message(STATUS "")
