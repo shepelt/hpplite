@@ -4,86 +4,97 @@ A lightweight L2 rollup built on SQLite with L1 anchoring to HPP Network.
 
 HPPLite enables verifiable SQL state transitions with checkpoint finality on Ethereum-compatible L1 chains. It combines SQLite's proven reliability with blockchain's trust guarantees.
 
+## Quick Start
+
+```c
+// Just use SQLite with a special URI - that's it!
+sqlite3 *db;
+sqlite3_open_v2(
+    "file:myapp.db?hpplite=on&rpc=https://sepolia.hpp.io"
+    "&factory=0x51cD96b8F0BE5bD920326709D39b62130291CaDe"
+    "&privkey=0xYOUR_PRIVATE_KEY",
+    &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+
+// Use SQLite normally - batches auto-submit to L1
+sqlite3_exec(db, "CREATE TABLE users(id INT, name TEXT)", NULL, NULL, NULL);
+sqlite3_exec(db, "INSERT INTO users VALUES(1, 'alice')", NULL, NULL, NULL);
+
+// Close - state persists on L1
+sqlite3_close(db);
+```
+
+On first open, the factory auto-deploys your rollup contract (~3s). All writes are batched and submitted to L1 for data availability.
+
 ## Architecture
 
 ```
+HPPLiteFactory (singleton on L1)
+    │
+    └── getOrCreateRollup() ──► HPPLiteDA (your rollup)
+                                    │
+                                    ├── submitBatch() - store batch data
+                                    ├── getBatch() - retrieve for reconstruction
+                                    └── submitCheckpoint() - finalize with attestations
+
 ┌─────────────────────────────────────────────────────────────────┐
-│                         HPP Sepolia (L1)                        │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    HPPLite.sol                          │    │
-│  │  - Checkpoint storage (height, stateRoot)               │    │
-│  │  - Witness registry                                     │    │
-│  │  - Attestation verification (ecrecover)                 │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-                              ▲
-                              │ submitCheckpoint(from, to, stateRoot, sigs)
-                              │
-┌─────────────────────────────────────────────────────────────────┐
-│                         HPPLite L2                              │
+│                         HPPLite L2 Nodes                        │
 │                                                                 │
-│  ┌──────────────┐    batches    ┌──────────────┐               │
-│  │  Sequencer   │ ────────────► │  Witness 1   │               │
-│  │              │               │              │               │
-│  │  - Executes  │               │  - Verifies  │               │
-│  │    SQL       │               │  - Attests   │               │
-│  │  - Creates   │               └──────────────┘               │
-│  │    batches   │                                               │
-│  │  - Submits   │    batches    ┌──────────────┐               │
-│  │    to L1     │ ────────────► │  Witness 2   │               │
-│  └──────────────┘               │              │               │
-│         │                       │  - Verifies  │               │
-│         │                       │  - Attests   │               │
-│         ▼                       └──────────────┘               │
-│  ┌──────────────┐                                               │
-│  │   SQLite     │               ┌──────────────┐               │
-│  │  + State     │    batches    │  Witness N   │               │
-│  │    Tracking  │ ────────────► │      ...     │               │
-│  └──────────────┘               └──────────────┘               │
-│                                                                 │
+│  ┌──────────────┐              ┌──────────────┐                │
+│  │  Sequencer   │   batches    │  Witness(es) │                │
+│  │              │ ───────────► │              │                │
+│  │  - Execute   │              │  - Verify    │                │
+│  │    SQL       │              │  - Attest    │                │
+│  │  - Submit    │              │  - Sync      │                │
+│  │    to L1     │              └──────────────┘                │
+│  └──────────────┘                                              │
+│         │                      ┌──────────────┐                │
+│         ▼                      │   Replica    │                │
+│  ┌──────────────┐              │              │                │
+│  │   SQLite     │   L1 sync    │  - Read-only │                │
+│  │  Database    │ ◄─────────── │  - Reconstruct│               │
+│  └──────────────┘              └──────────────┘                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-### Core (M1)
-- **SQLite State Tracking** - Pre-update hooks capture all state changes
-- **Batch Creation** - SQL operations grouped into signed batches
-- **Merkle State Roots** - Cryptographic commitment to database state
-- **Deterministic Replay** - Any node can reconstruct state from batches
+- **Transparent API** - Just use `sqlite3_open_v2()` with URI parameters
+- **Factory Deploy** - One-click rollup creation, no manual contract deployment
+- **On-Chain DA** - Full batch data stored on L1 for reconstruction
+- **Witness Attestation** - Multi-sig checkpoint verification
+- **State Reconstruction** - Any node can rebuild from L1 batches alone
 
-### Networking (M2)
-- **ZeroMQ Transport** - Sequencer-to-witness batch distribution
-- **Multi-Process** - Nodes run as separate processes
-- **Role-Based** - Sequencer, Witness, and Observer modes
+## Contracts
 
-### L1 Integration (M3)
-- **HPP Sepolia** - Real Ethereum L1 checkpoint anchoring
-- **EIP-191 Signatures** - Standard Ethereum signed messages
-- **Witness Attestations** - Multi-sig checkpoint verification
-- **State Reconstruction** - Rebuild L2 from L1 checkpoints + batch data
+Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
-## Components
+| Contract | Address | Description |
+|----------|---------|-------------|
+| HPPLiteFactory | `0x51cD96b8F0BE5bD920326709D39b62130291CaDe` | Creates rollups (one per wallet) |
+| HPPLiteDA | *(per-user)* | Your rollup contract |
 
-| Component | Description |
-|-----------|-------------|
-| `hpplite.c` | Core state tracking and Merkle tree |
-| `node.c` | Node lifecycle and role management |
-| `batch.c` | Batch creation, serialization, signing |
-| `crypto.c` | secp256k1 signing and verification |
-| `l1_eth.c` | Real Ethereum L1 client |
-| `l1_mock.c` | In-memory L1 mock for testing |
-| `eth/` | Web3 primitives (RLP, ABI, keccak256) |
+## URI Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `hpplite` | Yes | Set to `on` to enable |
+| `rpc` | Yes | L1 RPC URL |
+| `factory` | Yes* | Factory contract address |
+| `contract` | Yes* | Direct rollup address (if known) |
+| `privkey` | Yes | Private key for signing |
+| `datadir` | No | Local data directory |
+| `role` | No | `sequencer`, `witness`, or `replica` |
+
+*Either `factory` or `contract` is required.
 
 ## Building
 
 ```bash
 # Prerequisites
-brew install libsecp256k1 zeromq curl  # macOS
+brew install libsecp256k1 zeromq curl pkg-config  # macOS
 # apt install libsecp256k1-dev libzmq3-dev libcurl4-openssl-dev  # Linux
 
-# Build SQLite first
-cd /path/to/sqlite
+# Build SQLite first (from repo root)
 mkdir build && cd build
 ../configure && make sqlite3.c
 
@@ -97,388 +108,143 @@ make
 ## Testing
 
 ```bash
-# Unit tests (no network required)
-./test_hpplite          # State tracking
-./test_batch            # Batch serialization
-./test_node             # Node lifecycle
-./test_m3_witness       # Witness attestation
-./test_m3_reconstruct   # State reconstruction
-./test_m3_multinode     # Multi-node E2E
+# Unit tests (mock L1, fast, no network)
+ctest                    # Run all 15 unit tests (~4s)
 
-# Integration tests (requires HPP Sepolia)
-./test_m3_e2e           # Full L1 integration
-./test_m3_checkpoint    # Checkpoint submission
+# Individual unit tests
+./test_hpplite           # Core state tracking
+./test_batch             # Batch serialization
+./test_node              # Node lifecycle
+./test_l1_mock           # Mock L1 operations
+./test_checkpoint_flow   # Checkpoint logic
+./test_witness           # Attestation flow
+./test_reconstruct       # State reconstruction
+./test_multinode         # Multi-node coordination
+
+# Integration tests (real L1, requires funded wallet)
+export HPPLITE_PRIVATE_KEY=0x...
+./test_l1_full_e2e       # Simple transparent API test
+./test_full_cluster      # Full sequencer/witness/reconstruction
 
 # Benchmarks
-make speedtest          # Replay performance
+make speedtest           # Replay performance
 ```
 
-## Configuration
+## Gas Costs (HPP Sepolia)
 
-| CMake Option | Default | Description |
-|--------------|---------|-------------|
-| `HPPLITE_USE_REAL_L1` | OFF | Use real Ethereum vs mock |
-| `HPPLITE_ENABLE_ZMQ` | ON | Enable ZeroMQ networking |
-| `HPPLITE_BUILD_TESTS` | ON | Build test executables |
+| Operation | Gas | Cost (ETH) | Cost (USD*) |
+|-----------|-----|------------|-------------|
+| Factory deploy | 3.5M | 0.000035 | $0.12 |
+| Batch submit (~1KB) | 1.3M | 0.000013 | $0.04 |
+| Witness registration | 46K | 0.0000005 | $0.002 |
 
-## L1 System Contracts
+*At $3,500/ETH, 10 gwei gas price
 
-Deployed on HPP Sepolia (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
+### Monthly Projections
 
-| Contract | Address | Description |
-|----------|---------|-------------|
-| HPPLite | `0x2aC7688dFd3f81f189294cd12586776f43F19492` | Checkpoint-only (off-chain DA) |
-| HPPLiteDA | `0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc` | Checkpoint + On-chain DA + System Config (v2) |
+| Usage | Batches/day | Monthly Cost |
+|-------|-------------|--------------|
+| Light (personal) | 10 | ~$13 |
+| Medium (small app) | 100 | ~$264 |
+| Heavy (production) | 1,000 | ~$6,600 |
 
-### HPPLiteDA - On-Chain Data Availability
+**Cost driver**: 97% of cost is on-chain DA storage. Consider compression (4x savings) or off-chain DA (14x savings) for high-volume apps.
 
-The HPPLiteDA contract extends the base contract with on-chain batch storage:
+## Components
 
-```solidity
-// Submit batch data to L1 for data availability
-function submitBatch(uint256 height, bytes calldata data) external onlySequencer;
+| File | Description |
+|------|-------------|
+| `hpplite.c` | Core state tracking, transparent API |
+| `node.c` | Node lifecycle, L1 sync, batch management |
+| `batch.c` | Batch creation and serialization |
+| `crypto.c` | secp256k1 signing |
+| `config.c` | URI parsing, configuration |
+| `l1_eth.c` | Real Ethereum L1 client |
+| `l1_mock.c` | Mock L1 for testing |
+| `eth/` | Web3 primitives (RLP, ABI, keccak256) |
 
-// Submit multiple batches in one transaction
-function submitBatches(uint256 startHeight, bytes[] calldata batches) external onlySequencer;
-
-// Retrieve batch data by height
-function getBatch(uint256 height) external view returns (bytes memory);
-
-// Get batch hash for verification
-function getBatchHash(uint256 height) external view returns (bytes32);
-
-// Get DA state
-function getDAState() external view returns (
-    uint256 lastBatchHeight,
-    uint256 totalBatches,
-    bytes32 latestBatchHash
-);
-```
-
-This enables full L2 reconstruction from L1 alone - no external DA layer needed.
-
-### System Config (Optimism-style)
-
-HPPLiteDA v2 includes on-chain system configuration for client bootstrapping:
-
-```solidity
-// Get full system config for client discovery
-function getSystemConfig() external view returns (
-    string memory daScheme,      // "hppda", "ipfs", "file"
-    address daContract,          // DA contract address (address(this) if self-hosted)
-    uint256 batchSizeLimit,      // Max batch size in bytes
-    uint256 version,             // Contract version
-    uint256 chainId              // Chain ID from block.chainid
-);
-
-// Admin functions for config updates
-function setDAScheme(string calldata _scheme) external onlyOwner;
-function setDAContract(address _da) external onlyOwner;
-function setBatchSizeLimit(uint256 _limit) external onlyOwner;
-```
-
-**DA URI Scheme:**
-
-Batch references use a URI scheme for flexible DA layer switching:
-```
-hppda://<chainId>/<contract>/<height>
-hppda://181228/0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc/42
-```
-
-Clients can bootstrap from just the contract address and discover all configuration on-chain.
-
-### Full Contract Interface
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
-
-contract HPPLite {
-    // State
-    address public owner;
-    address public sequencer;
-    address[] public witnesses;
-
-    uint256 public requiredAttestations;    // Quorum (e.g., 2-of-3)
-    uint256 public checkpointInterval;      // Batches between checkpoints
-    uint256 public sequencerTimeout;        // Seconds before sequencer can be replaced
-
-    uint256 public lastCheckpointHeight;    // Latest L2 height on L1
-    bytes32 public lastStateRoot;           // Latest committed state root
-    uint256 public lastCheckpointTime;      // Timestamp of last checkpoint
-
-    // Events
-    event CheckpointSubmitted(uint256 fromHeight, uint256 toHeight, bytes32 stateRoot);
-    event SequencerChanged(address indexed oldSequencer, address indexed newSequencer);
-    event WitnessAdded(address indexed witness);
-    event WitnessRemoved(address indexed witness);
-
-    // Submit checkpoint with witness attestations
-    function submitCheckpoint(
-        uint256 fromHeight,
-        uint256 toHeight,
-        bytes32 stateRoot,
-        bytes calldata signatures    // Packed (r, s, v) * nWitnesses
-    ) external;
-
-    // Admin functions
-    function setSequencer(address _sequencer) external;
-    function addWitness(address _witness) external;
-    function removeWitness(address _witness) external;
-    function setRequiredAttestations(uint256 _required) external;
-
-    // View functions
-    function getState() external view returns (
-        address owner,
-        address sequencer,
-        uint256 witnessCount,
-        uint256 requiredAttestations,
-        uint256 checkpointInterval,
-        uint256 sequencerTimeout,
-        uint256 lastCheckpointHeight,
-        bytes32 lastStateRoot,
-        uint256 lastCheckpointTime
-    );
-
-    function getWitnesses() external view returns (address[] memory);
-    function isSequencerTimedOut() external view returns (bool);
-}
-```
-
-### Checkpoint Signature Verification
-
-The contract verifies attestations using `ecrecover`:
-
-```solidity
-// Message hash computation (must match client-side)
-bytes32 message = keccak256(abi.encodePacked(fromHeight, toHeight, stateRoot));
-
-// EIP-191 prefix for personal_sign compatibility
-bytes32 ethSignedHash = keccak256(abi.encodePacked(
-    "\x19Ethereum Signed Message:\n32",
-    message
-));
-
-// Recover signer from signature
-address signer = ecrecover(ethSignedHash, v, r, s);
-require(isWitness[signer], "Invalid witness");
-```
-
-### Calldata Encoding
-
-Checkpoint submission calldata format:
+## Test Structure
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Bytes 0-3:   Function selector (4 bytes)                        │
-│              keccak256("submitCheckpoint(uint256,uint256,       │
-│                         bytes32,bytes)")[:4]                    │
-│              = 0x????????                                       │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 4-35:  fromHeight (uint256, 32 bytes, big-endian)         │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 36-67: toHeight (uint256, 32 bytes, big-endian)           │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 68-99: stateRoot (bytes32, 32 bytes)                      │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 100-131: offset to signatures (uint256 = 128)             │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 132-163: signatures length (uint256 = nSigs * 65)         │
-├─────────────────────────────────────────────────────────────────┤
-│ Bytes 164+:  signatures data                                    │
-│              ┌─────────────────────────────────────────────┐    │
-│              │ Sig 1: r (32) + s (32) + v (1) = 65 bytes   │    │
-│              │ Sig 2: r (32) + s (32) + v (1) = 65 bytes   │    │
-│              │ ...                                          │    │
-│              └─────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+tests/
+├── unit/              # Mock L1, no network required
+│   ├── test_hpplite.c
+│   ├── test_batch.c
+│   ├── test_node.c
+│   ├── test_l1_mock.c
+│   ├── test_checkpoint_flow.c
+│   ├── test_witness.c
+│   ├── test_reconstruct.c
+│   ├── test_multinode.c
+│   └── test_zmq*.c
+│
+└── integration/       # Real L1 (HPP Sepolia)
+    ├── test_l1_full_e2e.c      # Transparent API
+    ├── test_full_cluster.c     # Sequencer + witness + reconstruction
+    ├── test_factory.c
+    └── test_l1_*.c
 ```
 
-## Batch Storage Format
-
-Batches are stored locally as JSON files and referenced by height.
-
-### File Structure
-```
-{dataDir}/
-├── batches/
-│   ├── 00000001.json
-│   ├── 00000002.json
-│   └── ...
-└── db.sqlite
-```
-
-### Batch JSON Schema
-```json
-{
-  "height": 1,
-  "prevStateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-  "postStateRoot": "0xabc123...",
-  "timestamp": 1702000000,
-  "sequencerPubkey": "02abc123...",
-  "signature": "abc123...",
-  "operations": [
-    {
-      "type": "INSERT",
-      "table": "users",
-      "rowid": 1,
-      "values": {
-        "id": 1,
-        "name": "alice"
-      }
-    },
-    {
-      "type": "UPDATE",
-      "table": "users",
-      "rowid": 1,
-      "oldValues": { "name": "alice" },
-      "newValues": { "name": "bob" }
-    },
-    {
-      "type": "DELETE",
-      "table": "users",
-      "rowid": 1,
-      "values": { "id": 1, "name": "bob" }
-    }
-  ]
-}
-```
-
-### Operation Types
-
-| Type | Description | Captured Data |
-|------|-------------|---------------|
-| `INSERT` | New row added | table, rowid, all column values |
-| `UPDATE` | Row modified | table, rowid, old values, new values |
-| `DELETE` | Row removed | table, rowid, deleted values |
-
-### State Root Computation
-
-The state root is a Merkle root over all table data:
-
-```
-stateRoot = keccak256(
-    tableRoot("table1") ||
-    tableRoot("table2") ||
-    ...
-)
-
-tableRoot(name) = keccak256(
-    rowHash(rowid1) ||
-    rowHash(rowid2) ||
-    ...
-)
-
-rowHash(rowid) = keccak256(
-    columnValue1 ||
-    columnValue2 ||
-    ...
-)
-```
-
-### Batch Signing
-
-Batches are signed by the sequencer using secp256k1:
-
-```
-batchHash = keccak256(
-    height ||
-    prevStateRoot ||
-    postStateRoot ||
-    operationsHash
-)
-
-signature = secp256k1_sign(sequencerPrivkey, batchHash)
-```
-
-### Data Availability
-
-Current implementation stores batches locally on each node. Future options:
-
-| Storage | Pros | Cons |
-|---------|------|------|
-| Local FS | Fast, simple | Node must stay online |
-| IPFS | Decentralized, content-addressed | Pinning required |
-| Arweave | Permanent, pay once | Cost per byte |
-| L1 calldata | Maximum security | Expensive |
-
-For checkpoints, only the state root goes to L1. Full batch data is stored off-chain with the hash committed on-chain for verification.
-
-## Usage Example
+## Example: Full Cluster Setup
 
 ```c
-#include "node.h"
+// Sequencer node
+sqlite3_open_v2(
+    "file:seq.db?hpplite=on&role=sequencer"
+    "&rpc=https://sepolia.hpp.io"
+    "&contract=0xYOUR_ROLLUP"
+    "&privkey=0xSEQ_KEY",
+    &seq_db, ...);
 
-// Create sequencer node
-HppliteNodeConfig cfg = {
-    .nodeId = "seq1",
-    .dataDir = "/data/hpplite",
-    .dbPath = "/data/hpplite/state.db"
-};
-memcpy(cfg.privkey, my_privkey, 32);
+// Witness node (different machine)
+sqlite3_open_v2(
+    "file:wit.db?hpplite=on&role=witness"
+    "&rpc=https://sepolia.hpp.io"
+    "&contract=0xYOUR_ROLLUP"
+    "&privkey=0xWIT_KEY",
+    &wit_db, ...);
 
-HppliteNode *node = hpplite_node_create(&cfg);
-hpplite_node_set_role(node, HPPLITE_ROLE_SEQUENCER);
-hpplite_node_start(node);
+// Read-only replica (reconstructs from L1)
+sqlite3_open_v2(
+    "file:replica.db?hpplite=on&role=replica"
+    "&rpc=https://sepolia.hpp.io"
+    "&contract=0xYOUR_ROLLUP",
+    &replica_db, ...);
+```
 
-// Execute SQL
-hpplite_node_exec(node, "CREATE TABLE users(id INT, name TEXT)", NULL);
-hpplite_node_exec(node, "INSERT INTO users VALUES(1, 'alice')", NULL);
+## Contract Interface
 
-// Flush batch
-uint64_t height = hpplite_node_flush_batch(node);
+```solidity
+// HPPLiteFactory
+function getOrCreateRollup() external returns (address);
+function getRollup(address owner) external view returns (address);
 
-// Get state root
-unsigned char root[32];
-hpplite_node_get_state_root(node, root);
+// HPPLiteDA (per-rollup)
+function submitBatch(uint256 height, bytes data) external;
+function getBatch(uint256 height) external view returns (bytes);
+function submitCheckpoint(uint256 from, uint256 to, bytes32 root, bytes sigs) external;
+function addWitness(address witness) external;
+function setSequencer(address seq) external;
 ```
 
 ## Roadmap
 
 ### Completed
-- [x] M1: Single-process state tracking and batching
-- [x] M2: Multi-process with ZeroMQ networking
-- [x] M3: L1 checkpoint anchoring on HPP Sepolia
+- [x] SQLite state tracking with Merkle roots
+- [x] Batch creation and signing
+- [x] ZeroMQ networking (sequencer ↔ witness)
+- [x] L1 checkpoint anchoring
+- [x] Factory-based deployment
+- [x] On-chain data availability
+- [x] Transparent SQLite API
+- [x] State reconstruction from L1
 
-### M4: L1 System Views (Planned)
-- [ ] **Virtual Tables** - SQL access to L1 state
-  - `hpplite_system` - System config from L1 contract
-  - `hpplite_checkpoints` - Finalized checkpoints on L1
-  - `hpplite_batches` - Batch metadata from DA layer
-  - `hpplite_witnesses` - Registered witnesses
-  - `hpplite_status` - Local node status, sync state
-- [ ] **Cross-layer Queries** - Join L1 state with local data
-
-### Future
-- [ ] **Data Availability** - IPFS/Arweave batch storage
-- [ ] **Batch Pruning** - Delete batches after L1 finality
-- [ ] **Light Clients** - Verify state with Merkle proofs only
-- [ ] **IoT Optimizations** - Reduced footprint for embedded devices
-- [ ] **Fraud Proofs** - Challenge invalid state transitions
-- [ ] **Cross-L2 Messaging** - Communication between HPPLite instances
-- [ ] **SQL Subset Restrictions** - Determinism guarantees
-- [ ] **WAL Mode Support** - Better concurrent read performance
-
-## Design Decisions
-
-### Why SQLite?
-- Battle-tested, billions of deployments
-- Single-file database, easy backup/restore
-- Pre-update hooks enable state tracking
-- Embedded, no external dependencies
-- Perfect for edge/IoT scenarios
-
-### Why HPP Network?
-- EVM-compatible, standard tooling
-- Low fees for checkpoint transactions
-- Fast finality for L2 confirmation
-- Testnet available for development
-
-### Batch vs Transaction Model
-HPPLite uses a batch model where multiple SQL operations are grouped:
-- Reduces L1 costs (one checkpoint per N batches)
-- Better throughput than per-TX commits
-- Witnesses verify batch outcomes, not individual ops
+### Planned
+- [ ] Batch compression (reduce DA costs)
+- [ ] Off-chain DA (IPFS/Arweave)
+- [ ] Virtual tables for L1 state queries
+- [ ] Light client mode (Merkle proofs only)
+- [ ] Fraud proofs
 
 ## License
 
