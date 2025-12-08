@@ -7,6 +7,7 @@
 #include "hpplite.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sys/time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -723,6 +724,7 @@ void hpplite_finalize_verified_batch(HppliteCtx *pCtx) {
 #include "crypto.h"
 #include "fs_storage.h"
 #include "batch.h"
+#include "l1_interface.h"
 
 /*
 ** Global registry mapping sqlite3* -> HppliteOpenState
@@ -736,6 +738,7 @@ struct HppliteOpenState {
     HppliteCrypto *crypto;
     HppliteKeypair keypair;
     HppliteStorage *storage;
+    HppliteL1 *l1;              /* L1 connection (auto-connected if config present) */
     HppliteOpenState *next;
 
     /* Batch timer state */
@@ -879,6 +882,12 @@ static void hpplite_close_hook(void *pArg, sqlite3 *db) {
         state->ctx = NULL;
     }
 
+    /* Disconnect L1 if connected */
+    if (state->l1) {
+        hpplite_l1_disconnect(state->l1);
+        state->l1 = NULL;
+    }
+
     /* Destroy mutex before freeing state */
     pthread_mutex_destroy(&state->flushMutex);
 
@@ -947,6 +956,17 @@ sqlite3 *hpplite_open(const char *uri) {
     /* Initialize storage */
     hpplite_storage_init(config->dataDir, &state->storage);
 
+    /* Auto-connect to L1 if rpcUrl and contract are configured */
+    if (config->rpcUrl && config->hasContract) {
+        char contractHex[43];
+        snprintf(contractHex, sizeof(contractHex), "0x");
+        for (int i = 0; i < 20; i++) {
+            snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
+        }
+        state->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
+        /* Note: L1 connection failure is not fatal - may be offline */
+    }
+
     /* Initialize timer thread state */
     state->timerRunning = 0;
 
@@ -980,6 +1000,11 @@ HppliteCtx *hpplite_context(sqlite3 *db) {
 struct HppliteConfig *hpplite_get_config(sqlite3 *db) {
     HppliteOpenState *state = findOpenState(db);
     return state ? state->config : NULL;
+}
+
+HppliteL1 *hpplite_get_l1(sqlite3 *db) {
+    HppliteOpenState *state = findOpenState(db);
+    return state ? state->l1 : NULL;
 }
 
 /*
@@ -1160,6 +1185,17 @@ static int hpplite_auto_init(
 
     /* Initialize storage */
     hpplite_storage_init(config->dataDir, &state->storage);
+
+    /* Auto-connect to L1 if rpcUrl and contract are configured */
+    if (config->rpcUrl && config->hasContract) {
+        char contractHex[43];
+        snprintf(contractHex, sizeof(contractHex), "0x");
+        for (int i = 0; i < 20; i++) {
+            snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
+        }
+        state->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
+        /* Note: L1 connection failure is not fatal - may be offline */
+    }
 
     /* Initialize timer thread state */
     state->timerRunning = 0;
