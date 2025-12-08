@@ -277,10 +277,8 @@ int main(void) {
     {
         unlink("/tmp/test_simple_open.db");
 
-        /* Register HPPLite auto-extension */
-        hpplite_register();
-
-        /* Open with standard SQLite API - HPPLite auto-initializes! */
+        /* Open with standard SQLite API - HPPLite auto-initializes!
+         * No registration needed - HPPLite is built into SQLite. */
         sqlite3 *db;
         int rc = sqlite3_open_v2(
             "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple",
@@ -307,9 +305,6 @@ int main(void) {
 
         /* Close with standard sqlite3_close - should auto-flush via close hook */
         sqlite3_close(db);
-
-        /* Unregister */
-        hpplite_unregister();
 
         PASS();
         passed++;

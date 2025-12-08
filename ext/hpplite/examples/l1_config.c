@@ -2,10 +2,12 @@
 ** HPPLite Example: L1 Configuration
 **
 ** Demonstrates:
-** - Transparent SQLite API with hpplite_register()
+** - Transparent SQLite API with ?hpplite=on URI parameter
 ** - Using network aliases (l1=hpp-sepolia)
 ** - Reading system config from L1 contract
 ** - Building DA URIs
+**
+** No registration needed - HPPLite is built into SQLite!
 **
 ** Build:
 **   gcc -I.. -I../../build -o l1_config l1_config.c \
@@ -35,9 +37,6 @@ int main(void) {
 
     /* Clean up */
     system("rm -rf " DATA_DIR " && mkdir -p " DATA_DIR);
-
-    /* Register HPPLite auto-extension */
-    hpplite_register();
 
     /*
      * Open database with standard SQLite API.
@@ -128,7 +127,6 @@ int main(void) {
     }
 
     sqlite3_close(db);
-    hpplite_unregister();
     printf("\nDone!\n");
     return 0;
 }

@@ -1214,24 +1214,33 @@ static int hpplite_auto_init(
 }
 
 /*
-** Register HPPLite as an auto-extension.
-** Call this once at application startup to enable transparent HPPLite support.
-** After registration, any sqlite3_open() with ?hpplite=on will automatically
-** initialize HPPLite.
-**
-** Example:
-**   hpplite_register();
-**   sqlite3_open_v2("file:db.sqlite?hpplite=on&role=sequencer", &db, flags, NULL);
+** Auto-register HPPLite when the library is loaded.
+** This uses a constructor attribute so registration happens automatically
+** before main() is called.
 */
-void hpplite_register(void) {
+__attribute__((constructor))
+static void hpplite_auto_register(void) {
     sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
 }
 
 /*
+** Register HPPLite as an auto-extension.
+**
+** DEPRECATED: No longer needed. HPPLite auto-registers when the library
+** is loaded via constructor. This function is retained for backwards
+** compatibility but does nothing.
+*/
+void hpplite_register(void) {
+    /* No-op: auto-registered via constructor */
+}
+
+/*
 ** Unregister HPPLite auto-extension.
+**
+** DEPRECATED: Retained for backwards compatibility but does nothing.
 */
 void hpplite_unregister(void) {
-    sqlite3_cancel_auto_extension((void(*)(void))hpplite_auto_init);
+    /* No-op */
 }
 
 /*
