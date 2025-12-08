@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Options
 option(HPPLITE_BUILD_TESTS "Build test executables" ON)
 option(HPPLITE_ENABLE_ZMQ "Enable ZeroMQ networking (M2+)" ON)
+option(HPPLITE_USE_REAL_L1 "Use real Ethereum L1 (vs mock)" OFF)
 
 # Find dependencies
 find_package(PkgConfig REQUIRED)
@@ -66,7 +67,8 @@ set(HPPLITE_SOURCES
     fs_storage.c
     crypto.c
     node.c
-    l1_mock.c
+    da_uri.c
+    config.c
     # M3 Web3 integration (eth/ subdirectory)
     eth/cJSON.c
     eth/keccak256.c
@@ -74,6 +76,15 @@ set(HPPLITE_SOURCES
     eth/abi.c
     eth/eth_client.c
 )
+
+# L1 backend selection (mock vs real Ethereum)
+if(HPPLITE_USE_REAL_L1)
+    list(APPEND HPPLITE_SOURCES l1_eth.c)
+    message(STATUS "L1 backend: Real Ethereum (l1_eth.c)")
+else()
+    list(APPEND HPPLITE_SOURCES l1_mock.c)
+    message(STATUS "L1 backend: Mock (l1_mock.c)")
+endif()
 
 # Add ZMQ networking source if enabled
 if(HPPLITE_ENABLE_ZMQ)
@@ -167,6 +178,38 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_eth_client eth/test_eth_client.c)
     target_link_libraries(test_eth_client hpplite)
 
+    # M3 L1 Ethereum client test (requires network)
+    add_executable(test_l1_eth test_l1_eth.c)
+    target_link_libraries(test_l1_eth hpplite)
+
+    # M3 E2E test (requires network and deployed contract)
+    add_executable(test_m3_e2e test_m3_e2e.c)
+    target_link_libraries(test_m3_e2e hpplite)
+
+    # M3 Checkpoint submission test (requires network)
+    add_executable(test_m3_checkpoint test_m3_checkpoint.c)
+    target_link_libraries(test_m3_checkpoint hpplite)
+
+    # M3 L2 Reconstruction test (requires network + prior checkpoint data)
+    add_executable(test_m3_reconstruct test_m3_reconstruct.c)
+    target_link_libraries(test_m3_reconstruct hpplite)
+
+    # M3 Witness attestation test
+    add_executable(test_m3_witness test_m3_witness.c)
+    target_link_libraries(test_m3_witness hpplite)
+
+    # M3 Multi-node E2E test
+    add_executable(test_m3_multinode test_m3_multinode.c)
+    target_link_libraries(test_m3_multinode hpplite)
+
+    # DA URI scheme test
+    add_executable(test_da_uri test_da_uri.c)
+    target_link_libraries(test_da_uri hpplite)
+
+    # Simple open API test
+    add_executable(test_simple_open test_simple_open.c)
+    target_link_libraries(test_simple_open hpplite)
+
     # Add tests to CTest
     enable_testing()
     add_test(NAME test_hpplite COMMAND test_hpplite)
@@ -185,6 +228,8 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
+    add_test(NAME test_da_uri COMMAND test_da_uri)
+    add_test(NAME test_simple_open COMMAND test_simple_open)
     # Note: test_eth_client requires network, not in ctest
 endif()
 
@@ -207,5 +252,6 @@ message(STATUS "  SQLite dir: ${SQLITE_DIR}")
 message(STATUS "  secp256k1: ${SECP256K1_LIBRARIES}")
 message(STATUS "  libcurl: ${CURL_LIBRARIES}")
 message(STATUS "  ZeroMQ: ${HPPLITE_ENABLE_ZMQ}")
+message(STATUS "  Real L1: ${HPPLITE_USE_REAL_L1}")
 message(STATUS "  Build tests: ${HPPLITE_BUILD_TESTS}")
 message(STATUS "")

@@ -404,3 +404,32 @@ int eth_client_get_receipt(EthClient *client,
     cJSON_Delete(response);
     return 1; /* mined */
 }
+
+/* Static context for address derivation (lazy init) */
+static secp256k1_context *g_addr_ctx = NULL;
+
+int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]) {
+    /* Lazy init secp256k1 context */
+    if (!g_addr_ctx) {
+        g_addr_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+        if (!g_addr_ctx) return -1;
+    }
+
+    /* Parse compressed pubkey */
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(g_addr_ctx, &pk, pubkey, 33)) {
+        return -1;
+    }
+
+    /* Serialize uncompressed */
+    uint8_t uncompressed[65];
+    size_t len = 65;
+    if (!secp256k1_ec_pubkey_serialize(g_addr_ctx, uncompressed, &len,
+                                        &pk, SECP256K1_EC_UNCOMPRESSED)) {
+        return -1;
+    }
+
+    /* Hash to get address */
+    eth_address_from_pubkey(uncompressed, address);
+    return 0;
+}
