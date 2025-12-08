@@ -137,14 +137,6 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_batch test_batch.c)
     target_link_libraries(test_batch hpplite)
 
-    # Sequencer API test
-    add_executable(test_sequencer test_sequencer.c)
-    target_link_libraries(test_sequencer hpplite)
-
-    # Integrated flow test
-    add_executable(test_integrated test_integrated.c)
-    target_link_libraries(test_integrated hpplite)
-
     # Full node test
     add_executable(test_node test_node.c)
     target_link_libraries(test_node hpplite)
@@ -153,9 +145,9 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_l1_mock test_l1_mock.c)
     target_link_libraries(test_l1_mock hpplite)
 
-    # M1 integration test
-    add_executable(test_m1_integration test_m1_integration.c)
-    target_link_libraries(test_m1_integration hpplite)
+    # Checkpoint flow test (sequencer + witnesses, single process)
+    add_executable(test_checkpoint_flow test_checkpoint_flow.c)
+    target_link_libraries(test_checkpoint_flow hpplite)
 
     # M2 multi-process test (requires ZMQ)
     if(HPPLITE_ENABLE_ZMQ)
@@ -214,11 +206,9 @@ if(HPPLITE_BUILD_TESTS)
     enable_testing()
     add_test(NAME test_hpplite COMMAND test_hpplite)
     add_test(NAME test_batch COMMAND test_batch)
-    add_test(NAME test_sequencer COMMAND test_sequencer)
-    add_test(NAME test_integrated COMMAND test_integrated)
     add_test(NAME test_node COMMAND test_node)
     add_test(NAME test_l1_mock COMMAND test_l1_mock)
-    add_test(NAME test_m1_integration COMMAND test_m1_integration)
+    add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
     if(HPPLITE_ENABLE_ZMQ)
         add_test(NAME test_m2_multiprocess COMMAND test_m2_multiprocess)
         add_test(NAME test_m2_nodes COMMAND test_m2_nodes)
