@@ -805,6 +805,37 @@ static void removeNode(sqlite3 *db) {
     }
 }
 
+/* Forward declarations for SQL functions */
+static void hpplite_sync_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+
+/*
+** Register a node with the global registry and set up SQL functions.
+** Called by hpplite_node_create() and hpplite_node_create_with_db().
+*/
+void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
+    if (!db || !node) return;
+
+    /* Check if already registered */
+    if (findEntry(db)) return;
+
+    /* Add to registry */
+    NodeEntry *entry = calloc(1, sizeof(NodeEntry));
+    if (!entry) return;
+
+    entry->db = db;
+    entry->node = node;
+    entry->config = NULL;  /* No config for direct node creation */
+    entry->next = g_nodeRegistry;
+    g_nodeRegistry = entry;
+
+    /* Register SQL functions */
+    sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
+                            hpplite_sync_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
+                            hpplite_flush_func, NULL, NULL);
+}
+
 /*
 ** Close hook callback - called automatically by sqlite3_close()
 ** This performs all HPPLite cleanup before SQLite tears down the connection.
@@ -844,7 +875,17 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     memcpy(nc->contract, cfg->contract, 20);
     nc->hasContract = cfg->hasContract;
     nc->batchIntervalMs = cfg->batchIntervalMs;
-    nc->role = HPPLITE_ROLE_SEQUENCER;  /* Default to sequencer for transparent API */
+
+    /* Role from config, default to sequencer */
+    switch (cfg->role) {
+        case HPPLITE_CFG_ROLE_SEQUENCER: nc->role = HPPLITE_ROLE_SEQUENCER; break;
+        case HPPLITE_CFG_ROLE_WITNESS:   nc->role = HPPLITE_ROLE_WITNESS; break;
+        default:                          nc->role = HPPLITE_ROLE_SEQUENCER; break;
+    }
+
+    /* ZMQ networking */
+    nc->bindAddress = cfg->zmqBind ? strdup(cfg->zmqBind) : NULL;
+    nc->sequencerAddress = cfg->zmqSequencer ? strdup(cfg->zmqSequencer) : NULL;
 }
 
 /*
@@ -900,11 +941,22 @@ sqlite3 *hpplite_open(const char *uri) {
     entry->next = g_nodeRegistry;
     g_nodeRegistry = entry;
 
+    /* Register SQL functions */
+    sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
+                            hpplite_sync_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
+                            hpplite_flush_func, NULL, NULL);
+
     /* Register close hook for automatic cleanup */
     sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
+
+    /* Start ZMQ transport if configured */
+    if (config->zmqBind || config->zmqSequencer) {
+        hpplite_node_start(node);
+    }
 
     return db;
 }
@@ -933,6 +985,10 @@ HppliteL1 *hpplite_get_l1(sqlite3 *db) {
     return node ? node->l1 : NULL;
 }
 
+HppliteNode *hpplite_get_node(sqlite3 *db) {
+    return findNode(db);
+}
+
 uint64_t hpplite_flush(sqlite3 *db) {
     HppliteNode *node = findNode(db);
     if (!node) return 0;
@@ -959,6 +1015,98 @@ void hpplite_state_root(sqlite3 *db, unsigned char *out) {
     } else {
         memset(out, 0, HPPLITE_HASH_SIZE);
     }
+}
+
+/*
+** SQL function: hpplite_sync()
+** Triggers sync from L1 for witness/replica nodes.
+*/
+static void hpplite_sync_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = findNode(db);
+
+    if (!node) {
+        sqlite3_result_int(ctx, 0);
+        return;
+    }
+
+    if (!node->l1) {
+        /* No L1 connection, nothing to sync */
+        sqlite3_result_int(ctx, 0);
+        return;
+    }
+
+    /* Get current L1 state */
+    uint64_t lastBatch = 0, totalBatches = 0;
+    unsigned char latestHash[32];
+    if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) {
+        sqlite3_result_int(ctx, 0);
+        return;
+    }
+
+    /* Replay batches we haven't seen yet */
+    uint64_t currentHeight = node->ctx->blockHeight - 1;
+    int synced = 0;
+
+    for (uint64_t h = currentHeight + 1; h <= lastBatch; h++) {
+        size_t dataLen = 0;
+        uint8_t *data = hpplite_l1_get_batch(node->l1, h, &dataLen);
+        if (data && dataLen > 0) {
+            HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
+            if (batch) {
+                /* Set checkpoint window start for first batch */
+                if (synced == 0 && h == currentHeight + 1) {
+                    node->checkpointFromHeight = batch->height;
+                    memcpy(node->checkpointPreRoot, batch->preStateRoot, HPPLITE_HASH_SIZE);
+                }
+                for (int i = 0; i < batch->nTxns; i++) {
+                    if (batch->aTxns[i].zSql) {
+                        sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
+                    }
+                }
+                node->ctx->blockHeight = batch->height + 1;
+                node->lastVerifiedHeight = batch->height;
+                memcpy(node->lastVerifiedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                hpplite_batch_free(batch);
+                synced++;
+            }
+            free(data);
+        }
+    }
+
+    sqlite3_result_int(ctx, synced);
+}
+
+/*
+** SQL function: hpplite_flush()
+** Triggers a batch flush for sequencer nodes.
+*/
+static void hpplite_flush_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = findNode(db);
+
+    if (!node || node->role != HPPLITE_ROLE_SEQUENCER) {
+        sqlite3_result_int64(ctx, 0);
+        return;
+    }
+
+    uint64_t height = hpplite_node_flush_batch(node);
+    sqlite3_result_int64(ctx, (sqlite3_int64)height);
 }
 
 /*
@@ -1021,11 +1169,22 @@ static int hpplite_auto_init(
     entry->next = g_nodeRegistry;
     g_nodeRegistry = entry;
 
+    /* Register SQL functions */
+    sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
+                            hpplite_sync_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
+                            hpplite_flush_func, NULL, NULL);
+
     /* Register close hook for automatic cleanup */
     sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
+
+    /* Start ZMQ transport if configured */
+    if (config->zmqBind || config->zmqSequencer) {
+        hpplite_node_start(node);
+    }
 
     return SQLITE_OK;
 }

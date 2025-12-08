@@ -165,6 +165,15 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_multinode tests/unit/test_multinode.c)
     target_link_libraries(test_multinode hpplite)
 
+    add_executable(test_bugs tests/unit/test_bugs.c)
+    target_link_libraries(test_bugs hpplite)
+
+    # test_full_e2e uses mock L1 - only build when not using real L1
+    if(NOT HPPLITE_USE_REAL_L1)
+        add_executable(test_full_e2e tests/unit/test_full_e2e.c)
+        target_link_libraries(test_full_e2e hpplite)
+    endif()
+
     if(HPPLITE_ENABLE_ZMQ)
         add_executable(test_zmq tests/unit/test_zmq.c)
         target_link_libraries(test_zmq hpplite Threads::Threads)
@@ -178,36 +187,26 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
     add_executable(test_abi eth/test_abi.c eth/abi.c eth/keccak256.c)
 
-    # === Integration Tests (require network + .env) ===
+    # === Integration Tests (require network + HPPLITE_PRIVATE_KEY) ===
     # Located in tests/integration/
-    # Run manually: ./test_factory, ./test_l1_e2e, etc.
+    # Run manually: ./test_l1_primitives, ./test_single_node, ./test_cluster
+    #
+    # Three non-overlapping scopes:
+    #   test_l1_primitives - L1 client & factory primitives (no HPPLite nodes)
+    #   test_single_node   - Single node E2E with transparent API
+    #   test_cluster       - Multi-node cluster with ZMQ + attestations
 
     add_executable(test_eth_client eth/test_eth_client.c)
     target_link_libraries(test_eth_client hpplite)
 
-    add_executable(test_l1_client tests/integration/test_l1_client.c)
-    target_link_libraries(test_l1_client hpplite)
+    add_executable(test_l1_primitives tests/integration/test_l1_primitives.c)
+    target_link_libraries(test_l1_primitives hpplite)
 
-    add_executable(test_l1_e2e tests/integration/test_l1_e2e.c)
-    target_link_libraries(test_l1_e2e hpplite)
+    add_executable(test_single_node tests/integration/test_single_node.c)
+    target_link_libraries(test_single_node hpplite)
 
-    add_executable(test_l1_checkpoint tests/integration/test_l1_checkpoint.c)
-    target_link_libraries(test_l1_checkpoint hpplite)
-
-    add_executable(test_factory tests/integration/test_factory.c)
-    target_link_libraries(test_factory hpplite)
-
-    add_executable(test_l1_reconstruct tests/integration/test_l1_reconstruct.c)
-    target_link_libraries(test_l1_reconstruct hpplite)
-
-    add_executable(test_full_e2e tests/integration/test_full_e2e.c)
-    target_link_libraries(test_full_e2e hpplite)
-
-    add_executable(test_l1_full_e2e tests/integration/test_l1_full_e2e.c)
-    target_link_libraries(test_l1_full_e2e hpplite)
-
-    add_executable(test_full_cluster tests/integration/test_full_cluster.c)
-    target_link_libraries(test_full_cluster hpplite)
+    add_executable(test_cluster tests/integration/test_full_cluster.c)
+    target_link_libraries(test_cluster hpplite Threads::Threads)
 
     # === CTest Registration (unit tests only) ===
     enable_testing()

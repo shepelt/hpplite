@@ -331,7 +331,7 @@ int hpplite_l1_is_witness(HppliteL1 *l1, const unsigned char *pubkey) {
         hpplite_l1_state_free(state);
         return 0;
     }
-    
+
     int result = 0;
     if (state->witnessAddresses) {
         for (int i = 0; i < state->nWitnesses; i++) {
@@ -341,7 +341,7 @@ int hpplite_l1_is_witness(HppliteL1 *l1, const unsigned char *pubkey) {
             }
         }
     }
-    
+
     hpplite_l1_state_free(state);
     return result;
 }
