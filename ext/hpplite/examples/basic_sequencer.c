@@ -1,13 +1,13 @@
 /*
 ** HPPLite Example: Basic Sequencer
 **
-** Demonstrates:
-** - Using hpplite_open() with URI parameters
-** - OR using hpplite_register() + standard sqlite3_open_v2()
-** - Standard SQLite API (sqlite3_exec) for database operations
+** Demonstrates transparent SQLite integration:
+** - Register HPPLite once with hpplite_register()
+** - Use standard sqlite3_open_v2() with ?hpplite=on URI parameter
+** - Use standard sqlite3_exec() for all database operations
 ** - Automatic state root tracking
 ** - Manual and automatic batch creation
-** - Transparent close via sqlite3_close() or hpplite_close()
+** - Transparent close via sqlite3_close() (close hook handles cleanup)
 **
 ** Build:
 **   cd ../build && make
@@ -41,24 +41,33 @@ int main(void) {
     system(cmd);
 
     /*
-     * Open database with HPPLite enabled.
+     * Register HPPLite auto-extension (call once at app startup).
+     * After this, any sqlite3_open() with ?hpplite=on will auto-initialize.
+     */
+    hpplite_register();
+
+    /*
+     * Open database with standard SQLite API.
+     * HPPLite auto-initializes via the registered extension!
      *
      * URI parameters:
      *   hpplite=on        - Enable HPPLite
      *   role=sequencer    - This node produces batches
      *   datadir=/path     - Where to store batches
-     *
-     * The returned db handle works like a normal sqlite3 handle.
      */
     printf("Opening database with HPPLite...\n");
-    sqlite3 *db = hpplite_open(
+    sqlite3 *db;
+    int rc = sqlite3_open_v2(
         "file:" DATA_DIR "/state.db"
         "?hpplite=on"
         "&role=sequencer"
-        "&datadir=" DATA_DIR
+        "&datadir=" DATA_DIR,
+        &db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+        NULL
     );
-    if (!db) {
-        printf("ERROR: Failed to open database\n");
+    if (rc != SQLITE_OK) {
+        printf("ERROR: Failed to open database: %s\n", sqlite3_errmsg(db));
         return 1;
     }
 
@@ -131,59 +140,13 @@ int main(void) {
     snprintf(cmd, sizeof(cmd), "ls -la %s/batches/", DATA_DIR);
     system(cmd);
 
-    /* Close - any pending changes are flushed automatically.
-     * Using standard sqlite3_close() - the close hook handles cleanup! */
+    /* Close with standard sqlite3_close() - the close hook handles cleanup!
+     * Any pending changes are flushed automatically. */
     sqlite3_close(db);
-    printf("\nDone with hpplite_open() approach!\n");
 
-    /*
-     * =========================================================
-     * Alternative: Auto-Extension Approach
-     * =========================================================
-     *
-     * For fully transparent SQLite integration, use hpplite_register()
-     * once at startup. Then standard sqlite3_open_v2() + sqlite3_close()
-     * works automatically!
-     */
-    printf("\n--- Auto-Extension Demo ---\n\n");
-
-    /* Register HPPLite as auto-extension (call once at app startup) */
-    hpplite_register();
-
-    /* Now use standard SQLite API - HPPLite auto-initializes! */
-    sqlite3 *db2;
-    rc = sqlite3_open_v2(
-        "file:" DATA_DIR "/auto.db?hpplite=on&role=sequencer&datadir=" DATA_DIR,
-        &db2,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-        NULL
-    );
-    if (rc != SQLITE_OK) {
-        printf("ERROR: sqlite3_open_v2 failed\n");
-        return 1;
-    }
-
-    /* HPPLite is active - verify by getting context */
-    if (hpplite_context(db2)) {
-        printf("HPPLite auto-initialized via sqlite3_open_v2!\n");
-    }
-
-    /* Standard SQLite operations - changes tracked automatically */
-    sqlite3_exec(db2, "CREATE TABLE auto_test(id INT, val TEXT)", NULL, NULL, NULL);
-    sqlite3_exec(db2, "INSERT INTO auto_test VALUES(1, 'transparent')", NULL, NULL, NULL);
-
-    hpplite_state_root(db2, stateRoot);
-    printf("State root: ");
-    print_hex(stateRoot, 32);
-    printf("\n");
-
-    /* Standard sqlite3_close - close hook flushes pending batch! */
-    sqlite3_close(db2);
-    printf("Closed with sqlite3_close() - close hook handled cleanup!\n");
-
-    /* Unregister when done */
+    /* Unregister auto-extension when done (optional, for cleanup) */
     hpplite_unregister();
 
-    printf("\nAll done!\n");
+    printf("\nDone!\n");
     return 0;
 }
