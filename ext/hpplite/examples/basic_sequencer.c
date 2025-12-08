@@ -2,22 +2,19 @@
 ** HPPLite Example: Basic Sequencer
 **
 ** Demonstrates transparent SQLite integration:
-** - Register HPPLite once with hpplite_register()
 ** - Use standard sqlite3_open_v2() with ?hpplite=on URI parameter
 ** - Use standard sqlite3_exec() for all database operations
 ** - Automatic state root tracking
 ** - Manual and automatic batch creation
 ** - Transparent close via sqlite3_close() (close hook handles cleanup)
 **
+** No registration needed - HPPLite is built into SQLite!
+**
 ** Build:
 **   cd ../build && make
 **   gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
 **       ../build/libhpplite.a ../build/libsqlite3.a \
 **       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq -lpthread
-**
-** Or if using the makefile in build directory:
-**   make && gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
-**       libhpplite.a libsqlite3.a -lsecp256k1 -lcurl -lzmq -lpthread
 */
 
 #include "hpplite.h"
@@ -41,14 +38,8 @@ int main(void) {
     system(cmd);
 
     /*
-     * Register HPPLite auto-extension (call once at app startup).
-     * After this, any sqlite3_open() with ?hpplite=on will auto-initialize.
-     */
-    hpplite_register();
-
-    /*
      * Open database with standard SQLite API.
-     * HPPLite auto-initializes via the registered extension!
+     * HPPLite auto-initializes when ?hpplite=on is in the URI!
      *
      * URI parameters:
      *   hpplite=on        - Enable HPPLite
@@ -143,9 +134,6 @@ int main(void) {
     /* Close with standard sqlite3_close() - the close hook handles cleanup!
      * Any pending changes are flushed automatically. */
     sqlite3_close(db);
-
-    /* Unregister auto-extension when done (optional, for cleanup) */
-    hpplite_unregister();
 
     printf("\nDone!\n");
     return 0;

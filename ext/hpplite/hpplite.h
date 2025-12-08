@@ -302,22 +302,19 @@ uint64_t hpplite_check_flush(sqlite3 *db);
 void hpplite_state_root(sqlite3 *db, unsigned char *out);
 
 /*
-** Register HPPLite as an auto-extension.
-** Call this once at application startup to enable transparent HPPLite support.
-** After registration, any sqlite3_open_v2() with ?hpplite=on will automatically
-** initialize HPPLite.
+** DEPRECATED: No longer needed.
+**
+** HPPLite auto-registers via a constructor when the library is loaded.
+** Just use sqlite3_open_v2() directly:
 **
 ** Example:
-**   hpplite_register();
 **   sqlite3_open_v2("file:db.sqlite?hpplite=on&role=sequencer", &db, flags, NULL);
 **   sqlite3_exec(db, "INSERT ...", ...);  // Changes tracked automatically
 **   sqlite3_close(db);  // Flushes pending batch automatically
+**
+** These functions are retained for backwards compatibility but do nothing.
 */
 void hpplite_register(void);
-
-/*
-** Unregister HPPLite auto-extension.
-*/
 void hpplite_unregister(void);
 
 /*
