@@ -70,4 +70,7 @@ int eth_hex_decode(const char *hex, uint8_t *out, size_t out_len);
 /* Derive Ethereum address from compressed (33-byte) public key */
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]);
 
+/* Derive Ethereum address from private key */
+int eth_address_from_privkey(const uint8_t privkey[32], uint8_t address[20]);
+
 #endif /* ETH_CLIENT_H */

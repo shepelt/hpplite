@@ -140,6 +140,7 @@ static int test_setup_l1_and_nodes(void) {
     memset(&seqCfg, 0, sizeof(seqCfg));
     seqCfg.nodeId = "sequencer";
     memcpy(seqCfg.privkey, SEQ_PRIVKEY, 32);
+    seqCfg.hasPrivkey = 1;
     seqCfg.dataDir = seqDir;
     seqCfg.dbPath = seqDb;
     seqCfg.requiredAttestations = 2;
@@ -149,6 +150,7 @@ static int test_setup_l1_and_nodes(void) {
     memset(&wit1Cfg, 0, sizeof(wit1Cfg));
     wit1Cfg.nodeId = "witness1";
     memcpy(wit1Cfg.privkey, WIT1_PRIVKEY, 32);
+    wit1Cfg.hasPrivkey = 1;
     wit1Cfg.dataDir = wit1Dir;
     wit1Cfg.dbPath = wit1Db;
 
@@ -156,6 +158,7 @@ static int test_setup_l1_and_nodes(void) {
     memset(&wit2Cfg, 0, sizeof(wit2Cfg));
     wit2Cfg.nodeId = "witness2";
     memcpy(wit2Cfg.privkey, WIT2_PRIVKEY, 32);
+    wit2Cfg.hasPrivkey = 1;
     wit2Cfg.dataDir = wit2Dir;
     wit2Cfg.dbPath = wit2Db;
 

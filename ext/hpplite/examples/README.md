@@ -96,6 +96,21 @@ DA URI scheme demonstration:
 ./da_uri_demo
 ```
 
+### factory_demo.c
+
+Factory pattern demonstration showing:
+- Auto-discovery of rollup from wallet (private key)
+- Auto-creation of rollup if none exists
+- One rollup per wallet (1:1 wallet:rollup mapping)
+- Using factory helper functions
+
+```bash
+export HPPLITE_PRIVATE_KEY=0x...
+./factory_demo
+```
+
+**Note:** Requires network access to HPP Sepolia and the factory contract to be deployed.
+
 ## URI Parameters
 
 Open databases with configuration in the URI:

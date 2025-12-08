@@ -17,6 +17,7 @@
 
 #include "batch.h"
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,6 +117,12 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1);
 void hpplite_l1_system_config_free(HppliteSystemConfig *config);
 
 /*
+** Set private key for signing L1 transactions.
+** Must be called before submitting batches or checkpoints.
+*/
+int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]);
+
+/*
 ** Disconnect from L1
 */
 void hpplite_l1_disconnect(HppliteL1 *l1);
@@ -187,6 +194,113 @@ int hpplite_l1_poll(HppliteL1 *l1);
 ** Returns 1 if success, 0 if reverted, -1 if pending/error
 */
 int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs);
+
+/* === Factory Functions (for auto-deploy) === */
+
+/*
+** Get rollup address for an owner from factory.
+** Returns: 1 if rollup exists (address in rollup_address_out)
+**          0 if no rollup for this owner
+**         -1 on error
+*/
+int hpplite_l1_factory_get_rollup(
+    const char *rpc_url,
+    const char *factory_address,    /* NULL for default HPP Sepolia factory */
+    const uint8_t owner_address[20],
+    uint8_t rollup_address_out[20]
+);
+
+/*
+** Check if owner has a rollup.
+** Returns: 1 if rollup exists, 0 if no rollup, -1 on error
+*/
+int hpplite_l1_factory_has_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20]
+);
+
+/*
+** Get or create rollup for the wallet associated with privkey.
+** If no rollup exists, creates one (transaction).
+** Returns transaction hash on success, NULL on failure.
+** Caller should wait for tx, then call get_rollup to get address.
+*/
+char *hpplite_l1_factory_get_or_create_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t rollup_address_out[20]
+);
+
+/*
+** Get rollup address for the wallet associated with privkey.
+** Helper that derives address from privkey, then calls get_rollup.
+** Returns: 1 if rollup exists, 0 if no rollup, -1 on error
+*/
+int hpplite_l1_factory_get_my_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t rollup_address_out[20]
+);
+
+/*
+** Connect to L1 using factory - auto-discovers rollup for this wallet.
+** Returns NULL if no rollup exists for this wallet.
+** On success, private key is already set for transactions.
+*/
+HppliteL1 *hpplite_l1_connect_factory(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32]
+);
+
+/* === Batch DA Functions (on-chain data availability) === */
+
+/*
+** Submit batch data to L1 for data availability.
+** Returns transaction hash on success, NULL on failure.
+*/
+char *hpplite_l1_submit_batch(
+    HppliteL1 *l1,
+    uint64_t height,
+    const uint8_t *data,
+    size_t data_len
+);
+
+/*
+** Get batch data from L1.
+** Returns batch data (caller must free), NULL if not found.
+*/
+uint8_t *hpplite_l1_get_batch(
+    HppliteL1 *l1,
+    uint64_t height,
+    size_t *data_len_out
+);
+
+/*
+** Get batch hash from L1.
+** Returns: 1 if batch exists (hash in hash_out)
+**          0 if no batch at this height
+**         -1 on error
+*/
+int hpplite_l1_get_batch_hash(
+    HppliteL1 *l1,
+    uint64_t height,
+    uint8_t hash_out[32]
+);
+
+/*
+** Get DA state from L1 contract.
+** Returns 0 on success, -1 on error.
+*/
+int hpplite_l1_get_da_state(
+    HppliteL1 *l1,
+    uint64_t *last_batch_height,
+    uint64_t *total_batches,
+    uint8_t latest_batch_hash[32]
+);
 
 /* === Mock-specific functions for testing === */
 

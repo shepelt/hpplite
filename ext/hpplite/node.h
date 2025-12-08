@@ -76,20 +76,32 @@ typedef struct HppliteNodeConfig {
     /* Identity */
     char *nodeId;                   /* Human-readable node ID */
     unsigned char privkey[32];      /* Node's private key */
+    int hasPrivkey;                 /* Whether privkey is set */
 
     /* Paths */
     char *dataDir;                  /* Data directory */
     char *dbPath;                   /* SQLite database path */
 
-    /* Network */
+    /* L1 Connection */
+    char *rpcUrl;                   /* L1 RPC endpoint */
+    unsigned char factory[20];      /* Factory contract address */
+    int hasFactory;                 /* Whether factory is set */
+    unsigned char contract[20];     /* Direct contract address */
+    int hasContract;                /* Whether contract is set */
+
+    /* P2P Network (ZMQ) */
     char *bindAddress;              /* Address to bind, e.g. tcp on port 5555 */
     char *sequencerAddress;         /* Sequencer address to connect to */
+
+    /* Role */
+    HppliteNodeRole role;           /* Desired role (sequencer/witness) */
 
     /* Thresholds */
     int requiredAttestations;       /* Signatures needed for finality */
     int checkpointInterval;         /* Batches between L1 checkpoints */
     int batchTimeoutMs;             /* Max time to wait for batch (ms) */
     int attestationTimeoutMs;       /* Max time to wait for attestations (ms) */
+    int batchIntervalMs;            /* Auto-flush interval (0 = disabled) */
 } HppliteNodeConfig;
 
 /*
@@ -159,6 +171,19 @@ typedef struct HppliteNode {
     uint64_t batchesVerified;
     uint64_t attestationsSent;
     uint64_t attestationsReceived;
+
+    /* Auto-flush timer thread (for transparent API) */
+    void *timerThread;              /* pthread_t (opaque to avoid header dep) */
+    void *flushMutex;               /* pthread_mutex_t */
+    volatile int timerRunning;      /* Flag to signal thread to stop */
+    int64_t lastFlushTime;          /* Last flush timestamp (ms) */
+    unsigned char lastFlushedRoot[HPPLITE_HASH_SIZE];  /* State root at last flush */
+
+    /* Flag: does this node own the db connection? */
+    int ownsDb;
+
+    /* Flag: does this node own the L1 connection? */
+    int ownsL1;
 } HppliteNode;
 
 /*
@@ -168,9 +193,27 @@ typedef struct HppliteNode {
 HppliteNode *hpplite_node_create(const HppliteNodeConfig *config);
 
 /*
+** Initialize a node using an existing database connection.
+** The node does NOT own the db (won't close it on destroy).
+** Used by transparent API where sqlite3_open() already created the connection.
+*/
+HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *config);
+
+/*
 ** Free a node and all resources.
 */
 void hpplite_node_destroy(HppliteNode *node);
+
+/*
+** Start auto-flush timer thread (for transparent API).
+** Periodically flushes pending SQL based on config.batchIntervalMs.
+*/
+void hpplite_node_start_timer(HppliteNode *node);
+
+/*
+** Stop auto-flush timer thread.
+*/
+void hpplite_node_stop_timer(HppliteNode *node);
 
 /*
 ** Set node role (sequencer or witness).

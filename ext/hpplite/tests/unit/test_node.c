@@ -108,6 +108,7 @@ static void test_node_create(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "test-sequencer";
     memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_seq";
     config.dbPath = "/tmp/hpplite_test_seq/test.db";
     config.requiredAttestations = 2;
@@ -174,6 +175,7 @@ static void test_sequencer_batches(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "test-sequencer";
     memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_seq2";
     config.dbPath = "/tmp/hpplite_test_seq2/test.db";
     config.requiredAttestations = 1;
@@ -371,6 +373,7 @@ static void test_full_flow(void) {
     memset(&seqConfig, 0, sizeof(seqConfig));
     seqConfig.nodeId = "sequencer";
     memcpy(seqConfig.privkey, SEQ_PRIVKEY, 32);
+    seqConfig.hasPrivkey = 1;
     seqConfig.dataDir = "/tmp/hpplite_test_flow/seq";
     seqConfig.dbPath = "/tmp/hpplite_test_flow/seq/test.db";
     seqConfig.requiredAttestations = 2;
@@ -387,6 +390,7 @@ static void test_full_flow(void) {
     memset(&wit1Config, 0, sizeof(wit1Config));
     wit1Config.nodeId = "witness1";
     memcpy(wit1Config.privkey, WIT1_PRIVKEY, 32);
+    wit1Config.hasPrivkey = 1;
     wit1Config.dataDir = "/tmp/hpplite_test_flow/wit1";
     wit1Config.dbPath = "/tmp/hpplite_test_flow/wit1/test.db";
 
@@ -404,6 +408,7 @@ static void test_full_flow(void) {
     memset(&wit2Config, 0, sizeof(wit2Config));
     wit2Config.nodeId = "witness2";
     memcpy(wit2Config.privkey, WIT2_PRIVKEY, 32);
+    wit2Config.hasPrivkey = 1;
     wit2Config.dataDir = "/tmp/hpplite_test_flow/wit2";
     wit2Config.dbPath = "/tmp/hpplite_test_flow/wit2/test.db";
 
@@ -579,6 +584,7 @@ static void test_attestation_validation(void) {
     memset(&seqConfig, 0, sizeof(seqConfig));
     seqConfig.nodeId = "sequencer";
     memcpy(seqConfig.privkey, SEQ_PRIVKEY, 32);
+    seqConfig.hasPrivkey = 1;
     seqConfig.dataDir = "/tmp/hpplite_test_att/seq";
     seqConfig.dbPath = "/tmp/hpplite_test_att/seq/test.db";
     seqConfig.requiredAttestations = 1;
@@ -594,6 +600,7 @@ static void test_attestation_validation(void) {
     memset(&witConfig, 0, sizeof(witConfig));
     witConfig.nodeId = "witness";
     memcpy(witConfig.privkey, WIT1_PRIVKEY, 32);
+    witConfig.hasPrivkey = 1;
     witConfig.dataDir = "/tmp/hpplite_test_att/wit";
     witConfig.dbPath = "/tmp/hpplite_test_att/wit/test.db";
 

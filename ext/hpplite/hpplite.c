@@ -333,6 +333,47 @@ static void hppliteRollbackHook(void *pArg) {
   freeAllChanges(pCtx);
 }
 
+/* Forward declaration */
+static int addPendingSql(HppliteCtx *pCtx, const char *zSql, int nRows);
+
+/*
+** Trace callback to capture SQL statements for transparent API.
+** This allows standard sqlite3_exec() calls to be captured for batching.
+*/
+static int hppliteTraceCallback(
+    unsigned mask,
+    void *pCtx,
+    void *pStmt,
+    void *pSql
+) {
+    (void)mask;
+    HppliteCtx *ctx = (HppliteCtx*)pCtx;
+    sqlite3_stmt *stmt = (sqlite3_stmt*)pStmt;
+    const char *sql = (const char*)pSql;
+
+    if (!ctx || !ctx->bEnabled || !sql) return 0;
+
+    /* Skip internal SQLite statements, empty SQL, and read-only queries */
+    if (sql[0] == '\0') return 0;
+    if (strncmp(sql, "PRAGMA", 6) == 0) return 0;
+    if (strncmp(sql, "pragma", 6) == 0) return 0;
+    if (strncmp(sql, "SELECT", 6) == 0) return 0;
+    if (strncmp(sql, "select", 6) == 0) return 0;
+    if (strncmp(sql, "EXPLAIN", 7) == 0) return 0;
+    if (strncmp(sql, "explain", 7) == 0) return 0;
+
+    /* Save pre-state before first SQL in a batch */
+    if (ctx->nPending == 0) {
+        memcpy(ctx->preStateRoot, ctx->stateRoot, HPPLITE_HASH_SIZE);
+    }
+
+    /* Add SQL to pending list */
+    addPendingSql(ctx, sql, -1);  /* -1 = rows affected unknown */
+
+    (void)stmt;
+    return 0;
+}
+
 /*
 ** Initialize HPPLite tracking on a database connection.
 */
@@ -361,6 +402,9 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
 
+  /* Register trace callback to capture SQL for transparent API */
+  sqlite3_trace_v2(db, SQLITE_TRACE_STMT, hppliteTraceCallback, pCtx);
+
   *ppCtx = pCtx;
   return SQLITE_OK;
 }
@@ -377,6 +421,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
 #endif
   sqlite3_commit_hook(pCtx->db, NULL, NULL);
   sqlite3_rollback_hook(pCtx->db, NULL, NULL);
+  sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
 
   freeAllChanges(pCtx);
   freeAllPending(pCtx);
@@ -588,26 +633,16 @@ int hpplite_exec_cb(
   char **pzErrMsg
 ) {
   int rc;
-  int nRows;
 
   if (!pCtx || !zSql) return SQLITE_MISUSE;
 
-  /* If this is the first SQL in a new block, save pre-state */
-  if (pCtx->nPending == 0) {
-    memcpy(pCtx->preStateRoot, pCtx->stateRoot, HPPLITE_HASH_SIZE);
-  }
-
-  /* Execute the SQL */
+  /*
+  ** Execute the SQL.
+  ** The trace callback (hppliteTraceCallback) automatically tracks
+  ** write operations in the pending list for batching.
+  ** No need to call addPendingSql() here - trace callback handles it.
+  */
   rc = sqlite3_exec(pCtx->db, zSql, xCallback, pArg, pzErrMsg);
-  if (rc != SQLITE_OK) {
-    return rc;
-  }
-
-  /* Get rows affected */
-  nRows = sqlite3_changes(pCtx->db);
-
-  /* Track this SQL in the pending list */
-  rc = addPendingSql(pCtx, zSql, nRows);
 
   return rc;
 }
@@ -725,55 +760,45 @@ void hpplite_finalize_verified_batch(HppliteCtx *pCtx) {
 #include "fs_storage.h"
 #include "batch.h"
 #include "l1_interface.h"
+#include "node.h"
 
 /*
-** Global registry mapping sqlite3* -> HppliteOpenState
+** Global registry mapping sqlite3* -> HppliteNode
 ** (Simple linked list for now, could use hash table for performance)
 */
-typedef struct HppliteOpenState HppliteOpenState;
-struct HppliteOpenState {
+typedef struct NodeEntry NodeEntry;
+struct NodeEntry {
     sqlite3 *db;
-    HppliteCtx *ctx;
-    HppliteConfig *config;
-    HppliteCrypto *crypto;
-    HppliteKeypair keypair;
-    HppliteStorage *storage;
-    HppliteL1 *l1;              /* L1 connection (auto-connected if config present) */
-    HppliteOpenState *next;
-
-    /* Batch timer state */
-    int64_t lastFlushTime;
-
-    /* State root at last flush (for detecting changes) */
-    unsigned char lastFlushedRoot[HPPLITE_HASH_SIZE];
-
-    /* Background timer thread for automatic flushing */
-    pthread_t timerThread;
-    pthread_mutex_t flushMutex;
-    volatile int timerRunning;  /* Flag to signal thread to stop */
+    HppliteNode *node;
+    HppliteConfig *config;  /* Stored for hpplite_get_config() */
+    NodeEntry *next;
 };
 
-static HppliteOpenState *g_openDatabases = NULL;
+static NodeEntry *g_nodeRegistry = NULL;
 
-static HppliteOpenState *findOpenState(sqlite3 *db) {
-    HppliteOpenState *s = g_openDatabases;
-    while (s) {
-        if (s->db == db) return s;
-        s = s->next;
+static NodeEntry *findEntry(sqlite3 *db) {
+    NodeEntry *e = g_nodeRegistry;
+    while (e) {
+        if (e->db == db) return e;
+        e = e->next;
     }
     return NULL;
 }
 
-static void removeOpenState(sqlite3 *db) {
-    HppliteOpenState **pp = &g_openDatabases;
+static HppliteNode *findNode(sqlite3 *db) {
+    NodeEntry *e = findEntry(db);
+    return e ? e->node : NULL;
+}
+
+static void removeNode(sqlite3 *db) {
+    NodeEntry **pp = &g_nodeRegistry;
     while (*pp) {
         if ((*pp)->db == db) {
-            HppliteOpenState *s = *pp;
-            *pp = s->next;
-            if (s->config) hpplite_config_free(s->config);
-            if (s->crypto) hpplite_crypto_free(s->crypto);
-            if (s->storage) hpplite_storage_close(s->storage);
-            free(s);
+            NodeEntry *e = *pp;
+            *pp = e->next;
+            /* Note: node is destroyed separately via hpplite_node_destroy() */
+            if (e->config) hpplite_config_free(e->config);
+            free(e);
             return;
         }
         pp = &(*pp)->next;
@@ -781,118 +806,57 @@ static void removeOpenState(sqlite3 *db) {
 }
 
 /*
-** Get current time in milliseconds
-*/
-static int64_t currentTimeMs(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
-/* Forward declaration */
-static uint64_t doFlush(HppliteOpenState *state);
-static uint64_t doFlushLocked(HppliteOpenState *state);
-
-/*
-** Background timer thread - automatically flushes batches on interval
-*/
-static void *timerThreadFunc(void *arg) {
-    HppliteOpenState *state = (HppliteOpenState *)arg;
-
-    if (!state || !state->config) return NULL;
-
-    int intervalMs = state->config->batchIntervalMs;
-    if (intervalMs <= 0) return NULL;  /* Auto-flush disabled */
-
-    /* Sleep in small increments to allow quick shutdown */
-    int sleepMs = (intervalMs < 100) ? intervalMs : 100;
-
-    while (state->timerRunning) {
-        /* Sleep for a bit */
-        usleep(sleepMs * 1000);
-
-        if (!state->timerRunning) break;
-
-        /* Check if it's time to flush */
-        int64_t now = currentTimeMs();
-        int64_t elapsed = now - state->lastFlushTime;
-
-        if (elapsed >= intervalMs) {
-            /* Lock and flush */
-            pthread_mutex_lock(&state->flushMutex);
-            if (state->timerRunning) {  /* Double-check after lock */
-                doFlushLocked(state);
-            }
-            pthread_mutex_unlock(&state->flushMutex);
-        }
-    }
-
-    return NULL;
-}
-
-/*
-** Start the background timer thread
-*/
-static void startTimerThread(HppliteOpenState *state) {
-    if (!state || !state->config) return;
-    if (state->config->batchIntervalMs <= 0) return;  /* Auto-flush disabled */
-
-    pthread_mutex_init(&state->flushMutex, NULL);
-    state->timerRunning = 1;
-    pthread_create(&state->timerThread, NULL, timerThreadFunc, state);
-}
-
-/*
-** Stop the background timer thread
-*/
-static void stopTimerThread(HppliteOpenState *state) {
-    if (!state || !state->timerRunning) return;
-
-    /* Signal thread to stop */
-    state->timerRunning = 0;
-}
-
-/* Forward declaration */
-static uint64_t doFlushLocked(HppliteOpenState *state);
-
-/*
 ** Close hook callback - called automatically by sqlite3_close()
 ** This performs all HPPLite cleanup before SQLite tears down the connection.
 */
 static void hpplite_close_hook(void *pArg, sqlite3 *db) {
-    (void)pArg;  /* Unused - we look up state by db */
+    (void)pArg;  /* Unused - we look up node by db */
 
-    HppliteOpenState *state = findOpenState(db);
-    if (!state) return;
+    HppliteNode *node = findNode(db);
+    if (!node) return;
 
-    /* Stop background timer thread first */
-    if (state->timerRunning) {
-        state->timerRunning = 0;
-        pthread_join(state->timerThread, NULL);
-    }
+    /*
+    ** IMPORTANT: Set ownsDb to 0 because sqlite3_close() is already closing
+    ** the database. We don't want hpplite_node_destroy() to try to close it
+    ** again, which would cause a double-free/double-close bug.
+    */
+    node->ownsDb = 0;
 
-    /* Flush any pending changes */
-    pthread_mutex_lock(&state->flushMutex);
-    doFlushLocked(state);
-    pthread_mutex_unlock(&state->flushMutex);
+    /* Destroy the node (stops timer, flushes pending, frees resources) */
+    hpplite_node_destroy(node);
 
-    /* Shutdown HPPLite context */
-    if (state->ctx) {
-        hpplite_shutdown(state->ctx);
-        state->ctx = NULL;
-    }
+    /* Remove from registry */
+    removeNode(db);
+}
 
-    /* Disconnect L1 if connected */
-    if (state->l1) {
-        hpplite_l1_disconnect(state->l1);
-        state->l1 = NULL;
-    }
+/*
+** Helper: convert HppliteConfig to HppliteNodeConfig
+*/
+static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *nc) {
+    memset(nc, 0, sizeof(HppliteNodeConfig));
+    nc->dataDir = cfg->dataDir ? strdup(cfg->dataDir) : NULL;
+    nc->dbPath = cfg->dbPath ? strdup(cfg->dbPath) : NULL;
+    nc->rpcUrl = cfg->rpcUrl ? strdup(cfg->rpcUrl) : NULL;
+    memcpy(nc->privkey, cfg->privkey, 32);
+    nc->hasPrivkey = cfg->hasPrivkey;
+    memcpy(nc->factory, cfg->factory, 20);
+    nc->hasFactory = cfg->hasFactory;
+    memcpy(nc->contract, cfg->contract, 20);
+    nc->hasContract = cfg->hasContract;
+    nc->batchIntervalMs = cfg->batchIntervalMs;
+    nc->role = HPPLITE_ROLE_SEQUENCER;  /* Default to sequencer for transparent API */
+}
 
-    /* Destroy mutex before freeing state */
-    pthread_mutex_destroy(&state->flushMutex);
-
-    /* Remove from registry (frees state) */
-    removeOpenState(db);
+/*
+** Helper: free node config strings
+*/
+static void free_node_config(HppliteNodeConfig *nc) {
+    free(nc->dataDir);
+    free(nc->dbPath);
+    free(nc->rpcUrl);
+    free(nc->nodeId);
+    free(nc->bindAddress);
+    free(nc->sequencerAddress);
 }
 
 sqlite3 *hpplite_open(const char *uri) {
@@ -908,77 +872,39 @@ sqlite3 *hpplite_open(const char *uri) {
         return NULL;
     }
 
-    /* Open SQLite database */
-    sqlite3 *db;
-    int rc = sqlite3_open_v2(uri, &db,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-        NULL);
-    if (rc != SQLITE_OK) {
-        if (db) sqlite3_close(db);
+    /* Convert to node config */
+    HppliteNodeConfig nodeConfig;
+    config_to_node_config(config, &nodeConfig);
+
+    /* Create node (opens db internally) */
+    HppliteNode *node = hpplite_node_create(&nodeConfig);
+    free_node_config(&nodeConfig);
+
+    if (!node) {
         hpplite_config_free(config);
         return NULL;
     }
 
-    /* Initialize HPPLite context */
-    HppliteCtx *ctx;
-    rc = hpplite_init(db, &ctx);
-    if (rc != SQLITE_OK) {
-        sqlite3_close(db);
+    sqlite3 *db = node->db;
+
+    /* Add to registry */
+    NodeEntry *entry = calloc(1, sizeof(NodeEntry));
+    if (!entry) {
         hpplite_config_free(config);
+        hpplite_node_destroy(node);
         return NULL;
     }
+    entry->db = db;
+    entry->node = node;
+    entry->config = config;  /* Store config for hpplite_get_config() */
+    entry->next = g_nodeRegistry;
+    g_nodeRegistry = entry;
 
-    /* Create open state */
-    HppliteOpenState *state = calloc(1, sizeof(HppliteOpenState));
-    if (!state) {
-        hpplite_shutdown(ctx);
-        sqlite3_close(db);
-        hpplite_config_free(config);
-        return NULL;
-    }
-
-    state->db = db;
-    state->ctx = ctx;
-    state->config = config;
-    state->lastFlushTime = currentTimeMs();
-
-    /* Initialize lastFlushedRoot to current state (genesis) */
-    hpplite_get_state_root(ctx, state->lastFlushedRoot);
-
-    /* Initialize crypto if we have a private key */
-    if (config->hasPrivkey) {
-        state->crypto = hpplite_crypto_init();
-        if (state->crypto) {
-            hpplite_crypto_keypair_from_privkey(state->crypto, &state->keypair, config->privkey);
-        }
-    }
-
-    /* Initialize storage */
-    hpplite_storage_init(config->dataDir, &state->storage);
-
-    /* Auto-connect to L1 if rpcUrl and contract are configured */
-    if (config->rpcUrl && config->hasContract) {
-        char contractHex[43];
-        snprintf(contractHex, sizeof(contractHex), "0x");
-        for (int i = 0; i < 20; i++) {
-            snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
-        }
-        state->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
-        /* Note: L1 connection failure is not fatal - may be offline */
-    }
-
-    /* Initialize timer thread state */
-    state->timerRunning = 0;
-
-    /* Add to global registry */
-    state->next = g_openDatabases;
-    g_openDatabases = state;
-
-    /* Register close hook for automatic cleanup when sqlite3_close() is called */
+    /* Register close hook for automatic cleanup */
     sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
-    /* Start background timer thread for automatic flushing */
-    startTimerThread(state);
+    /* Start auto-flush timer thread */
+    hpplite_node_start_timer(node);
 
     return db;
 }
@@ -993,132 +919,43 @@ int hpplite_close(sqlite3 *db) {
 }
 
 HppliteCtx *hpplite_context(sqlite3 *db) {
-    HppliteOpenState *state = findOpenState(db);
-    return state ? state->ctx : NULL;
+    HppliteNode *node = findNode(db);
+    return node ? node->ctx : NULL;
 }
 
 struct HppliteConfig *hpplite_get_config(sqlite3 *db) {
-    HppliteOpenState *state = findOpenState(db);
-    return state ? state->config : NULL;
+    NodeEntry *e = findEntry(db);
+    return e ? e->config : NULL;
 }
 
 HppliteL1 *hpplite_get_l1(sqlite3 *db) {
-    HppliteOpenState *state = findOpenState(db);
-    return state ? state->l1 : NULL;
-}
-
-/*
-** Internal flush implementation - creates batch if state changed
-** Called with mutex held (or when timer not running)
-*/
-static uint64_t doFlushLocked(HppliteOpenState *state) {
-    if (!state || !state->ctx) return 0;
-
-    HppliteCtx *ctx = state->ctx;
-
-    /* Check if state root has changed since last flush */
-    unsigned char currentRoot[HPPLITE_HASH_SIZE];
-    hpplite_get_state_root(ctx, currentRoot);
-
-    if (memcmp(currentRoot, state->lastFlushedRoot, HPPLITE_HASH_SIZE) == 0) {
-        /* No state change since last flush */
-        return 0;
-    }
-
-    /* Create batch with state transition */
-    HppliteBatch *batch = hpplite_batch_new(ctx->blockHeight);
-    if (!batch) return 0;
-
-    /* Set pre-state (from last flush) */
-    hpplite_batch_set_pre_state(batch, state->lastFlushedRoot);
-
-    /* Set post-state (current) */
-    hpplite_batch_set_post_state(batch, currentRoot);
-
-    /* Set timestamp */
-    batch->timestamp = (uint64_t)time(NULL);
-
-    uint64_t height = batch->height;
-
-    /* Compute block hash */
-    SHA256_CTX hashCtx;
-    unsigned char blockHash[HPPLITE_HASH_SIZE];
-    sha256_init(&hashCtx);
-    sha256_update(&hashCtx, (uint8_t*)&batch->height, sizeof(batch->height));
-    sha256_update(&hashCtx, ctx->prevBlockHash, HPPLITE_HASH_SIZE);
-    sha256_update(&hashCtx, batch->preStateRoot, HPPLITE_HASH_SIZE);
-    sha256_update(&hashCtx, batch->postStateRoot, HPPLITE_HASH_SIZE);
-    sha256_final(&hashCtx, blockHash);
-
-    /* Update context for next block */
-    memcpy(ctx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
-    ctx->blockHeight++;
-
-    /* TODO: Sign batch when extended batch format is implemented */
-    (void)state->crypto;
-    (void)state->keypair;
-
-    /* Store batch */
-    if (state->storage) {
-        hpplite_storage_store_batch(state->storage, batch);
-    }
-
-    /* Update last flushed root */
-    memcpy(state->lastFlushedRoot, currentRoot, HPPLITE_HASH_SIZE);
-
-    hpplite_batch_free(batch);
-    state->lastFlushTime = currentTimeMs();
-
-    return height;
-}
-
-/*
-** Thread-safe flush - acquires mutex if timer thread is running
-*/
-static uint64_t doFlush(HppliteOpenState *state) {
-    if (!state) return 0;
-
-    uint64_t height;
-
-    if (state->timerRunning) {
-        pthread_mutex_lock(&state->flushMutex);
-        height = doFlushLocked(state);
-        pthread_mutex_unlock(&state->flushMutex);
-    } else {
-        height = doFlushLocked(state);
-    }
-
-    return height;
+    HppliteNode *node = findNode(db);
+    return node ? node->l1 : NULL;
 }
 
 uint64_t hpplite_flush(sqlite3 *db) {
-    HppliteOpenState *state = findOpenState(db);
-    return doFlush(state);
+    HppliteNode *node = findNode(db);
+    if (!node) return 0;
+    /* Use the node's flush (sequencer path) */
+    return hpplite_node_flush_batch(node);
 }
 
 /*
 ** Check if auto-flush is needed and perform it if so.
 ** Returns batch height if flushed, 0 otherwise.
+** Note: With timer thread, this is less necessary but kept for compatibility.
 */
 uint64_t hpplite_check_flush(sqlite3 *db) {
-    HppliteOpenState *state = findOpenState(db);
-    if (!state) return 0;
-
-    /* Check if interval passed */
-    if (state->config && state->config->batchIntervalMs > 0) {
-        int64_t now = currentTimeMs();
-        int64_t elapsed = now - state->lastFlushTime;
-        if (elapsed >= state->config->batchIntervalMs) {
-            return doFlush(state);
-        }
-    }
-    return 0;
+    HppliteNode *node = findNode(db);
+    if (!node) return 0;
+    /* The timer thread handles auto-flush; this is a manual trigger */
+    return hpplite_node_flush_batch(node);
 }
 
 void hpplite_state_root(sqlite3 *db, unsigned char *out) {
-    HppliteOpenState *state = findOpenState(db);
-    if (state && state->ctx) {
-        hpplite_get_state_root(state->ctx, out);
+    HppliteNode *node = findNode(db);
+    if (node && node->ctx) {
+        hpplite_get_state_root(node->ctx, out);
     } else {
         memset(out, 0, HPPLITE_HASH_SIZE);
     }
@@ -1127,6 +964,7 @@ void hpplite_state_root(sqlite3 *db, unsigned char *out) {
 /*
 ** Auto-extension callback - called automatically on every sqlite3_open()
 ** Checks URI parameters and initializes HPPLite if enabled.
+** Uses HppliteNode for unified implementation.
 */
 static int hpplite_auto_init(
     sqlite3 *db,
@@ -1147,68 +985,47 @@ static int hpplite_auto_init(
         return SQLITE_OK;
     }
 
-    /* Load configuration from URI */
-    HppliteConfig *config = hpplite_config_load(filename);
+    /* Load configuration from SQLite URI parameters */
+    HppliteConfig *config = hpplite_config_create();
     if (!config) return SQLITE_OK;
 
-    /* Initialize HPPLite context */
-    HppliteCtx *ctx;
-    int rc = hpplite_init(db, &ctx);
-    if (rc != SQLITE_OK) {
+    /* Load from env first */
+    hpplite_config_load_env(config);
+
+    /* Then override with SQLite URI parameters */
+    hpplite_config_load_sqlite_uri(config, filename);
+
+    /* Convert to node config */
+    HppliteNodeConfig nodeConfig;
+    config_to_node_config(config, &nodeConfig);
+
+    /* Create node using existing db connection */
+    HppliteNode *node = hpplite_node_create_with_db(db, &nodeConfig);
+    free_node_config(&nodeConfig);
+
+    if (!node) {
         hpplite_config_free(config);
         return SQLITE_OK;  /* Don't fail the open, just skip HPPLite */
     }
 
-    /* Create open state */
-    HppliteOpenState *state = calloc(1, sizeof(HppliteOpenState));
-    if (!state) {
-        hpplite_shutdown(ctx);
+    /* Add to registry */
+    NodeEntry *entry = calloc(1, sizeof(NodeEntry));
+    if (!entry) {
         hpplite_config_free(config);
+        hpplite_node_destroy(node);
         return SQLITE_OK;
     }
-
-    state->db = db;
-    state->ctx = ctx;
-    state->config = config;
-    state->lastFlushTime = currentTimeMs();
-
-    /* Initialize lastFlushedRoot to current state (genesis) */
-    hpplite_get_state_root(ctx, state->lastFlushedRoot);
-
-    /* Initialize crypto if we have a private key */
-    if (config->hasPrivkey) {
-        state->crypto = hpplite_crypto_init();
-        if (state->crypto) {
-            hpplite_crypto_keypair_from_privkey(state->crypto, &state->keypair, config->privkey);
-        }
-    }
-
-    /* Initialize storage */
-    hpplite_storage_init(config->dataDir, &state->storage);
-
-    /* Auto-connect to L1 if rpcUrl and contract are configured */
-    if (config->rpcUrl && config->hasContract) {
-        char contractHex[43];
-        snprintf(contractHex, sizeof(contractHex), "0x");
-        for (int i = 0; i < 20; i++) {
-            snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
-        }
-        state->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
-        /* Note: L1 connection failure is not fatal - may be offline */
-    }
-
-    /* Initialize timer thread state */
-    state->timerRunning = 0;
-
-    /* Add to global registry */
-    state->next = g_openDatabases;
-    g_openDatabases = state;
+    entry->db = db;
+    entry->node = node;
+    entry->config = config;  /* Store config for hpplite_get_config() */
+    entry->next = g_nodeRegistry;
+    g_nodeRegistry = entry;
 
     /* Register close hook for automatic cleanup */
     sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
-    /* Start background timer thread for automatic flushing */
-    startTimerThread(state);
+    /* Start auto-flush timer thread */
+    hpplite_node_start_timer(node);
 
     return SQLITE_OK;
 }

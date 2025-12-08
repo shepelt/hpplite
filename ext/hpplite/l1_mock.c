@@ -14,6 +14,7 @@
 
 #define MAX_WITNESSES 32
 #define MAX_CHECKPOINTS 1000
+#define MAX_BATCHES 10000
 
 /*
 ** Internal L1 mock structure
@@ -50,6 +51,11 @@ struct HppliteL1 {
     /* Callbacks */
     HppliteL1Callback callback;
     void *callbackArg;
+
+    /* Batch DA storage */
+    uint64_t nBatches;
+    uint8_t *batchData[MAX_BATCHES];
+    size_t batchLen[MAX_BATCHES];
 };
 
 /*
@@ -91,6 +97,15 @@ HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress)
 }
 
 /*
+** Set private key (stub for mock)
+*/
+int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
+    (void)l1;
+    (void)privkey;
+    return 0;  /* Always succeeds in mock */
+}
+
+/*
 ** Disconnect from L1
 */
 void hpplite_l1_disconnect(HppliteL1 *l1) {
@@ -99,6 +114,13 @@ void hpplite_l1_disconnect(HppliteL1 *l1) {
     /* Free checkpoints */
     for (int i = 0; i < l1->nCheckpoints; i++) {
         hpplite_checkpoint_free(l1->checkpoints[i]);
+    }
+
+    /* Free batch data */
+    for (uint64_t i = 0; i < l1->nBatches; i++) {
+        if (l1->batchData[i]) {
+            free(l1->batchData[i]);
+        }
     }
 
     /* Free crypto */
@@ -475,4 +497,179 @@ const HppliteCheckpoint *hpplite_l1_mock_get_last_checkpoint(HppliteL1 *l1) {
 */
 int hpplite_l1_mock_get_checkpoint_count(HppliteL1 *l1) {
     return l1 ? l1->nCheckpoints : 0;
+}
+
+/* === Factory Functions (stubs for mock) === */
+
+int hpplite_l1_factory_get_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20],
+    uint8_t rollup_address_out[20]
+) {
+    (void)rpc_url;
+    (void)factory_address;
+    (void)owner_address;
+    memset(rollup_address_out, 0, 20);
+    return 0;  /* No rollup in mock */
+}
+
+int hpplite_l1_factory_has_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20]
+) {
+    (void)rpc_url;
+    (void)factory_address;
+    (void)owner_address;
+    return 0;  /* No rollup in mock */
+}
+
+char *hpplite_l1_factory_get_or_create_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t rollup_address_out[20]
+) {
+    (void)rpc_url;
+    (void)factory_address;
+    (void)privkey;
+    memset(rollup_address_out, 0, 20);
+    return NULL;  /* Not supported in mock */
+}
+
+int hpplite_l1_factory_get_my_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t rollup_address_out[20]
+) {
+    (void)rpc_url;
+    (void)factory_address;
+    (void)privkey;
+    memset(rollup_address_out, 0, 20);
+    return 0;  /* No rollup in mock */
+}
+
+HppliteL1 *hpplite_l1_connect_factory(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32]
+) {
+    (void)rpc_url;
+    (void)factory_address;
+    (void)privkey;
+    return NULL;  /* Not supported in mock */
+}
+
+/* === Batch DA Functions === */
+
+char *hpplite_l1_submit_batch(
+    HppliteL1 *l1,
+    uint64_t height,
+    const uint8_t *data,
+    size_t data_len
+) {
+    if (!l1 || !data || height == 0) return NULL;
+    if (height > MAX_BATCHES) return NULL;
+
+    /* Store batch data (height is 1-indexed, array is 0-indexed) */
+    size_t idx = height - 1;
+
+    /* Free existing data if overwriting */
+    if (l1->batchData[idx]) {
+        free(l1->batchData[idx]);
+    }
+
+    l1->batchData[idx] = malloc(data_len);
+    if (!l1->batchData[idx]) return NULL;
+
+    memcpy(l1->batchData[idx], data, data_len);
+    l1->batchLen[idx] = data_len;
+
+    /* Track highest batch */
+    if (height > l1->nBatches) {
+        l1->nBatches = height;
+    }
+
+    /* Return mock transaction hash */
+    return sqlite3_mprintf("0x%016llx", (unsigned long long)height);
+}
+
+uint8_t *hpplite_l1_get_batch(
+    HppliteL1 *l1,
+    uint64_t height,
+    size_t *data_len_out
+) {
+    if (!l1 || height == 0 || height > MAX_BATCHES) {
+        if (data_len_out) *data_len_out = 0;
+        return NULL;
+    }
+
+    size_t idx = height - 1;
+    if (!l1->batchData[idx]) {
+        if (data_len_out) *data_len_out = 0;
+        return NULL;
+    }
+
+    /* Return copy of batch data */
+    uint8_t *copy = malloc(l1->batchLen[idx]);
+    if (!copy) {
+        if (data_len_out) *data_len_out = 0;
+        return NULL;
+    }
+
+    memcpy(copy, l1->batchData[idx], l1->batchLen[idx]);
+    if (data_len_out) *data_len_out = l1->batchLen[idx];
+    return copy;
+}
+
+int hpplite_l1_get_batch_hash(
+    HppliteL1 *l1,
+    uint64_t height,
+    uint8_t hash_out[32]
+) {
+    if (!l1 || height == 0 || height > MAX_BATCHES) {
+        memset(hash_out, 0, 32);
+        return 0;
+    }
+
+    size_t idx = height - 1;
+    if (!l1->batchData[idx]) {
+        memset(hash_out, 0, 32);
+        return 0;
+    }
+
+    /* Simple hash of batch data (use proper hash in production) */
+    memset(hash_out, 0, 32);
+    for (size_t i = 0; i < l1->batchLen[idx] && i < 32; i++) {
+        hash_out[i] = l1->batchData[idx][i];
+    }
+    return 1;
+}
+
+int hpplite_l1_get_da_state(
+    HppliteL1 *l1,
+    uint64_t *last_batch_height,
+    uint64_t *total_batches,
+    uint8_t latest_batch_hash[32]
+) {
+    if (!l1) {
+        if (last_batch_height) *last_batch_height = 0;
+        if (total_batches) *total_batches = 0;
+        if (latest_batch_hash) memset(latest_batch_hash, 0, 32);
+        return -1;
+    }
+
+    if (last_batch_height) *last_batch_height = l1->nBatches;
+    if (total_batches) *total_batches = l1->nBatches;
+
+    if (latest_batch_hash) {
+        if (l1->nBatches > 0) {
+            hpplite_l1_get_batch_hash(l1, l1->nBatches, latest_batch_hash);
+        } else {
+            memset(latest_batch_hash, 0, 32);
+        }
+    }
+    return 0;
 }
