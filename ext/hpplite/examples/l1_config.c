@@ -2,6 +2,7 @@
 ** HPPLite Example: L1 Configuration
 **
 ** Demonstrates:
+** - Transparent SQLite API with hpplite_register()
 ** - Using network aliases (l1=hpp-sepolia)
 ** - Reading system config from L1 contract
 ** - Building DA URIs
@@ -9,7 +10,7 @@
 ** Build:
 **   gcc -I.. -I../../build -o l1_config l1_config.c \
 **       ../build/libhpplite.a ../build/libsqlite3.a \
-**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq
+**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq -lpthread
 */
 
 #include "hpplite.h"
@@ -35,8 +36,11 @@ int main(void) {
     /* Clean up */
     system("rm -rf " DATA_DIR " && mkdir -p " DATA_DIR);
 
+    /* Register HPPLite auto-extension */
+    hpplite_register();
+
     /*
-     * Open database with L1 network alias.
+     * Open database with standard SQLite API.
      *
      * Using l1=hpp-sepolia automatically sets:
      *   - chainId = 181228
@@ -45,16 +49,20 @@ int main(void) {
      * You can also use explicit chainid= and rpc= parameters.
      */
     printf("Opening database with L1 configuration...\n");
-    sqlite3 *db = hpplite_open(
+    sqlite3 *db;
+    int rc = sqlite3_open_v2(
         "file:" DATA_DIR "/state.db"
         "?hpplite=on"
         "&l1=hpp-sepolia"
         "&contract=" CONTRACT
         "&role=sequencer"
-        "&datadir=" DATA_DIR
+        "&datadir=" DATA_DIR,
+        &db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+        NULL
     );
-    if (!db) {
-        printf("ERROR: Failed to open database\n");
+    if (rc != SQLITE_OK) {
+        printf("ERROR: Failed to open database: %s\n", sqlite3_errmsg(db));
         return 1;
     }
 
@@ -117,7 +125,8 @@ int main(void) {
         printf("  (Could not connect - network may be unavailable)\n");
     }
 
-    hpplite_close(db);
+    sqlite3_close(db);
+    hpplite_unregister();
     printf("\nDone!\n");
     return 0;
 }
