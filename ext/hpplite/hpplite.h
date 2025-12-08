@@ -282,6 +282,20 @@ typedef struct HppliteL1 HppliteL1;
 HppliteL1 *hpplite_get_l1(sqlite3 *db);
 
 /*
+** Get the node for an open database.
+** Returns NULL if db is not an HPPLite database.
+** Used for advanced operations like ZMQ processing.
+*/
+struct HppliteNode *hpplite_get_node(sqlite3 *db);
+
+/*
+** Register a node with the global registry and set up SQL functions.
+** Called automatically by hpplite_node_create() and hpplite_node_create_with_db().
+** Can also be called manually for custom node setups.
+*/
+void hpplite_register_node(sqlite3 *db, struct HppliteNode *node);
+
+/*
 ** Force flush pending changes to a batch immediately.
 ** Normally batches are created automatically on the interval.
 ** Returns batch height or 0 if no pending changes.

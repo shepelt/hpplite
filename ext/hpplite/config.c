@@ -106,6 +106,8 @@ void hpplite_config_free(HppliteConfig *cfg) {
     if (cfg->rpcUrl) free(cfg->rpcUrl);
     if (cfg->dataDir) free(cfg->dataDir);
     if (cfg->dbPath) free(cfg->dbPath);
+    if (cfg->zmqBind) free(cfg->zmqBind);
+    if (cfg->zmqSequencer) free(cfg->zmqSequencer);
     free(cfg);
 }
 
@@ -343,6 +345,18 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (ms > 0) cfg->batchIntervalMs = ms;
     }
 
+    /* ZMQ bind address (sequencer) */
+    if (get_uri_param(uri, HPPLITE_URI_ZMQ_BIND, buf, sizeof(buf))) {
+        free(cfg->zmqBind);
+        cfg->zmqBind = strdup(buf);
+    }
+
+    /* ZMQ sequencer address (witness) */
+    if (get_uri_param(uri, HPPLITE_URI_ZMQ_SEQUENCER, buf, sizeof(buf))) {
+        free(cfg->zmqSequencer);
+        cfg->zmqSequencer = strdup(buf);
+    }
+
     return 0;
 }
 
@@ -441,6 +455,20 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val) {
         int ms = parse_duration_ms(val);
         if (ms > 0) cfg->batchIntervalMs = ms;
+    }
+
+    /* ZMQ bind address (sequencer) */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ZMQ_BIND);
+    if (val) {
+        free(cfg->zmqBind);
+        cfg->zmqBind = strdup(val);
+    }
+
+    /* ZMQ sequencer address (witness) */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ZMQ_SEQUENCER);
+    if (val) {
+        free(cfg->zmqSequencer);
+        cfg->zmqSequencer = strdup(val);
     }
 
     return 0;

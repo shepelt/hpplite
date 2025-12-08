@@ -18,17 +18,43 @@
 - L1-anchored replay verification
 
 ### M3: L1 Integration
-- HPPLite.sol contract (deployed to HPP Sepolia)
-- HPPLiteDA.sol with on-chain DA + system config
+- HPPLiteDA.sol contract with on-chain DA
+- HPPLiteFactory.sol for one-click rollup deployment
 - Web3 primitives (`eth/` - RLP, ABI, keccak256)
 - Ethereum JSON-RPC client (`l1_eth.c`)
 - EIP-191 signature verification
-- Checkpoint submission with witness attestations
+- Batch submission to L1
+- State reconstruction from L1 batches
 
 ### M3.5: Transparent SQLite API
 - `sqlite3_close_hook` for cleanup on close
 - Auto-extension for `?hpplite=on` URI parameter
-- L1 auto-connect from URI parameters
+- L1 auto-connect from URI parameters (`rpc`, `contract`, `factory`)
+- Factory auto-deploy on first open
+- Timer thread for time-based batch flushing
+- ZMQ in transparent API (`zmq_bind`, `zmq_sequencer` URI params)
+
+### Testing
+- Unit tests with mock L1 (15 tests)
+- Integration tests with real L1 (HPP Sepolia)
+- Full cluster test: sequencer + witness + ZMQ sync + L1 reconstruction
+- Full attestation flow test: checkpoint creation → ZMQ broadcast → witness attestation → L1 submission
+
+### Attestation & Checkpoint Flow
+- Witness checkpoint window tracking during L1 sync
+- Sequencer checkpoint creation and ZMQ broadcast
+- Witness attestation signing and ZMQ send
+- Sequencer attestation verification (L1 witness registry check)
+- Checkpoint submission to L1 with attestations
+
+---
+
+## In Progress / Known Issues
+
+### Bugs (Fixed)
+- [x] **Flush on close**: `hpplite_node_destroy()` now flushes pending data before cleanup
+- [x] **hpplite_sync()**: SQL function implemented - triggers L1 sync for witness/replica nodes
+- [x] **hpplite_flush()**: SQL function implemented - triggers batch flush for sequencer nodes
 
 ---
 
@@ -56,13 +82,13 @@ SELECT u.name, c.state_root FROM users u, hpplite_checkpoints c WHERE c.height =
 ## Future
 
 ### Transparent API Enhancements
-- [ ] Timer thread for time-based batch flushing
 - [ ] Size trigger in commit_hook (max changes per batch)
 - [ ] `_hpplite_pending` table for crash recovery
 - [ ] Write-ahead pattern (pending table → flush → clear)
 - [ ] Multi-connection handling
 
 ### Data Availability
+- [ ] Batch compression (reduce DA costs)
 - [ ] IPFS batch storage
 - [ ] Arweave batch storage
 - [ ] Batch pruning after L1 finality
@@ -75,6 +101,7 @@ SELECT u.name, c.state_root FROM users u, hpplite_checkpoints c WHERE c.height =
 - [ ] ZMQ reconnection on disconnect
 - [ ] Heartbeat/liveness detection
 - [ ] Out-of-order batch handling (sync)
+- [ ] L1 polling for new batches (witness/replica)
 - [ ] Adversarial/Byzantine testing
 
 ### Advanced
@@ -90,25 +117,33 @@ SELECT u.name, c.state_root FROM users u, hpplite_checkpoints c WHERE c.height =
 
 ```
 ext/hpplite/
-├── hpplite.c/h          # Core state tracking
+├── hpplite.c/h          # Core state tracking, transparent API
 ├── batch.c/h            # Batch serialization
 ├── crypto.c/h           # secp256k1 signing
 ├── fs_storage.c/h       # File-based storage
-├── node.c/h             # Node lifecycle
+├── node.c/h             # Node lifecycle, ZMQ, timer
+├── config.c/h           # URI parsing, configuration
+├── da_uri.c/h           # DA URI resolution
 ├── l1_interface.h       # L1 contract interface
-├── l1_mock.c            # L1 mock (M1)
-├── l1_service.c/h       # L1 mock ZMQ service (M2)
-├── l1_eth.c/h           # Real Ethereum client (M3)
+├── l1_mock.c            # L1 mock (testing)
+├── l1_service.c/h       # L1 mock ZMQ service
+├── l1_eth.c/h           # Real Ethereum client
 ├── zmq_transport.c/h    # ZeroMQ networking
 ├── eth/                 # Web3 primitives
+│   ├── eth_client.c/h   # JSON-RPC client
 │   ├── keccak256.c/h
 │   ├── rlp.c/h
-│   └── abi.c/h
-├── contracts/           # Solidity (M3)
-│   ├── src/HPPLite.sol
-│   └── src/HPPLiteDA.sol
-├── doc/                 # Documentation
-│   ├── architecture.md  # System design
-│   └── backlog.md       # This file
-└── test_*.c             # Tests
+│   ├── abi.c/h
+│   └── cJSON.c/h
+├── contracts/           # Solidity
+│   └── src/
+│       ├── HPPLiteDA.sol
+│       └── HPPLiteFactory.sol
+├── tests/
+│   ├── unit/            # Mock L1 tests
+│   └── integration/     # Real L1 tests
+├── examples/            # Usage examples
+└── doc/                 # Documentation
+    ├── architecture.md
+    └── backlog.md
 ```

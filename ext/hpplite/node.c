@@ -227,6 +227,11 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
                     if (data && dataLen > 0) {
                         HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
                         if (batch) {
+                            /* Set checkpoint window start for first batch */
+                            if (h == 1) {
+                                node->checkpointFromHeight = batch->height;
+                                memcpy(node->checkpointPreRoot, batch->preStateRoot, HPPLITE_HASH_SIZE);
+                            }
                             for (int i = 0; i < batch->nTxns; i++) {
                                 if (batch->aTxns[i].zSql) {
                                     sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
@@ -235,6 +240,9 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
                             node->ctx->blockHeight = batch->height + 1;
                             node->lastCheckpointHeight = batch->height;
                             memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                            /* Track as verified (L1 is source of truth) */
+                            node->lastVerifiedHeight = batch->height;
+                            memcpy(node->lastVerifiedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
                             hpplite_batch_free(batch);
                         }
                         free(data);
@@ -243,6 +251,9 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
             }
         }
     }
+
+    /* Register node with global registry for SQL functions */
+    hpplite_register_node(node->db, node);
 
     return node;
 }
@@ -394,6 +405,11 @@ HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *c
                     if (data && dataLen > 0) {
                         HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
                         if (batch) {
+                            /* Set checkpoint window start for first batch */
+                            if (h == 1) {
+                                node->checkpointFromHeight = batch->height;
+                                memcpy(node->checkpointPreRoot, batch->preStateRoot, HPPLITE_HASH_SIZE);
+                            }
                             for (int i = 0; i < batch->nTxns; i++) {
                                 if (batch->aTxns[i].zSql) {
                                     sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
@@ -403,6 +419,9 @@ HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *c
                             node->lastCheckpointHeight = batch->height;
                             memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
                             memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                            /* Track as verified (L1 is source of truth) */
+                            node->lastVerifiedHeight = batch->height;
+                            memcpy(node->lastVerifiedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
                             hpplite_batch_free(batch);
                         }
                         free(data);
@@ -411,6 +430,9 @@ HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *c
             }
         }
     }
+
+    /* Register node with global registry for SQL functions */
+    hpplite_register_node(node->db, node);
 
     return node;
 }
@@ -425,6 +447,14 @@ void hpplite_node_destroy(HppliteNode *node) {
 
     /* Stop timer thread first */
     hpplite_node_stop_timer(node);
+
+    /* Flush any pending data before cleanup (sequencer only) */
+    if (node->ctx && node->role == HPPLITE_ROLE_SEQUENCER) {
+        int pending = hpplite_pending_count(node->ctx);
+        if (pending > 0) {
+            hpplite_node_flush_batch(node);
+        }
+    }
 
     /* Stop if running */
     if (node->state == HPPLITE_STATE_RUNNING) {

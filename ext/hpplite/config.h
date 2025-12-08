@@ -53,6 +53,8 @@ extern "C" {
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
+#define HPPLITE_URI_ZMQ_BIND      "zmq_bind"      /* Sequencer: ZMQ bind address */
+#define HPPLITE_URI_ZMQ_SEQUENCER "zmq_sequencer" /* Witness: ZMQ sequencer address */
 
 /*
 ** Default values
@@ -95,6 +97,10 @@ typedef struct HppliteConfig {
 
     /* Batching */
     int batchIntervalMs;             /* Batch interval in milliseconds */
+
+    /* ZMQ networking */
+    char *zmqBind;                   /* Sequencer: ZMQ bind address (e.g. tcp://star:5555) */
+    char *zmqSequencer;              /* Witness: ZMQ sequencer address (e.g. tcp://host:5555) */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */
