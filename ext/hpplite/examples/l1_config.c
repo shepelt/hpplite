@@ -1,0 +1,123 @@
+/*
+** HPPLite Example: L1 Configuration
+**
+** Demonstrates:
+** - Using network aliases (l1=hpp-sepolia)
+** - Reading system config from L1 contract
+** - Building DA URIs
+**
+** Build:
+**   gcc -I.. -I../../build -o l1_config l1_config.c \
+**       ../build/libhpplite.a ../build/libsqlite3.a \
+**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq
+*/
+
+#include "hpplite.h"
+#include "l1_interface.h"
+#include "da_uri.h"
+#include "config.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* HPPLiteDA v2 on HPP Sepolia */
+#define CONTRACT "0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc"
+#define DATA_DIR "/tmp/hpplite_l1"
+
+static void print_hex(const unsigned char *data, int len) {
+    for (int i = 0; i < len; i++) printf("%02x", data[i]);
+}
+
+int main(void) {
+    printf("HPPLite L1 Configuration Example\n");
+    printf("==================================\n\n");
+
+    /* Clean up */
+    system("rm -rf " DATA_DIR " && mkdir -p " DATA_DIR);
+
+    /*
+     * Open database with L1 network alias.
+     *
+     * Using l1=hpp-sepolia automatically sets:
+     *   - chainId = 181228
+     *   - rpcUrl = https://sepolia.hpp.io
+     *
+     * You can also use explicit chainid= and rpc= parameters.
+     */
+    printf("Opening database with L1 configuration...\n");
+    sqlite3 *db = hpplite_open(
+        "file:" DATA_DIR "/state.db"
+        "?hpplite=on"
+        "&l1=hpp-sepolia"
+        "&contract=" CONTRACT
+        "&role=sequencer"
+        "&datadir=" DATA_DIR
+    );
+    if (!db) {
+        printf("ERROR: Failed to open database\n");
+        return 1;
+    }
+
+    /* Get the configuration */
+    HppliteConfig *cfg = hpplite_get_config(db);
+    if (cfg) {
+        printf("\nLoaded Configuration:\n");
+        printf("  Role:     %s\n", hpplite_config_role_str(cfg->role));
+        printf("  Chain ID: %llu\n", (unsigned long long)cfg->chainId);
+        printf("  RPC URL:  %s\n", cfg->rpcUrl);
+        printf("  Contract: 0x");
+        if (cfg->hasContract) {
+            print_hex(cfg->contract, 20);
+        } else {
+            printf("(not set)");
+        }
+        printf("\n");
+        printf("  Data Dir: %s\n", cfg->dataDir);
+    }
+
+    /* Demonstrate network alias resolution */
+    printf("\nNetwork Alias Resolution:\n");
+    printf("  hpp-sepolia -> chain ID %llu\n",
+           (unsigned long long)hpplite_da_resolve_alias("hpp-sepolia"));
+    printf("  hpp-mainnet -> chain ID %llu\n",
+           (unsigned long long)hpplite_da_resolve_alias("hpp-mainnet"));
+
+    const char *rpc = hpplite_da_get_rpc_url(181228);
+    printf("  Chain 181228 -> RPC %s\n", rpc ? rpc : "(not found)");
+
+    /* Connect to L1 and read system config */
+    printf("\nConnecting to L1 contract...\n");
+    HppliteL1 *l1 = hpplite_l1_connect(cfg->rpcUrl, CONTRACT);
+    if (l1) {
+        HppliteSystemConfig *syscfg = hpplite_l1_get_system_config(l1);
+        if (syscfg) {
+            printf("\nSystem Configuration (from L1 contract):\n");
+            printf("  DA Scheme:        %s\n", syscfg->daScheme);
+            printf("  DA Contract:      0x");
+            print_hex(syscfg->daContract, 20);
+            printf("\n");
+            printf("  Batch Size Limit: %llu bytes\n",
+                   (unsigned long long)syscfg->batchSizeLimit);
+            printf("  Version:          %llu\n", (unsigned long long)syscfg->version);
+
+            /* Build example DA URIs */
+            printf("\nExample DA URIs:\n");
+            char *uri1 = hpplite_da_uri_from_config(syscfg, 1, 1);
+            printf("  %s\n", uri1);
+            free(uri1);
+
+            char *uri2 = hpplite_da_uri_from_config(syscfg, 1, 100);
+            printf("  %s\n", uri2);
+            free(uri2);
+
+            hpplite_l1_system_config_free(syscfg);
+        }
+        hpplite_l1_disconnect(l1);
+    } else {
+        printf("  (Could not connect - network may be unavailable)\n");
+    }
+
+    hpplite_close(db);
+    printf("\nDone!\n");
+    return 0;
+}

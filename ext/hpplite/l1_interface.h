@@ -23,6 +23,37 @@ extern "C" {
 #endif
 
 /*
+** Network configuration (for bootstrapping)
+*/
+typedef struct HppliteNetworkConfig {
+    const char *alias;           /* Network alias: "hpp-sepolia" (optional) */
+    uint64_t chainId;            /* Chain ID: 181228 */
+    const char *rpcUrl;          /* RPC URL: "https://sepolia.hpp.io" */
+    unsigned char contract[20];  /* Contract address */
+} HppliteNetworkConfig;
+
+/*
+** System configuration (read from L1 contract)
+*/
+typedef struct HppliteSystemConfig {
+    char *daScheme;              /* DA URI scheme: "hppda", "ipfs", "file" */
+    unsigned char daContract[20]; /* DA contract address */
+    uint64_t batchSizeLimit;     /* Max batch size in bytes */
+    uint64_t version;            /* Contract version */
+    uint64_t chainId;            /* Chain ID */
+} HppliteSystemConfig;
+
+/*
+** Built-in network definitions
+*/
+#define HPPLITE_NETWORK_HPP_SEPOLIA { \
+    .alias = "hpp-sepolia", \
+    .chainId = 181228, \
+    .rpcUrl = "https://sepolia.hpp.io", \
+    .contract = {0} \
+}
+
+/*
 ** L1 connection context
 */
 typedef struct HppliteL1 HppliteL1;
@@ -66,6 +97,23 @@ typedef void (*HppliteL1Callback)(void *arg, const char *event, void *data);
 ** For real: pass RPC endpoint like "https://mainnet.infura.io/..."
 */
 HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress);
+
+/*
+** Initialize L1 connection from network config.
+** Preferred method - uses structured config.
+*/
+HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config);
+
+/*
+** Get system configuration from L1 contract.
+** Caller must free with hpplite_l1_system_config_free().
+*/
+HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1);
+
+/*
+** Free system config
+*/
+void hpplite_l1_system_config_free(HppliteSystemConfig *config);
 
 /*
 ** Disconnect from L1
@@ -132,6 +180,13 @@ void hpplite_l1_set_callback(HppliteL1 *l1, HppliteL1Callback callback, void *ar
 ** Returns number of new events, or -1 on error
 */
 int hpplite_l1_poll(HppliteL1 *l1);
+
+/*
+** Wait for transaction to be mined
+** tx_hash is hex string (0x prefixed)
+** Returns 1 if success, 0 if reverted, -1 if pending/error
+*/
+int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs);
 
 /* === Mock-specific functions for testing === */
 

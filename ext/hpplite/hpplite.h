@@ -212,6 +212,83 @@ int sqlite3_hpplite_init(
 );
 #endif
 
+/*
+** ============================================================================
+** Simple Open API (M3 - URI-based configuration)
+** ============================================================================
+**
+** Usage:
+**   sqlite3 *db = hpplite_open("file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia");
+**
+** URI Parameters:
+**   hpplite=on        Enable HPPLite (required)
+**   role=sequencer    Role: sequencer|witness|observer
+**   l1=hpp-sepolia    L1 network alias (or chainid=181228)
+**   contract=0x...    L1 contract address
+**   interval=5s       Batch interval (default: 5s)
+**   datadir=/path     Data directory for batches
+**   privkey=0x...     Private key (or keyfile=/path)
+**
+** Environment variables (lower priority than URI):
+**   HPPLITE_ROLE, HPPLITE_CHAIN_ID, HPPLITE_RPC_URL, etc.
+*/
+
+/* Forward declaration */
+struct HppliteConfig;
+
+/*
+** Open database with HPPLite enabled via URI parameters.
+** Returns sqlite3* handle or NULL on error.
+**
+** The returned handle works like normal sqlite3* - just use sqlite3_exec(), etc.
+** Batches are created automatically based on the interval setting.
+**
+** When done, call hpplite_close(db) instead of sqlite3_close().
+*/
+sqlite3 *hpplite_open(const char *uri);
+
+/*
+** Close HPPLite database (frees HPPLite resources + calls sqlite3_close).
+*/
+int hpplite_close(sqlite3 *db);
+
+/*
+** Get HPPLite context from an open database.
+** Returns NULL if database was not opened with hpplite_open().
+*/
+HppliteCtx *hpplite_context(sqlite3 *db);
+
+/*
+** Get the configuration for an open database.
+** Returns NULL if database was not opened with hpplite_open().
+*/
+struct HppliteConfig *hpplite_get_config(sqlite3 *db);
+
+/*
+** Force flush pending changes to a batch immediately.
+** Normally batches are created automatically on the interval.
+** Returns batch height or 0 if no pending changes.
+*/
+uint64_t hpplite_flush(sqlite3 *db);
+
+/*
+** Check if auto-flush interval passed and flush if so.
+** Call this periodically in applications, or rely on automatic
+** progress handler for automatic flushing during SQL execution.
+** Returns batch height if flushed, 0 otherwise.
+*/
+uint64_t hpplite_check_flush(sqlite3 *db);
+
+/*
+** Get current state root.
+*/
+void hpplite_state_root(sqlite3 *db, unsigned char *out);
+
+/*
+** Pubkey size for signatures
+*/
+#define HPPLITE_PUBKEY_SIZE 33
+
 #ifdef __cplusplus
 }
 #endif
