@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/time.h>
 
 /*
 ** Helper: duplicate a string using sqlite3_malloc
@@ -23,6 +26,15 @@ static char *node_strdup(const char *s) {
     char *dup = sqlite3_malloc((int)len);
     if (dup) memcpy(dup, s, len);
     return dup;
+}
+
+/*
+** Helper: get current time in milliseconds
+*/
+static int64_t node_current_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 /*
@@ -85,18 +97,26 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
     /* Copy configuration */
     node->config.nodeId = node_strdup(config->nodeId);
     memcpy(node->config.privkey, config->privkey, 32);
+    node->config.hasPrivkey = config->hasPrivkey;
     node->config.dataDir = node_strdup(config->dataDir);
     node->config.dbPath = node_strdup(config->dbPath);
+    node->config.rpcUrl = node_strdup(config->rpcUrl);
+    memcpy(node->config.factory, config->factory, 20);
+    node->config.hasFactory = config->hasFactory;
+    memcpy(node->config.contract, config->contract, 20);
+    node->config.hasContract = config->hasContract;
     node->config.bindAddress = node_strdup(config->bindAddress);
     node->config.sequencerAddress = node_strdup(config->sequencerAddress);
+    node->config.role = config->role;
     node->config.requiredAttestations = config->requiredAttestations > 0 ? config->requiredAttestations : 1;
     node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
     node->config.batchTimeoutMs = config->batchTimeoutMs > 0 ? config->batchTimeoutMs : 1000;
     node->config.attestationTimeoutMs = config->attestationTimeoutMs > 0 ? config->attestationTimeoutMs : 5000;
+    node->config.batchIntervalMs = config->batchIntervalMs;
 
     /* Initialize state */
     node->state = HPPLITE_STATE_INIT;
-    node->role = HPPLITE_ROLE_UNKNOWN;
+    node->role = config->role;
 
     /* Initialize crypto */
     node->crypto = hpplite_crypto_init();
@@ -106,10 +126,12 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
     }
 
     /* Initialize keypair from private key */
-    rc = hpplite_crypto_keypair_from_privkey(node->crypto, &node->keypair, config->privkey);
-    if (rc != 0) {
-        hpplite_node_destroy(node);
-        return NULL;
+    if (config->hasPrivkey) {
+        rc = hpplite_crypto_keypair_from_privkey(node->crypto, &node->keypair, config->privkey);
+        if (rc != 0) {
+            hpplite_node_destroy(node);
+            return NULL;
+        }
     }
 
     /* Open database */
@@ -118,6 +140,7 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
         hpplite_node_destroy(node);
         return NULL;
     }
+    node->ownsDb = 1;  /* We opened it, we own it */
 
     /* Initialize HPPLite context */
     rc = hpplite_init(node->db, &node->ctx);
@@ -127,10 +150,266 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
     }
 
     /* Initialize storage */
-    rc = hpplite_storage_init(config->dataDir, &node->storage);
-    if (rc != 0) {
+    if (config->dataDir) {
+        rc = hpplite_storage_init(config->dataDir, &node->storage);
+        if (rc != 0) {
+            hpplite_node_destroy(node);
+            return NULL;
+        }
+    }
+
+    /* Auto-connect to L1 if config provided */
+    if (config->rpcUrl && (config->hasContract || config->hasFactory)) {
+        if (config->hasFactory && config->hasPrivkey) {
+            /* Use factory to find/create rollup */
+            char factoryHex[43];
+            snprintf(factoryHex, sizeof(factoryHex), "0x");
+            for (int i = 0; i < 20; i++) {
+                snprintf(factoryHex + 2 + i*2, 3, "%02x", config->factory[i]);
+            }
+
+            /* Check if rollup exists */
+            unsigned char rollup[20];
+            int result = hpplite_l1_factory_get_my_rollup(
+                config->rpcUrl, factoryHex, config->privkey, rollup);
+
+            if (result == 0) {
+                /* No rollup exists - create one */
+                char *txHash = hpplite_l1_factory_get_or_create_rollup(
+                    config->rpcUrl, factoryHex, config->privkey, rollup);
+
+                if (txHash) {
+                    /* Wait for transaction to be mined */
+                    HppliteL1 *tempL1 = hpplite_l1_connect(config->rpcUrl, factoryHex);
+                    if (tempL1) {
+                        hpplite_l1_wait_for_tx(tempL1, txHash, 60);
+                        hpplite_l1_disconnect(tempL1);
+                    }
+                    free(txHash);
+
+                    /* Try again to get rollup address */
+                    result = hpplite_l1_factory_get_my_rollup(
+                        config->rpcUrl, factoryHex, config->privkey, rollup);
+                }
+            }
+
+            if (result == 1) {
+                /* Connect to the rollup */
+                node->l1 = hpplite_l1_connect_factory(
+                    config->rpcUrl, factoryHex, config->privkey);
+                node->ownsL1 = (node->l1 != NULL);
+            }
+        } else if (config->hasContract) {
+            /* Direct contract connection */
+            char contractHex[43];
+            snprintf(contractHex, sizeof(contractHex), "0x");
+            for (int i = 0; i < 20; i++) {
+                snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
+            }
+            node->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
+            node->ownsL1 = (node->l1 != NULL);
+
+            if (node->l1 && config->hasPrivkey) {
+                hpplite_l1_set_privkey(node->l1, config->privkey);
+            }
+        }
+
+        /* Sync existing batches from L1 */
+        if (node->l1) {
+            uint64_t lastBatch = 0, totalBatches = 0;
+            unsigned char latestHash[32];
+            if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) == 0
+                && totalBatches > 0) {
+                /* Replay batches from L1 */
+                for (uint64_t h = 1; h <= lastBatch; h++) {
+                    size_t dataLen = 0;
+                    uint8_t *data = hpplite_l1_get_batch(node->l1, h, &dataLen);
+                    if (data && dataLen > 0) {
+                        HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
+                        if (batch) {
+                            for (int i = 0; i < batch->nTxns; i++) {
+                                if (batch->aTxns[i].zSql) {
+                                    sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
+                                }
+                            }
+                            node->ctx->blockHeight = batch->height + 1;
+                            node->lastCheckpointHeight = batch->height;
+                            memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                            hpplite_batch_free(batch);
+                        }
+                        free(data);
+                    }
+                }
+            }
+        }
+    }
+
+    return node;
+}
+
+/*
+** Initialize a node using an existing database connection.
+** The node does NOT own the db (won't close it on destroy).
+*/
+HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *config) {
+    HppliteNode *node;
+    int rc;
+
+    if (!db || !config) return NULL;
+
+    node = sqlite3_malloc(sizeof(HppliteNode));
+    if (!node) return NULL;
+    memset(node, 0, sizeof(HppliteNode));
+
+    /* Use existing db, don't own it */
+    node->db = db;
+    node->ownsDb = 0;
+
+    /* Copy configuration */
+    node->config.nodeId = node_strdup(config->nodeId);
+    memcpy(node->config.privkey, config->privkey, 32);
+    node->config.hasPrivkey = config->hasPrivkey;
+    node->config.dataDir = node_strdup(config->dataDir);
+    node->config.dbPath = node_strdup(config->dbPath);
+    node->config.rpcUrl = node_strdup(config->rpcUrl);
+    memcpy(node->config.factory, config->factory, 20);
+    node->config.hasFactory = config->hasFactory;
+    memcpy(node->config.contract, config->contract, 20);
+    node->config.hasContract = config->hasContract;
+    node->config.bindAddress = node_strdup(config->bindAddress);
+    node->config.sequencerAddress = node_strdup(config->sequencerAddress);
+    node->config.role = config->role;
+    node->config.requiredAttestations = config->requiredAttestations > 0 ? config->requiredAttestations : 1;
+    node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
+    node->config.batchTimeoutMs = config->batchTimeoutMs > 0 ? config->batchTimeoutMs : 1000;
+    node->config.attestationTimeoutMs = config->attestationTimeoutMs > 0 ? config->attestationTimeoutMs : 5000;
+    node->config.batchIntervalMs = config->batchIntervalMs;
+
+    /* Initialize state */
+    node->state = HPPLITE_STATE_INIT;
+    node->role = config->role;
+
+    /* Initialize crypto */
+    node->crypto = hpplite_crypto_init();
+    if (!node->crypto) {
         hpplite_node_destroy(node);
         return NULL;
+    }
+
+    /* Initialize keypair from private key */
+    if (config->hasPrivkey) {
+        rc = hpplite_crypto_keypair_from_privkey(node->crypto, &node->keypair, config->privkey);
+        if (rc != 0) {
+            hpplite_node_destroy(node);
+            return NULL;
+        }
+    }
+
+    /* Initialize HPPLite context */
+    rc = hpplite_init(db, &node->ctx);
+    if (rc != SQLITE_OK) {
+        hpplite_node_destroy(node);
+        return NULL;
+    }
+
+    /* Initialize storage */
+    if (config->dataDir) {
+        rc = hpplite_storage_init(config->dataDir, &node->storage);
+        if (rc != 0) {
+            hpplite_node_destroy(node);
+            return NULL;
+        }
+    }
+
+    /* Initialize timer fields */
+    node->lastFlushTime = node_current_time_ms();
+    hpplite_get_state_root(node->ctx, node->lastFlushedRoot);
+
+    /* Auto-connect to L1 if config provided */
+    if (config->rpcUrl && (config->hasContract || config->hasFactory)) {
+        if (config->hasFactory && config->hasPrivkey) {
+            /* Use factory to find/create rollup */
+            char factoryHex[43];
+            snprintf(factoryHex, sizeof(factoryHex), "0x");
+            for (int i = 0; i < 20; i++) {
+                snprintf(factoryHex + 2 + i*2, 3, "%02x", config->factory[i]);
+            }
+
+            /* Check if rollup exists */
+            unsigned char rollup[20];
+            int result = hpplite_l1_factory_get_my_rollup(
+                config->rpcUrl, factoryHex, config->privkey, rollup);
+
+            if (result == 0) {
+                /* No rollup exists - create one */
+                char *txHash = hpplite_l1_factory_get_or_create_rollup(
+                    config->rpcUrl, factoryHex, config->privkey, rollup);
+
+                if (txHash) {
+                    /* Wait for transaction to be mined */
+                    HppliteL1 *tempL1 = hpplite_l1_connect(config->rpcUrl, factoryHex);
+                    if (tempL1) {
+                        hpplite_l1_wait_for_tx(tempL1, txHash, 60);
+                        hpplite_l1_disconnect(tempL1);
+                    }
+                    free(txHash);
+
+                    /* Try again to get rollup address */
+                    result = hpplite_l1_factory_get_my_rollup(
+                        config->rpcUrl, factoryHex, config->privkey, rollup);
+                }
+            }
+
+            if (result == 1) {
+                /* Connect to the rollup */
+                node->l1 = hpplite_l1_connect_factory(
+                    config->rpcUrl, factoryHex, config->privkey);
+                node->ownsL1 = (node->l1 != NULL);
+            }
+        } else if (config->hasContract) {
+            /* Direct contract connection */
+            char contractHex[43];
+            snprintf(contractHex, sizeof(contractHex), "0x");
+            for (int i = 0; i < 20; i++) {
+                snprintf(contractHex + 2 + i*2, 3, "%02x", config->contract[i]);
+            }
+            node->l1 = hpplite_l1_connect(config->rpcUrl, contractHex);
+            node->ownsL1 = (node->l1 != NULL);
+
+            if (node->l1 && config->hasPrivkey) {
+                hpplite_l1_set_privkey(node->l1, config->privkey);
+            }
+        }
+
+        /* Sync existing batches from L1 */
+        if (node->l1) {
+            uint64_t lastBatch = 0, totalBatches = 0;
+            unsigned char latestHash[32];
+            if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) == 0
+                && totalBatches > 0) {
+                /* Replay batches from L1 */
+                for (uint64_t h = 1; h <= lastBatch; h++) {
+                    size_t dataLen = 0;
+                    uint8_t *data = hpplite_l1_get_batch(node->l1, h, &dataLen);
+                    if (data && dataLen > 0) {
+                        HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
+                        if (batch) {
+                            for (int i = 0; i < batch->nTxns; i++) {
+                                if (batch->aTxns[i].zSql) {
+                                    sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
+                                }
+                            }
+                            node->ctx->blockHeight = batch->height + 1;
+                            node->lastCheckpointHeight = batch->height;
+                            memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                            memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                            hpplite_batch_free(batch);
+                        }
+                        free(data);
+                    }
+                }
+            }
+        }
     }
 
     return node;
@@ -143,6 +422,9 @@ void hpplite_node_destroy(HppliteNode *node) {
     int i;
 
     if (!node) return;
+
+    /* Stop timer thread first */
+    hpplite_node_stop_timer(node);
 
     /* Stop if running */
     if (node->state == HPPLITE_STATE_RUNNING) {
@@ -170,7 +452,10 @@ void hpplite_node_destroy(HppliteNode *node) {
         sqlite3_free(node->witnessPubkeys);
     }
 
-    /* Note: L1 is NOT freed here - it's a shared pointer for M1 */
+    /* Disconnect L1 only if we own it (auto-connected) */
+    if (node->l1 && node->ownsL1) {
+        hpplite_l1_disconnect(node->l1);
+    }
 
     /* Close storage */
     if (node->storage) {
@@ -182,8 +467,8 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_shutdown(node->ctx);
     }
 
-    /* Close database */
-    if (node->db) {
+    /* Close database only if we own it */
+    if (node->db && node->ownsDb) {
         sqlite3_close(node->db);
     }
 
@@ -196,10 +481,143 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.nodeId);
     sqlite3_free(node->config.dataDir);
     sqlite3_free(node->config.dbPath);
+    sqlite3_free(node->config.rpcUrl);
     sqlite3_free(node->config.bindAddress);
     sqlite3_free(node->config.sequencerAddress);
 
     sqlite3_free(node);
+}
+
+/*
+** Internal flush for timer thread - creates batch and posts to L1
+** Must be called with mutex held.
+*/
+static uint64_t node_do_flush_locked(HppliteNode *node) {
+    if (!node || !node->ctx) return 0;
+
+    /* Create batch from pending SQL */
+    HppliteBatch *batch = hpplite_flush_block(node->ctx);
+    if (!batch) return 0;
+
+    uint64_t height = batch->height;
+
+    /* Store batch locally */
+    if (node->storage) {
+        hpplite_storage_store_batch(node->storage, batch);
+    }
+
+    /* Post batch to L1 for data availability */
+    if (node->l1) {
+        char *json = hpplite_batch_to_json(batch);
+        if (json) {
+            char *txHash = hpplite_l1_submit_batch(node->l1, height,
+                                    (const uint8_t *)json, strlen(json));
+            if (txHash) {
+                hpplite_l1_wait_for_tx(node->l1, txHash, 30);
+                free(txHash);
+            }
+            sqlite3_free(json);
+        }
+    }
+
+    /* Update last flushed state */
+    memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+    node->lastFlushTime = node_current_time_ms();
+
+    hpplite_batch_free(batch);
+    return height;
+}
+
+/*
+** Timer thread function - auto-flush batches on interval
+*/
+static void *node_timer_thread_func(void *arg) {
+    HppliteNode *node = (HppliteNode *)arg;
+
+    if (!node) return NULL;
+
+    int intervalMs = node->config.batchIntervalMs;
+    if (intervalMs <= 0) return NULL;
+
+    /* Sleep in small increments for quick shutdown */
+    int sleepMs = (intervalMs < 100) ? intervalMs : 100;
+
+    while (node->timerRunning) {
+        usleep(sleepMs * 1000);
+
+        if (!node->timerRunning) break;
+
+        /* Check if time to flush */
+        int64_t now = node_current_time_ms();
+        int64_t elapsed = now - node->lastFlushTime;
+
+        if (elapsed >= intervalMs) {
+            pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+            if (mutex) {
+                pthread_mutex_lock(mutex);
+                if (node->timerRunning) {
+                    node_do_flush_locked(node);
+                }
+                pthread_mutex_unlock(mutex);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/*
+** Start auto-flush timer thread
+*/
+void hpplite_node_start_timer(HppliteNode *node) {
+    if (!node) return;
+    if (node->config.batchIntervalMs <= 0) return;
+    if (node->timerRunning) return;  /* Already running */
+
+    /* Allocate mutex */
+    pthread_mutex_t *mutex = sqlite3_malloc(sizeof(pthread_mutex_t));
+    if (!mutex) return;
+    pthread_mutex_init(mutex, NULL);
+    node->flushMutex = mutex;
+
+    /* Start thread */
+    pthread_t *thread = sqlite3_malloc(sizeof(pthread_t));
+    if (!thread) {
+        pthread_mutex_destroy(mutex);
+        sqlite3_free(mutex);
+        node->flushMutex = NULL;
+        return;
+    }
+
+    node->timerRunning = 1;
+    pthread_create(thread, NULL, node_timer_thread_func, node);
+    node->timerThread = thread;
+}
+
+/*
+** Stop auto-flush timer thread
+*/
+void hpplite_node_stop_timer(HppliteNode *node) {
+    if (!node || !node->timerRunning) return;
+
+    /* Signal thread to stop */
+    node->timerRunning = 0;
+
+    /* Wait for thread to finish */
+    pthread_t *thread = (pthread_t *)node->timerThread;
+    if (thread) {
+        pthread_join(*thread, NULL);
+        sqlite3_free(thread);
+        node->timerThread = NULL;
+    }
+
+    /* Destroy mutex */
+    pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+    if (mutex) {
+        pthread_mutex_destroy(mutex);
+        sqlite3_free(mutex);
+        node->flushMutex = NULL;
+    }
 }
 
 #ifdef HPPLITE_ENABLE_ZMQ
@@ -508,6 +926,21 @@ uint64_t hpplite_node_flush_batch(HppliteNode *node) {
         hpplite_zmq_broadcast_batch(node->zmqTransport, batch, batchRef);
     }
 #endif
+
+    /* Post batch to L1 for data availability */
+    if (node->l1) {
+        char *json = hpplite_batch_to_json(batch);
+        if (json) {
+            char *txHash = hpplite_l1_submit_batch(node->l1, batch->height,
+                                    (const uint8_t *)json, strlen(json));
+            if (txHash) {
+                /* Wait for transaction to be mined */
+                hpplite_l1_wait_for_tx(node->l1, txHash, 30);
+                free(txHash);
+            }
+            sqlite3_free(json);
+        }
+    }
 
     uint64_t height = batch->height;
     hpplite_batch_free(batch);
@@ -1160,6 +1593,7 @@ HppliteAttestation *hpplite_node_parse_attestation_msg(
 void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1) {
     if (!node) return;
     node->l1 = l1;
+    node->ownsL1 = 0;  /* Externally provided - we don't own it */
 }
 
 /*

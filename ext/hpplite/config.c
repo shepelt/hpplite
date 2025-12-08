@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "da_uri.h"
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -307,6 +308,13 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         }
     }
 
+    /* Factory */
+    if (get_uri_param(uri, HPPLITE_URI_FACTORY, buf, sizeof(buf))) {
+        if (hex_to_bytes(buf, cfg->factory, 20) == 0) {
+            cfg->hasFactory = 1;
+        }
+    }
+
     /* Private key */
     if (get_uri_param(uri, HPPLITE_URI_PRIVKEY, buf, sizeof(buf))) {
         hpplite_config_parse_privkey(cfg, buf);
@@ -332,6 +340,106 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     /* Batch interval */
     if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
+        if (ms > 0) cfg->batchIntervalMs = ms;
+    }
+
+    return 0;
+}
+
+int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
+    if (!cfg || !filename) return -1;
+
+    const char *val;
+
+    /* Set database path */
+    cfg->dbPath = strdup(filename);
+
+    /* Role */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ROLE);
+    if (val) {
+        cfg->role = hpplite_config_parse_role(val);
+        cfg->roleSource = 2;
+    }
+
+    /* Chain ID (numeric) */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHAIN_ID);
+    if (val) {
+        cfg->chainId = strtoull(val, NULL, 10);
+        cfg->chainIdSource = 2;
+    }
+
+    /* L1 network alias */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_L1);
+    if (val) {
+        uint64_t chainId = hpplite_da_resolve_alias(val);
+        if (chainId > 0) {
+            cfg->chainId = chainId;
+            cfg->chainIdSource = 2;
+
+            /* Also set RPC URL from alias */
+            const char *rpc = hpplite_da_get_rpc_url(chainId);
+            if (rpc) {
+                free(cfg->rpcUrl);
+                cfg->rpcUrl = strdup(rpc);
+                cfg->rpcUrlSource = 2;
+            }
+        }
+    }
+
+    /* RPC URL */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_RPC_URL);
+    if (val) {
+        free(cfg->rpcUrl);
+        cfg->rpcUrl = strdup(val);
+        cfg->rpcUrlSource = 2;
+    }
+
+    /* Contract */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_CONTRACT);
+    if (val) {
+        if (hpplite_config_parse_contract(cfg, val) == 0) {
+            cfg->contractSource = 2;
+        }
+    }
+
+    /* Factory */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_FACTORY);
+    if (val) {
+        if (hex_to_bytes(val, cfg->factory, 20) == 0) {
+            cfg->hasFactory = 1;
+        }
+    }
+
+    /* Private key */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_PRIVKEY);
+    if (val) {
+        hpplite_config_parse_privkey(cfg, val);
+    }
+
+    /* Private key file */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_PRIVKEY_FILE);
+    if (val) {
+        hpplite_config_load_privkey_file(cfg, val);
+    }
+
+    /* Data dir */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_DATA_DIR);
+    if (val) {
+        free(cfg->dataDir);
+        cfg->dataDir = strdup(val);
+    }
+
+    /* Node ID */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_NODE_ID);
+    if (val) {
+        free(cfg->nodeId);
+        cfg->nodeId = strdup(val);
+    }
+
+    /* Batch interval */
+    val = sqlite3_uri_parameter(filename, "interval");
+    if (val) {
+        int ms = parse_duration_ms(val);
         if (ms > 0) cfg->batchIntervalMs = ms;
     }
 

@@ -230,6 +230,11 @@ contract HPPLiteDA {
 
     // ============ Admin Functions ============
 
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Invalid owner");
+        owner = newOwner;
+    }
+
     function setSequencer(address _sequencer) external onlyOwner {
         address old = sequencer;
         sequencer = _sequencer;

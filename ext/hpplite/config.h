@@ -52,6 +52,7 @@ extern "C" {
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_NODE_ID       "nodeid"
+#define HPPLITE_URI_FACTORY       "factory"
 
 /*
 ** Default values
@@ -85,6 +86,8 @@ typedef struct HppliteConfig {
     char *rpcUrl;                    /* RPC endpoint */
     unsigned char contract[20];      /* L1 contract address */
     int hasContract;                 /* Whether contract is set */
+    unsigned char factory[20];       /* Factory contract address */
+    int hasFactory;                  /* Whether factory is set */
 
     /* Paths */
     char *dataDir;                   /* Data directory */
@@ -123,6 +126,13 @@ int hpplite_config_load_env(HppliteConfig *cfg);
 ** Overrides current values if URI params are set.
 */
 int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri);
+
+/*
+** Load config from SQLite db filename using sqlite3_uri_parameter().
+** This is the correct way to load config from an open database,
+** since sqlite3_db_filename() only returns the path, not the URI.
+*/
+int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename);
 
 /*
 ** Load config from all sources (defaults + env + uri).

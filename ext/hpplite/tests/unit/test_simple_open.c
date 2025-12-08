@@ -238,25 +238,25 @@ int main(void) {
     TEST("Auto-flush via background thread");
     {
         unlink("/tmp/test_simple_open.db");
-        /* Use 100ms interval for testing */
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&interval=100ms&datadir=/tmp/hpplite_test_simple";
+        /* Use 200ms interval for testing */
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&interval=200ms&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
         /* Check config has correct interval */
         HppliteConfig *cfg = hpplite_get_config(db);
-        if (cfg->batchIntervalMs != 100) FAIL("interval not set correctly");
+        if (cfg->batchIntervalMs != 200) FAIL("interval not set correctly");
+
+        /* Get height BEFORE inserting data */
+        HppliteCtx *ctx = hpplite_context(db);
+        uint64_t h1 = hpplite_get_block_height(ctx);
 
         /* Insert data */
         sqlite3_exec(db, "CREATE TABLE auto(x);", NULL, NULL, NULL);
         sqlite3_exec(db, "INSERT INTO auto VALUES(1);", NULL, NULL, NULL);
 
-        /* Get height before waiting */
-        HppliteCtx *ctx = hpplite_context(db);
-        uint64_t h1 = hpplite_get_block_height(ctx);
-
         /* Wait for background thread to auto-flush (interval + buffer) */
-        usleep(200000);  /* 200ms - enough for 100ms interval + thread wake */
+        usleep(350000);  /* 350ms - enough for 200ms interval + thread wake */
 
         /* Check that block height increased - NO manual flush call needed! */
         uint64_t h2 = hpplite_get_block_height(ctx);

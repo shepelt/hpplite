@@ -269,8 +269,13 @@ static size_t sign_transaction(EthClient *client,
                                const uint8_t to[20], uint64_t value,
                                const uint8_t *data, size_t data_len,
                                uint8_t *out) {
-    /* Build unsigned tx for signing (EIP-155) */
-    uint8_t items[1024];
+    /* Build unsigned tx for signing (EIP-155)
+     * Buffer size: data_len + ~200 bytes for other fields + signature
+     */
+    size_t items_size = data_len + 256;
+    if (items_size < 2048) items_size = 2048;
+    uint8_t *items = malloc(items_size);
+    if (!items) return 0;
     size_t items_len = 0;
     
     items_len += rlp_encode_uint64(nonce, items + items_len);
@@ -284,20 +289,27 @@ static size_t sign_transaction(EthClient *client,
     items_len += rlp_encode_uint64(0, items + items_len);
     items_len += rlp_encode_uint64(0, items + items_len);
     
-    /* RLP encode as list */
-    uint8_t unsigned_tx[1200];
+    /* RLP encode as list - use dynamic buffer for larger data */
+    size_t unsigned_tx_size = items_len + 16;  /* items + list header */
+    uint8_t *unsigned_tx = malloc(unsigned_tx_size);
+    if (!unsigned_tx) {
+        free(items);
+        return 0;
+    }
     size_t header_len = rlp_encode_list_header(items_len, unsigned_tx);
     memcpy(unsigned_tx + header_len, items, items_len);
     size_t unsigned_tx_len = header_len + items_len;
-    
+
     /* Hash for signing */
     uint8_t hash[32];
     keccak256(unsigned_tx, unsigned_tx_len, hash);
-    
+    free(unsigned_tx);  /* Done with unsigned tx */
+
     /* Sign */
     secp256k1_ecdsa_recoverable_signature sig;
-    if (!secp256k1_ecdsa_sign_recoverable(client->secp_ctx, &sig, hash, 
+    if (!secp256k1_ecdsa_sign_recoverable(client->secp_ctx, &sig, hash,
                                            client->privkey, NULL, NULL)) {
+        free(items);
         return 0;
     }
     
@@ -323,7 +335,9 @@ static size_t sign_transaction(EthClient *client,
     
     header_len = rlp_encode_list_header(items_len, out);
     memcpy(out + header_len, items, items_len);
-    return header_len + items_len;
+    size_t result = header_len + items_len;
+    free(items);
+    return result;
 }
 
 uint8_t *eth_client_send_raw_tx(EthClient *client,
@@ -367,16 +381,27 @@ uint8_t *eth_client_send_tx(EthClient *client,
     
     /* Add 10% to gas price */
     gas_price = gas_price + gas_price / 10;
-    
-    uint8_t raw_tx[2048];
+
+    /* Allocate buffer for signed tx: data + overhead for RLP encoding + signature */
+    size_t raw_tx_size = data_len + 512;
+    if (raw_tx_size < 4096) raw_tx_size = 4096;
+    uint8_t *raw_tx = malloc(raw_tx_size);
+    if (!raw_tx) {
+        snprintf(client->error, sizeof(client->error), "malloc failed");
+        return NULL;
+    }
+
     size_t raw_tx_len = sign_transaction(client, nonce, gas_price, gas_limit,
                                           to, value, data, data_len, raw_tx);
     if (raw_tx_len == 0) {
         snprintf(client->error, sizeof(client->error), "failed to sign transaction");
+        free(raw_tx);
         return NULL;
     }
-    
-    return eth_client_send_raw_tx(client, raw_tx, raw_tx_len);
+
+    uint8_t *result = eth_client_send_raw_tx(client, raw_tx, raw_tx_len);
+    free(raw_tx);
+    return result;
 }
 
 int eth_client_get_receipt(EthClient *client,
@@ -425,6 +450,33 @@ int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address
     uint8_t uncompressed[65];
     size_t len = 65;
     if (!secp256k1_ec_pubkey_serialize(g_addr_ctx, uncompressed, &len,
+                                        &pk, SECP256K1_EC_UNCOMPRESSED)) {
+        return -1;
+    }
+
+    /* Hash to get address */
+    eth_address_from_pubkey(uncompressed, address);
+    return 0;
+}
+
+int eth_address_from_privkey(const uint8_t privkey[32], uint8_t address[20]) {
+    /* Lazy init secp256k1 context (need SIGN for pubkey creation) */
+    static secp256k1_context *sign_ctx = NULL;
+    if (!sign_ctx) {
+        sign_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+        if (!sign_ctx) return -1;
+    }
+
+    /* Derive public key from private key */
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_create(sign_ctx, &pk, privkey)) {
+        return -1;
+    }
+
+    /* Serialize uncompressed */
+    uint8_t uncompressed[65];
+    size_t len = 65;
+    if (!secp256k1_ec_pubkey_serialize(sign_ctx, uncompressed, &len,
                                         &pk, SECP256K1_EC_UNCOMPRESSED)) {
         return -1;
     }

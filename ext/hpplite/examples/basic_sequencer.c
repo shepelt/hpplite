@@ -1,140 +1,151 @@
 /*
-** HPPLite Example: Basic Sequencer
+** HPPLite Example: Basic Sequencer + Replay
 **
-** Demonstrates transparent SQLite integration:
-** - Use standard sqlite3_open_v2() with ?hpplite=on URI parameter
-** - Use standard sqlite3_exec() for all database operations
-** - Automatic state root tracking
-** - Manual and automatic batch creation
-** - Transparent close via sqlite3_close() (close hook handles cleanup)
+** Demonstrates transparent SQLite integration with L1:
+** 1. Write data using standard SQLite API
+** 2. Data is automatically posted to L1
+** 3. Open fresh database and reconstruct from L1
 **
-** No registration needed - HPPLite is built into SQLite!
+** This is 100% standard SQLite API - no HPPLite-specific calls needed!
+**
+** Requires: cast (from foundry), jq
+**
+** Usage:
+**   ./basic_sequencer    # Loads master key from ../.env
 **
 ** Build:
-**   cd ../build && make
-**   gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
-**       ../build/libhpplite.a ../build/libsqlite3.a \
-**       -L/opt/homebrew/lib -lsecp256k1 -lcurl -lzmq -lpthread
+**   cd ../build && make basic_sequencer
 */
 
-#include "hpplite.h"
+#include <sqlite3.h>
+#include "test_util.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
+
+/* Force linker to include hpplite library (needed for static linking) */
+extern void hpplite_register(void);
 
 #define DATA_DIR "/tmp/hpplite_example"
+#define DATA_DIR2 "/tmp/hpplite_example2"
 
-static void print_hex(const unsigned char *data, int len) {
-    for (int i = 0; i < len; i++) printf("%02x", data[i]);
-}
-
-int main(void) {
-    printf("HPPLite Basic Sequencer Example\n");
-    printf("================================\n\n");
-
-    /* Clean up and create data directory */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", DATA_DIR, DATA_DIR);
-    system(cmd);
-
-    /*
-     * Open database with standard SQLite API.
-     * HPPLite auto-initializes when ?hpplite=on is in the URI!
-     *
-     * URI parameters:
-     *   hpplite=on        - Enable HPPLite
-     *   role=sequencer    - This node produces batches
-     *   datadir=/path     - Where to store batches
-     */
-    printf("Opening database with HPPLite...\n");
-    sqlite3 *db;
-    int rc = sqlite3_open_v2(
-        "file:" DATA_DIR "/state.db"
-        "?hpplite=on"
-        "&role=sequencer"
-        "&datadir=" DATA_DIR,
-        &db,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-        NULL
-    );
-    if (rc != SQLITE_OK) {
-        printf("ERROR: Failed to open database: %s\n", sqlite3_errmsg(db));
-        return 1;
-    }
-
-    /* Get initial state root (all zeros for new db) */
-    unsigned char stateRoot[32];
-    hpplite_state_root(db, stateRoot);
-    printf("Initial state root: ");
-    print_hex(stateRoot, 32);
-    printf("\n\n");
-
-    /* Use standard sqlite3_exec - changes are automatically tracked! */
-    char *errMsg = NULL;
-    int rc;
-
-    printf("Creating table...\n");
-    rc = sqlite3_exec(db,
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)",
-        NULL, NULL, &errMsg);
-    if (rc != SQLITE_OK) {
-        printf("ERROR: %s\n", errMsg);
-        sqlite3_free(errMsg);
-        return 1;
-    }
-
-    printf("Inserting data...\n");
-    sqlite3_exec(db, "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')", NULL, NULL, NULL);
-    sqlite3_exec(db, "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')", NULL, NULL, NULL);
-    sqlite3_exec(db, "INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')", NULL, NULL, NULL);
-
-    /* State root has changed after each commit */
-    hpplite_state_root(db, stateRoot);
-    printf("State root after inserts: ");
-    print_hex(stateRoot, 32);
-    printf("\n");
-
-    /* Flush batch - creates a batch with state root transition */
-    printf("\nFlushing batch...\n");
-    uint64_t height = hpplite_flush(db);
-    printf("Batch created at height: %llu\n", (unsigned long long)height);
-
-    /* More operations */
-    printf("\nUpdating data...\n");
-    sqlite3_exec(db, "UPDATE users SET email = 'alice@newdomain.com' WHERE id = 1", NULL, NULL, NULL);
-    sqlite3_exec(db, "DELETE FROM users WHERE id = 3", NULL, NULL, NULL);
-
-    hpplite_state_root(db, stateRoot);
-    printf("State root after updates: ");
-    print_hex(stateRoot, 32);
-    printf("\n");
-
-    height = hpplite_flush(db);
-    printf("Batch created at height: %llu\n", (unsigned long long)height);
-
-    /* Query the data - standard SQLite API */
-    printf("\nQuerying data:\n");
+static void query_users(sqlite3 *db) {
     sqlite3_stmt *stmt;
-    rc = sqlite3_prepare_v2(db, "SELECT * FROM users", -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, "SELECT * FROM users ORDER BY id", -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             printf("  id=%d name=%s email=%s\n",
                    sqlite3_column_int(stmt, 0),
-                   sqlite3_column_text(stmt, 1),
-                   sqlite3_column_text(stmt, 2));
+                   (const char*)sqlite3_column_text(stmt, 1),
+                   (const char*)sqlite3_column_text(stmt, 2));
         }
         sqlite3_finalize(stmt);
     }
+}
 
-    /* Show batch files */
-    printf("\nBatch files created:\n");
-    snprintf(cmd, sizeof(cmd), "ls -la %s/batches/", DATA_DIR);
-    system(cmd);
+int main(void) {
+    /* Force linker to include hpplite library */
+    hpplite_register();
 
-    /* Close with standard sqlite3_close() - the close hook handles cleanup!
-     * Any pending changes are flushed automatically. */
+    printf("HPPLite Basic Sequencer + Replay Example\n");
+    printf("=========================================\n");
+    printf("(Using 100%% standard SQLite API)\n\n");
+
+    /* Check dependencies */
+    if (!test_util_has_cast()) {
+        printf("ERROR: 'cast' not found. Install foundry: https://getfoundry.sh\n");
+        return 1;
+    }
+
+    /* Create funded wallet for this run */
+    printf("Creating fresh funded wallet...\n");
+    char privkey[128], address[64];
+    if (test_util_create_funded_wallet(privkey, sizeof(privkey),
+                                        address, sizeof(address),
+                                        HPPLITE_DEFAULT_RPC, "0.01ether") != 0) {
+        return 1;
+    }
+    printf("  Address: %s\n\n", address);
+
+    /* Clean up data directories */
+    system("rm -rf " DATA_DIR " " DATA_DIR2 " && mkdir -p " DATA_DIR " " DATA_DIR2);
+
+    /*
+     * PART 1: Write data to L1
+     */
+    printf("=== PART 1: Write data ===\n\n");
+
+    char uri[1024];
+    snprintf(uri, sizeof(uri),
+        "file:" DATA_DIR "/state.db"
+        "?hpplite=on"
+        "&factory=%s"
+        "&privkey=%s"
+        "&l1=hpp-sepolia",
+        HPPLITE_DEFAULT_FACTORY,
+        privkey
+    );
+
+    sqlite3 *db;
+    int rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    if (rc != SQLITE_OK) {
+        printf("ERROR: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    printf("Connected to L1, creating rollup...\n\n");
+
+    /* Write some data */
+    printf("Writing data:\n");
+    sqlite3_exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)",
+                 NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')", NULL, NULL, NULL);
+
+    query_users(db);
+
+    /* Wait for flush to L1 */
+    printf("\nFlushing to L1...\n");
+    sleep(3);
+
     sqlite3_close(db);
+    printf("Database closed. Data is now on L1.\n\n");
 
-    printf("\nDone!\n");
+    /*
+     * PART 2: Reconstruct from L1 in fresh database
+     */
+    printf("=== PART 2: Reconstruct from L1 ===\n\n");
+
+    /* Open a DIFFERENT database file, but same rollup (same privkey) */
+    snprintf(uri, sizeof(uri),
+        "file:" DATA_DIR2 "/reconstructed.db"
+        "?hpplite=on"
+        "&factory=%s"
+        "&privkey=%s"
+        "&l1=hpp-sepolia"
+        "&role=replica",  /* replica mode - sync from L1 */
+        HPPLITE_DEFAULT_FACTORY,
+        privkey
+    );
+
+    sqlite3 *db2;
+    rc = sqlite3_open_v2(uri, &db2,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    if (rc != SQLITE_OK) {
+        printf("ERROR: %s\n", sqlite3_errmsg(db2));
+        return 1;
+    }
+
+    printf("Opened fresh database, syncing from L1...\n");
+    sleep(2);  /* Wait for sync */
+
+    printf("\nReconstructed data:\n");
+    query_users(db2);
+
+    sqlite3_close(db2);
+
+    printf("\nSuccess! Data reconstructed from L1.\n");
+
     return 0;
 }

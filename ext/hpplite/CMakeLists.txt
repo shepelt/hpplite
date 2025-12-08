@@ -129,98 +129,123 @@ target_link_directories(hpplite PUBLIC
 
 # Test executables
 if(HPPLITE_BUILD_TESTS)
-    # Basic state tracking test
-    add_executable(test_hpplite test_hpplite.c)
+    # Include tests directory for test_env.h
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+    # === Unit Tests (no network required) ===
+    # Located in tests/unit/
+
+    add_executable(test_hpplite tests/unit/test_hpplite.c)
     target_link_libraries(test_hpplite hpplite)
 
-    # Batch serialization test
-    add_executable(test_batch test_batch.c)
+    add_executable(test_batch tests/unit/test_batch.c)
     target_link_libraries(test_batch hpplite)
 
-    # Full node test
-    add_executable(test_node test_node.c)
+    add_executable(test_node tests/unit/test_node.c)
     target_link_libraries(test_node hpplite)
 
-    # L1 mock test
-    add_executable(test_l1_mock test_l1_mock.c)
+    add_executable(test_l1_mock tests/unit/test_l1_mock.c)
     target_link_libraries(test_l1_mock hpplite)
 
-    # Checkpoint flow test (sequencer + witnesses, single process)
-    add_executable(test_checkpoint_flow test_checkpoint_flow.c)
+    add_executable(test_checkpoint_flow tests/unit/test_checkpoint_flow.c)
     target_link_libraries(test_checkpoint_flow hpplite)
 
-    # M2 multi-process test (requires ZMQ)
-    if(HPPLITE_ENABLE_ZMQ)
-        add_executable(test_m2_multiprocess test_m2_multiprocess.c)
-        target_link_libraries(test_m2_multiprocess hpplite Threads::Threads)
+    add_executable(test_da_uri tests/unit/test_da_uri.c)
+    target_link_libraries(test_da_uri hpplite)
 
-        # M2 node-to-node ZMQ test
-        add_executable(test_m2_nodes test_m2_nodes.c)
-        target_link_libraries(test_m2_nodes hpplite Threads::Threads)
+    add_executable(test_simple_open tests/unit/test_simple_open.c)
+    target_link_libraries(test_simple_open hpplite)
+
+    add_executable(test_witness tests/unit/test_witness.c)
+    target_link_libraries(test_witness hpplite)
+
+    add_executable(test_reconstruct tests/unit/test_reconstruct.c)
+    target_link_libraries(test_reconstruct hpplite)
+
+    add_executable(test_multinode tests/unit/test_multinode.c)
+    target_link_libraries(test_multinode hpplite)
+
+    if(HPPLITE_ENABLE_ZMQ)
+        add_executable(test_zmq tests/unit/test_zmq.c)
+        target_link_libraries(test_zmq hpplite Threads::Threads)
+
+        add_executable(test_zmq_nodes tests/unit/test_zmq_nodes.c)
+        target_link_libraries(test_zmq_nodes hpplite Threads::Threads)
     endif()
 
-    # M3 Web3 tests (eth/ subdirectory)
+    # Web3 primitive tests (eth/ subdirectory)
     add_executable(test_keccak eth/test_keccak.c eth/keccak256.c)
-
     add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
-
     add_executable(test_abi eth/test_abi.c eth/abi.c eth/keccak256.c)
 
-    # M3 eth_client test (requires network)
+    # === Integration Tests (require network + .env) ===
+    # Located in tests/integration/
+    # Run manually: ./test_factory, ./test_l1_e2e, etc.
+
     add_executable(test_eth_client eth/test_eth_client.c)
     target_link_libraries(test_eth_client hpplite)
 
-    # M3 L1 Ethereum client test (requires network)
-    add_executable(test_l1_eth test_l1_eth.c)
-    target_link_libraries(test_l1_eth hpplite)
+    add_executable(test_l1_client tests/integration/test_l1_client.c)
+    target_link_libraries(test_l1_client hpplite)
 
-    # M3 E2E test (requires network and deployed contract)
-    add_executable(test_m3_e2e test_m3_e2e.c)
-    target_link_libraries(test_m3_e2e hpplite)
+    add_executable(test_l1_e2e tests/integration/test_l1_e2e.c)
+    target_link_libraries(test_l1_e2e hpplite)
 
-    # M3 Checkpoint submission test (requires network)
-    add_executable(test_m3_checkpoint test_m3_checkpoint.c)
-    target_link_libraries(test_m3_checkpoint hpplite)
+    add_executable(test_l1_checkpoint tests/integration/test_l1_checkpoint.c)
+    target_link_libraries(test_l1_checkpoint hpplite)
 
-    # M3 L2 Reconstruction test (requires network + prior checkpoint data)
-    add_executable(test_m3_reconstruct test_m3_reconstruct.c)
-    target_link_libraries(test_m3_reconstruct hpplite)
+    add_executable(test_factory tests/integration/test_factory.c)
+    target_link_libraries(test_factory hpplite)
 
-    # M3 Witness attestation test
-    add_executable(test_m3_witness test_m3_witness.c)
-    target_link_libraries(test_m3_witness hpplite)
+    add_executable(test_l1_reconstruct tests/integration/test_l1_reconstruct.c)
+    target_link_libraries(test_l1_reconstruct hpplite)
 
-    # M3 Multi-node E2E test
-    add_executable(test_m3_multinode test_m3_multinode.c)
-    target_link_libraries(test_m3_multinode hpplite)
+    add_executable(test_full_e2e tests/integration/test_full_e2e.c)
+    target_link_libraries(test_full_e2e hpplite)
 
-    # DA URI scheme test
-    add_executable(test_da_uri test_da_uri.c)
-    target_link_libraries(test_da_uri hpplite)
+    add_executable(test_l1_full_e2e tests/integration/test_l1_full_e2e.c)
+    target_link_libraries(test_l1_full_e2e hpplite)
 
-    # Simple open API test
-    add_executable(test_simple_open test_simple_open.c)
-    target_link_libraries(test_simple_open hpplite)
+    add_executable(test_full_cluster tests/integration/test_full_cluster.c)
+    target_link_libraries(test_full_cluster hpplite)
 
-    # Add tests to CTest
+    # === CTest Registration (unit tests only) ===
     enable_testing()
+
     add_test(NAME test_hpplite COMMAND test_hpplite)
     add_test(NAME test_batch COMMAND test_batch)
     add_test(NAME test_node COMMAND test_node)
     add_test(NAME test_l1_mock COMMAND test_l1_mock)
     add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
-    if(HPPLITE_ENABLE_ZMQ)
-        add_test(NAME test_m2_multiprocess COMMAND test_m2_multiprocess)
-        add_test(NAME test_m2_nodes COMMAND test_m2_nodes)
-    endif()
-
-    # M3 Web3 tests (no network required)
+    add_test(NAME test_da_uri COMMAND test_da_uri)
+    add_test(NAME test_simple_open COMMAND test_simple_open)
+    add_test(NAME test_witness COMMAND test_witness)
+    add_test(NAME test_reconstruct COMMAND test_reconstruct)
+    add_test(NAME test_multinode COMMAND test_multinode)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
-    add_test(NAME test_da_uri COMMAND test_da_uri)
-    add_test(NAME test_simple_open COMMAND test_simple_open)
-    # Note: test_eth_client requires network, not in ctest
+
+    if(HPPLITE_ENABLE_ZMQ)
+        add_test(NAME test_zmq COMMAND test_zmq)
+        add_test(NAME test_zmq_nodes COMMAND test_zmq_nodes)
+    endif()
+endif()
+
+# Examples (build with -DHPPLITE_BUILD_EXAMPLES=ON)
+option(HPPLITE_BUILD_EXAMPLES "Build example executables" ON)
+if(HPPLITE_BUILD_EXAMPLES)
+    add_executable(factory_demo examples/factory_demo.c)
+    target_link_libraries(factory_demo hpplite)
+
+    add_executable(da_uri_demo examples/da_uri_demo.c)
+    target_link_libraries(da_uri_demo hpplite)
+
+    add_executable(basic_sequencer examples/basic_sequencer.c)
+    target_link_libraries(basic_sequencer hpplite)
+
+    add_executable(l1_config examples/l1_config.c)
+    target_link_libraries(l1_config hpplite)
 endif()
 
 # Benchmarks (not in ctest, run with 'make speedtest')
@@ -244,4 +269,5 @@ message(STATUS "  libcurl: ${CURL_LIBRARIES}")
 message(STATUS "  ZeroMQ: ${HPPLITE_ENABLE_ZMQ}")
 message(STATUS "  Real L1: ${HPPLITE_USE_REAL_L1}")
 message(STATUS "  Build tests: ${HPPLITE_BUILD_TESTS}")
+message(STATUS "  Build examples: ${HPPLITE_BUILD_EXAMPLES}")
 message(STATUS "")
