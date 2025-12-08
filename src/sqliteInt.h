@@ -1725,6 +1725,8 @@ struct sqlite3 {
   int (*xCommitCallback)(void*);    /* Invoked at every commit. */
   void *pRollbackArg;               /* Argument to xRollbackCallback() */
   void (*xRollbackCallback)(void*); /* Invoked at every commit. */
+  void *pCloseArg;                  /* Argument to xCloseCallback() */
+  void (*xCloseCallback)(void*, sqlite3*); /* Invoked before close. */
   void *pUpdateArg;
   void (*xUpdateCallback)(void*,int, const char*,const char*,sqlite_int64);
   void *pAutovacPagesArg;           /* Client argument to autovac_pages */

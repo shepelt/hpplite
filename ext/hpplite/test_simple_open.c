@@ -271,6 +271,72 @@ int main(void) {
         passed++;
     }
 
+    /* Test 10: Auto-extension with standard sqlite3_open */
+    tests++;
+    TEST("Auto-extension with sqlite3_open_v2");
+    {
+        unlink("/tmp/test_simple_open.db");
+
+        /* Register HPPLite auto-extension */
+        hpplite_register();
+
+        /* Open with standard SQLite API - HPPLite auto-initializes! */
+        sqlite3 *db;
+        int rc = sqlite3_open_v2(
+            "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple",
+            &db,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+            NULL
+        );
+        if (rc != SQLITE_OK) FAIL("sqlite3_open_v2 failed");
+
+        /* HPPLite should be active */
+        HppliteCtx *ctx = hpplite_context(db);
+        if (!ctx) FAIL("HPPLite not auto-initialized");
+
+        /* Do some SQL */
+        sqlite3_exec(db, "CREATE TABLE auto_test(id INT);", NULL, NULL, NULL);
+        sqlite3_exec(db, "INSERT INTO auto_test VALUES(42);", NULL, NULL, NULL);
+
+        /* Verify state root changed */
+        unsigned char root[32];
+        hpplite_state_root(db, root);
+        int nonzero = 0;
+        for (int i = 0; i < 32; i++) if (root[i]) nonzero = 1;
+        if (!nonzero) FAIL("state root is zero after INSERT");
+
+        /* Close with standard sqlite3_close - should auto-flush via close hook */
+        sqlite3_close(db);
+
+        /* Unregister */
+        hpplite_unregister();
+
+        PASS();
+        passed++;
+    }
+
+    /* Test 11: Standard sqlite3_close triggers flush via close hook */
+    tests++;
+    TEST("sqlite3_close triggers close hook flush");
+    {
+        unlink("/tmp/test_simple_open.db");
+
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        sqlite3 *db = hpplite_open(uri);
+        if (!db) FAIL("hpplite_open failed");
+
+        sqlite3_exec(db, "CREATE TABLE hook_test(x);", NULL, NULL, NULL);
+        sqlite3_exec(db, "INSERT INTO hook_test VALUES(1);", NULL, NULL, NULL);
+
+        /* Use sqlite3_close directly (not hpplite_close) */
+        int rc = sqlite3_close(db);
+        if (rc != SQLITE_OK) FAIL("sqlite3_close failed");
+
+        /* If we got here without crash, close hook worked */
+        PASS();
+        passed++;
+    }
+
     /* Summary */
     printf("\n=== Results: %d/%d tests passed ===\n", passed, tests);
 

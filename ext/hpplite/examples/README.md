@@ -4,6 +4,8 @@ Example programs demonstrating HPPLite features.
 
 ## Quick Start
 
+### Option 1: Using hpplite_open() (Simple)
+
 ```c
 #include "hpplite.h"
 
@@ -26,8 +28,40 @@ hpplite_state_root(db, root);
 // Flush batch when ready
 uint64_t height = hpplite_flush(db);
 
-// Close (flushes any pending changes)
-hpplite_close(db);
+// Close - close hook flushes any pending changes automatically
+sqlite3_close(db);
+```
+
+### Option 2: Using Auto-Extension (Transparent)
+
+```c
+#include "hpplite.h"
+
+// Register HPPLite once at app startup
+hpplite_register();
+
+// Now use standard SQLite API - HPPLite auto-initializes!
+sqlite3 *db;
+sqlite3_open_v2(
+    "file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia",
+    &db,
+    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+    NULL
+);
+
+// Standard SQLite operations - HPPLite tracks changes automatically
+sqlite3_exec(db, "CREATE TABLE users(id, name)", NULL, NULL, NULL);
+sqlite3_exec(db, "INSERT INTO users VALUES(1, 'Alice')", NULL, NULL, NULL);
+
+// State root available
+unsigned char root[32];
+hpplite_state_root(db, root);
+
+// Standard close - close hook flushes pending batch automatically!
+sqlite3_close(db);
+
+// Unregister when done
+hpplite_unregister();
 ```
 
 ## Building
@@ -62,6 +96,8 @@ Basic sequencer example demonstrating:
 - Using standard `sqlite3_exec()` for all SQL operations
 - Automatic state root tracking
 - Creating batches with `hpplite_flush()`
+- Auto-extension approach with `hpplite_register()` + `sqlite3_open_v2()`
+- Transparent close via `sqlite3_close()` (close hook handles cleanup)
 
 ```bash
 ./basic_sequencer

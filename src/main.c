@@ -1257,6 +1257,11 @@ static int sqlite3Close(sqlite3 *db, int forceZombie){
     db->trace.xV2(SQLITE_TRACE_CLOSE, db->pTraceArg, db, 0);
   }
 
+  /* Invoke the close hook before any cleanup begins */
+  if( db->xCloseCallback ){
+    db->xCloseCallback(db->pCloseArg, db);
+  }
+
   /* Force xDisconnect calls on all virtual tables */
   disconnectAllVtab(db);
 
@@ -2393,6 +2398,31 @@ void *sqlite3_rollback_hook(
   pRet = db->pRollbackArg;
   db->xRollbackCallback = xCallback;
   db->pRollbackArg = pArg;
+  sqlite3_mutex_leave(db->mutex);
+  return pRet;
+}
+
+/*
+** Register a callback to be invoked just before a database connection
+** is closed. This allows extensions to perform cleanup operations.
+*/
+void *sqlite3_close_hook(
+  sqlite3 *db,                        /* Attach the hook to this database */
+  void (*xCallback)(void*, sqlite3*), /* Callback function */
+  void *pArg                          /* Argument to the function */
+){
+  void *pRet;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  pRet = db->pCloseArg;
+  db->xCloseCallback = xCallback;
+  db->pCloseArg = pArg;
   sqlite3_mutex_leave(db->mutex);
   return pRet;
 }
