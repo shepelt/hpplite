@@ -93,10 +93,12 @@ int main(void) {
     const char *rpc = hpplite_da_get_rpc_url(181228);
     printf("  Chain 181228 -> RPC %s\n", rpc ? rpc : "(not found)");
 
-    /* Connect to L1 and read system config */
-    printf("\nConnecting to L1 contract...\n");
-    HppliteL1 *l1 = hpplite_l1_connect(cfg->rpcUrl, CONTRACT);
+    /* Get L1 connection (auto-connected from URI params) */
+    printf("\nL1 Connection (auto-connected from URI)...\n");
+    HppliteL1 *l1 = hpplite_get_l1(db);
     if (l1) {
+        printf("  L1 connected successfully!\n");
+
         HppliteSystemConfig *syscfg = hpplite_l1_get_system_config(l1);
         if (syscfg) {
             printf("\nSystem Configuration (from L1 contract):\n");
@@ -120,9 +122,9 @@ int main(void) {
 
             hpplite_l1_system_config_free(syscfg);
         }
-        hpplite_l1_disconnect(l1);
+        /* Note: L1 disconnect is handled automatically by close hook */
     } else {
-        printf("  (Could not connect - network may be unavailable)\n");
+        printf("  (L1 not connected - network may be unavailable)\n");
     }
 
     sqlite3_close(db);

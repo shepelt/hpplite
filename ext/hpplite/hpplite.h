@@ -267,6 +267,20 @@ HppliteCtx *hpplite_context(sqlite3 *db);
 */
 struct HppliteConfig *hpplite_get_config(sqlite3 *db);
 
+/* Forward declaration for L1 interface */
+struct HppliteL1;
+typedef struct HppliteL1 HppliteL1;
+
+/*
+** Get the L1 connection for an open database.
+** Returns NULL if L1 was not configured (missing rpcUrl or contract),
+** or if the connection failed (network unavailable).
+**
+** The L1 connection is auto-established when the database is opened
+** with l1=... and contract=... URI parameters.
+*/
+HppliteL1 *hpplite_get_l1(sqlite3 *db);
+
 /*
 ** Force flush pending changes to a batch immediately.
 ** Normally batches are created automatically on the interval.
