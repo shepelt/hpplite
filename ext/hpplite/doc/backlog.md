@@ -10,14 +10,7 @@
 - Node module (`node.c`)
 - L1 mock implementation (`l1_mock.c`)
 
-### M2: Multi-Process Networking
-- ZeroMQ transport layer (`zmq_transport.c`)
-- L1 mock service (`l1_service.c`)
-- Sequencer → Witness batch distribution (PUB/SUB)
-- Witness → Sequencer attestations (DEALER/ROUTER)
-- L1-anchored replay verification
-
-### M3: L1 Integration
+### M2: L1 Integration
 - HPPLiteDA.sol contract with on-chain DA
 - HPPLiteFactory.sol for one-click rollup deployment
 - Web3 primitives (`eth/` - RLP, ABI, keccak256)
@@ -26,90 +19,99 @@
 - Batch submission to L1
 - State reconstruction from L1 batches
 
-### M3.5: Transparent SQLite API
+### M3: Transparent SQLite API
 - `sqlite3_close_hook` for cleanup on close
 - Auto-extension for `?hpplite=on` URI parameter
 - L1 auto-connect from URI parameters (`rpc`, `contract`, `factory`)
 - Factory auto-deploy on first open
 - Timer thread for time-based batch flushing
-- ZMQ in transparent API (`zmq_bind`, `zmq_sequencer` URI params)
 
 ### Testing
-- Unit tests with mock L1 (15 tests)
+- Unit tests with mock L1
 - Integration tests with real L1 (HPP Sepolia)
-- Full cluster test: sequencer + witness + ZMQ sync + L1 reconstruction
-- Full attestation flow test: checkpoint creation → ZMQ broadcast → witness attestation → L1 submission
-
-### Attestation & Checkpoint Flow
-- Witness checkpoint window tracking during L1 sync
-- Sequencer checkpoint creation and ZMQ broadcast
-- Witness attestation signing and ZMQ send
-- Sequencer attestation verification (L1 witness registry check)
-- Checkpoint submission to L1 with attestations
+- State reconstruction test
 
 ---
 
-## In Progress / Known Issues
+## Architecture Decision: Singleton Sequencer
 
-### Bugs (Fixed)
-- [x] **Flush on close**: `hpplite_node_destroy()` now flushes pending data before cleanup
-- [x] **hpplite_sync()**: SQL function implemented - triggers L1 sync for witness/replica nodes
-- [x] **hpplite_flush()**: SQL function implemented - triggers batch flush for sequencer nodes
+After evaluating distributed witness models, we settled on **singleton sequencer** for simplicity:
+
+**Why not active witnesses?**
+- Write routing from witness to sequencer is complex
+- Eventual consistency breaks SQLite app expectations
+- 24/7 witness nodes add infrastructure burden
+
+**The chosen model:**
+- Single sequencer serves all clients (strong consistency)
+- All data on L1 (verifiable, reconstructable)
+- On-demand verification (no 24/7 watchers needed)
+- Same security model as Optimism/Arbitrum
+
+See [architecture.md](architecture.md) for details.
 
 ---
 
-## M4: L1 System Views (Planned)
+## M4: Verify CLI (Next)
 
-Virtual tables exposing L1 state via SQL:
+One-click verification from L1 data:
 
-| Table | Source | Description |
-|-------|--------|-------------|
-| `hpplite_system` | L1 contract | System config (DA scheme, limits) |
-| `hpplite_checkpoints` | L1 contract | Finalized checkpoints |
-| `hpplite_batches` | DA layer | Batch metadata |
-| `hpplite_witnesses` | L1 contract | Registered witnesses |
-| `hpplite_status` | Local | Node status, sync state |
-
-Example queries:
-```sql
-SELECT * FROM hpplite_system;
-SELECT height, state_root FROM hpplite_checkpoints ORDER BY height DESC LIMIT 5;
-SELECT u.name, c.state_root FROM users u, hpplite_checkpoints c WHERE c.height = 100;
+```bash
+hpplite verify 0xCONTRACT_ADDRESS --rpc https://sepolia.hpp.io
 ```
+
+Implementation:
+- [ ] CLI argument parsing
+- [ ] Fetch all batches from L1
+- [ ] Replay SQL in order
+- [ ] Compute and compare state roots
+- [ ] Report verification result
+
+This is the "ability to verify" that provides security without running 24/7 nodes.
 
 ---
 
 ## Future
 
-### Transparent API Enhancements
-- [ ] Size trigger in commit_hook (max changes per batch)
-- [ ] `_hpplite_pending` table for crash recovery
-- [ ] Write-ahead pattern (pending table → flush → clear)
-- [ ] Multi-connection handling
+### Cost Optimization
+- [ ] Batch compression (gzip/zstd)
+- [ ] Off-chain DA options (IPFS, Arweave) with L1 commitment
+- [ ] Batch aggregation (multiple txs per batch)
 
-### Data Availability
-- [ ] Batch compression (reduce DA costs)
-- [ ] IPFS batch storage
-- [ ] Arweave batch storage
-- [ ] Batch pruning after L1 finality
+### Security
+- [ ] Challenge submission to L1
+- [ ] Sequencer bonding/slashing
+- [ ] Fraud proof generation
 
 ### Light Clients
 - [ ] Merkle proofs for state queries
-- [ ] Verify state without full replay
+- [ ] Verify specific rows without full replay
+- [ ] Mobile-friendly verification
 
-### Robustness
-- [ ] ZMQ reconnection on disconnect
-- [ ] Heartbeat/liveness detection
-- [ ] Out-of-order batch handling (sync)
-- [ ] L1 polling for new batches (witness/replica)
-- [ ] Adversarial/Byzantine testing
+### Scaling (If Needed)
+- [ ] Read replicas (opt-in stale reads)
+- [ ] Explicit `mode=replica` for read-only access
+- [ ] Bounded staleness guarantees
 
-### Advanced
-- [ ] Fraud proofs (challenge invalid transitions)
-- [ ] Cross-L2 messaging
-- [ ] SQL subset restrictions (determinism)
-- [ ] WAL mode support
-- [ ] IoT optimizations (reduced footprint)
+### Developer Experience
+- [ ] `@hpplite/js` - JavaScript/TypeScript SDK
+- [ ] `@hpplite/next` - Next.js integration
+- [ ] Better error messages
+- [ ] Dashboard/explorer
+
+---
+
+## Removed from Scope
+
+These were considered but removed for simplicity:
+
+- **Active witness nodes** - replaced with on-demand verification
+- **ZMQ P2P networking** - not needed for singleton sequencer
+- **Witness attestations** - replaced with challenge-based security
+- **Auto-discovery** - not needed without distributed nodes
+- **Write forwarding** - clients connect directly to sequencer
+
+The code for these features still exists but is not part of the primary architecture.
 
 ---
 
@@ -121,14 +123,11 @@ ext/hpplite/
 ├── batch.c/h            # Batch serialization
 ├── crypto.c/h           # secp256k1 signing
 ├── fs_storage.c/h       # File-based storage
-├── node.c/h             # Node lifecycle, ZMQ, timer
+├── node.c/h             # Node lifecycle, timer
 ├── config.c/h           # URI parsing, configuration
-├── da_uri.c/h           # DA URI resolution
 ├── l1_interface.h       # L1 contract interface
 ├── l1_mock.c            # L1 mock (testing)
-├── l1_service.c/h       # L1 mock ZMQ service
 ├── l1_eth.c/h           # Real Ethereum client
-├── zmq_transport.c/h    # ZeroMQ networking
 ├── eth/                 # Web3 primitives
 │   ├── eth_client.c/h   # JSON-RPC client
 │   ├── keccak256.c/h

@@ -8,7 +8,7 @@
 **   file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia&contract=0x...
 **
 ** Environment variables:
-**   HPPLITE_ROLE        - sequencer|witness|observer
+**   HPPLITE_ROLE        - sequencer|observer
 **   HPPLITE_CHAIN_ID    - Chain ID (e.g., 181228)
 **   HPPLITE_RPC_URL     - RPC endpoint
 **   HPPLITE_CONTRACT    - L1 contract address
@@ -53,8 +53,6 @@ extern "C" {
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
-#define HPPLITE_URI_ZMQ_BIND      "zmq_bind"      /* Sequencer: ZMQ bind address */
-#define HPPLITE_URI_ZMQ_SEQUENCER "zmq_sequencer" /* Witness: ZMQ sequencer address */
 
 /*
 ** Default values
@@ -69,7 +67,6 @@ extern "C" {
 typedef enum {
     HPPLITE_CFG_ROLE_UNKNOWN = 0,
     HPPLITE_CFG_ROLE_SEQUENCER,
-    HPPLITE_CFG_ROLE_WITNESS,
     HPPLITE_CFG_ROLE_OBSERVER
 } HppliteConfigRole;
 
@@ -79,7 +76,7 @@ typedef enum {
 typedef struct HppliteConfig {
     /* Node identity */
     char *nodeId;                    /* Node identifier */
-    HppliteConfigRole role;          /* sequencer|witness|observer */
+    HppliteConfigRole role;          /* sequencer|observer */
     unsigned char privkey[32];       /* Node private key */
     int hasPrivkey;                  /* Whether privkey is set */
 
@@ -97,10 +94,6 @@ typedef struct HppliteConfig {
 
     /* Batching */
     int batchIntervalMs;             /* Batch interval in milliseconds */
-
-    /* ZMQ networking */
-    char *zmqBind;                   /* Sequencer: ZMQ bind address (e.g. tcp://star:5555) */
-    char *zmqSequencer;              /* Witness: ZMQ sequencer address (e.g. tcp://host:5555) */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */

@@ -3,45 +3,39 @@ pragma solidity ^0.8.19;
 
 /**
  * @title HPPLite
- * @notice HPPLite L2 System Contract - Coordination layer
- * @dev Manages sequencer/witnesses, checkpoints, peer discovery, config
- *      DA is pluggable via daScheme/daContract
+ * @notice HPPLite L2 System Contract - Singleton Sequencer Model
+ * @dev Manages sequencer lease, checkpoints, and coordinates with DA contract.
+ *      Security model: same as Optimism/Arbitrum - centralized sequencer,
+ *      decentralized verification via L1 data availability.
  */
 contract HPPLite {
+    // ============ Constants ============
+    uint256 public constant LEASE_DURATION = 5 minutes;
+    uint256 public constant VERSION = 4;
+
     // ============ State ============
     address public owner;
-    address public sequencer;
-    address[] public witnesses;
-    mapping(address => bool) public isWitness;
 
-    uint256 public requiredAttestations;
-    uint256 public checkpointInterval;
-    uint256 public sequencerTimeout;
+    // Sequencer lease - ensures singleton even with same private key on multiple instances
+    address public sequencerWallet;
+    bytes32 public sequencerInstance;  // Unique per process (e.g., hash of pid+timestamp+random)
+    uint256 public leaseExpiry;
 
+    // Checkpoints
     uint256 public lastCheckpointHeight;
     bytes32 public lastStateRoot;
     uint256 public lastCheckpointTime;
+    uint256 public checkpointInterval;
 
-    // ============ Data Availability Config ============
-    string public daScheme;        // "hppda" (on-chain), "ipfs", "file", etc.
-    address public daContract;     // DA contract address (for "hppda" scheme)
-    uint256 public version;
-
-    // ============ Peer Discovery ============
-    mapping(address => string) public endpoints;      // wallet => "tcp://host:port"
-    mapping(address => uint32) public nodeVersions;   // wallet => protocol version
+    // Data Availability
+    string public daScheme;
+    address public daContract;
 
     // ============ Events ============
-    event CheckpointSubmitted(
-        uint256 indexed fromHeight,
-        uint256 indexed toHeight,
-        bytes32 stateRoot
-    );
-    event SequencerChanged(address indexed oldSequencer, address indexed newSequencer);
-    event WitnessAdded(address indexed witness);
-    event WitnessRemoved(address indexed witness);
+    event SequencerClaimed(address indexed wallet, bytes32 indexed instanceId, uint256 leaseExpiry);
+    event LeaseRenewed(address indexed wallet, bytes32 indexed instanceId, uint256 leaseExpiry);
+    event CheckpointSubmitted(uint256 indexed fromHeight, uint256 indexed toHeight, bytes32 stateRoot);
     event ConfigUpdated(string indexed key, bytes value);
-    event EndpointUpdated(address indexed node, string endpoint, uint32 version);
 
     // ============ Modifiers ============
     modifier onlyOwner() {
@@ -49,143 +43,96 @@ contract HPPLite {
         _;
     }
 
-    modifier onlySequencer() {
-        require(msg.sender == sequencer, "Not sequencer");
+    modifier onlyActiveSequencer(bytes32 instanceId) {
+        require(msg.sender == sequencerWallet, "Not sequencer wallet");
+        require(instanceId == sequencerInstance, "Wrong instance");
+        require(block.timestamp < leaseExpiry, "Lease expired");
         _;
     }
 
     // ============ Constructor ============
     constructor(
-        uint256 _requiredAttestations,
         uint256 _checkpointInterval,
-        uint256 _sequencerTimeout,
         string memory _daScheme,
         address _daContract
     ) {
         owner = msg.sender;
-        requiredAttestations = _requiredAttestations;
-        checkpointInterval = _checkpointInterval;
-        sequencerTimeout = _sequencerTimeout;
-        lastCheckpointTime = block.timestamp;
-
+        checkpointInterval = _checkpointInterval > 0 ? _checkpointInterval : 100;
         daScheme = bytes(_daScheme).length > 0 ? _daScheme : "hppda";
         daContract = _daContract;
-        version = 3;
+        lastCheckpointTime = block.timestamp;
+    }
+
+    // ============ Sequencer Lease Functions ============
+
+    /**
+     * @notice Claim sequencer role (when lease expired or first time)
+     * @param instanceId Unique identifier for this process instance
+     */
+    function claimSequencer(bytes32 instanceId) external {
+        require(
+            sequencerWallet == address(0) || block.timestamp >= leaseExpiry,
+            "Lease still active"
+        );
+        require(instanceId != bytes32(0), "Invalid instance ID");
+
+        sequencerWallet = msg.sender;
+        sequencerInstance = instanceId;
+        leaseExpiry = block.timestamp + LEASE_DURATION;
+
+        emit SequencerClaimed(msg.sender, instanceId, leaseExpiry);
+    }
+
+    /**
+     * @notice Renew lease (must be current sequencer with matching instance)
+     * @param instanceId Must match current sequencer instance
+     */
+    function renewLease(bytes32 instanceId) external onlyActiveSequencer(instanceId) {
+        leaseExpiry = block.timestamp + LEASE_DURATION;
+        emit LeaseRenewed(msg.sender, instanceId, leaseExpiry);
+    }
+
+    /**
+     * @notice Check if current sequencer lease is active
+     */
+    function isLeaseActive() external view returns (bool) {
+        return sequencerWallet != address(0) && block.timestamp < leaseExpiry;
+    }
+
+    /**
+     * @notice Get time remaining on lease (0 if expired)
+     */
+    function leaseTimeRemaining() external view returns (uint256) {
+        if (block.timestamp >= leaseExpiry) return 0;
+        return leaseExpiry - block.timestamp;
     }
 
     // ============ Checkpoint Functions ============
 
     /**
-     * @notice Submit checkpoint with witness attestations
+     * @notice Submit checkpoint (simplified - no attestations in singleton model)
+     * @param instanceId Must match current sequencer instance
      * @param fromHeight Start of checkpoint range
      * @param toHeight End of checkpoint range
      * @param stateRoot Post-state root after applying batches
-     * @param signatures Packed witness signatures (r, s, v) * n
      */
     function submitCheckpoint(
+        bytes32 instanceId,
         uint256 fromHeight,
         uint256 toHeight,
-        bytes32 stateRoot,
-        bytes calldata signatures
-    ) external onlySequencer {
-        require(fromHeight == lastCheckpointHeight + 1, "Non-sequential checkpoint");
+        bytes32 stateRoot
+    ) external onlyActiveSequencer(instanceId) {
+        require(fromHeight == lastCheckpointHeight + 1 || lastCheckpointHeight == 0, "Non-sequential");
         require(toHeight >= fromHeight, "Invalid range");
 
-        // Verify we have required attestations
-        uint256 sigCount = signatures.length / 65;
-        require(sigCount >= requiredAttestations, "Insufficient attestations");
-
-        // Compute message hash
-        bytes32 message = keccak256(abi.encodePacked(fromHeight, toHeight, stateRoot));
-        bytes32 ethSignedHash = keccak256(abi.encodePacked(
-            "\x19Ethereum Signed Message:\n32",
-            message
-        ));
-
-        // Verify signatures
-        uint256 validCount = 0;
-        address[] memory signers = new address[](sigCount);
-
-        for (uint256 i = 0; i < sigCount; i++) {
-            (bytes32 r, bytes32 s, uint8 v) = _splitSignature(signatures, i);
-            address signer = ecrecover(ethSignedHash, v, r, s);
-
-            if (isWitness[signer]) {
-                bool duplicate = false;
-                for (uint256 j = 0; j < validCount; j++) {
-                    if (signers[j] == signer) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (!duplicate) {
-                    signers[validCount] = signer;
-                    validCount++;
-                }
-            }
-        }
-
-        require(validCount >= requiredAttestations, "Not enough valid attestations");
-
-        // Update state
         lastCheckpointHeight = toHeight;
         lastStateRoot = stateRoot;
         lastCheckpointTime = block.timestamp;
 
+        // Auto-renew lease on activity
+        leaseExpiry = block.timestamp + LEASE_DURATION;
+
         emit CheckpointSubmitted(fromHeight, toHeight, stateRoot);
-    }
-
-    // ============ Peer Discovery Functions ============
-
-    /**
-     * @notice Register or update node endpoint
-     * @param endpoint ZMQ address (e.g., "tcp://1.2.3.4:5555")
-     * @param nodeVersion Protocol version
-     */
-    function setEndpoint(string calldata endpoint, uint32 nodeVersion) external {
-        require(
-            msg.sender == sequencer || isWitness[msg.sender],
-            "Not sequencer or witness"
-        );
-        require(bytes(endpoint).length > 0, "Empty endpoint");
-        require(bytes(endpoint).length <= 256, "Endpoint too long");
-
-        endpoints[msg.sender] = endpoint;
-        nodeVersions[msg.sender] = nodeVersion;
-
-        emit EndpointUpdated(msg.sender, endpoint, nodeVersion);
-    }
-
-    /**
-     * @notice Get sequencer's endpoint for witness connections
-     */
-    function getSequencerEndpoint() external view returns (
-        string memory endpoint,
-        uint32 nodeVersion
-    ) {
-        return (endpoints[sequencer], nodeVersions[sequencer]);
-    }
-
-    /**
-     * @notice Get all witness endpoints
-     */
-    function getWitnessEndpoints() external view returns (
-        address[] memory addrs,
-        string[] memory eps,
-        uint32[] memory versions
-    ) {
-        uint256 count = witnesses.length;
-        addrs = new address[](count);
-        eps = new string[](count);
-        versions = new uint32[](count);
-
-        for (uint256 i = 0; i < count; i++) {
-            addrs[i] = witnesses[i];
-            eps[i] = endpoints[witnesses[i]];
-            versions[i] = nodeVersions[witnesses[i]];
-        }
-
-        return (addrs, eps, versions);
     }
 
     // ============ Admin Functions ============
@@ -195,65 +142,40 @@ contract HPPLite {
         owner = newOwner;
     }
 
-    function setSequencer(address _sequencer) external onlyOwner {
-        address old = sequencer;
-        sequencer = _sequencer;
-        emit SequencerChanged(old, _sequencer);
-    }
-
-    function addWitness(address _witness) external onlyOwner {
-        require(!isWitness[_witness], "Already witness");
-        witnesses.push(_witness);
-        isWitness[_witness] = true;
-        emit WitnessAdded(_witness);
-    }
-
-    function removeWitness(address _witness) external onlyOwner {
-        require(isWitness[_witness], "Not witness");
-        isWitness[_witness] = false;
-
-        for (uint256 i = 0; i < witnesses.length; i++) {
-            if (witnesses[i] == _witness) {
-                witnesses[i] = witnesses[witnesses.length - 1];
-                witnesses.pop();
-                break;
-            }
-        }
-
-        emit WitnessRemoved(_witness);
-    }
-
-    function setRequiredAttestations(uint256 _required) external onlyOwner {
-        require(_required > 0 && _required <= witnesses.length, "Invalid count");
-        requiredAttestations = _required;
-    }
-
     function setDAConfig(string calldata _scheme, address _da) external onlyOwner {
         daScheme = _scheme;
         daContract = _da;
         emit ConfigUpdated("daConfig", abi.encode(_scheme, _da));
     }
 
+    function setCheckpointInterval(uint256 _interval) external onlyOwner {
+        checkpointInterval = _interval;
+    }
+
+    /**
+     * @notice Emergency: force expire lease (owner only)
+     * @dev Use if sequencer is misbehaving and needs to be replaced
+     */
+    function forceExpireLease() external onlyOwner {
+        leaseExpiry = block.timestamp;
+    }
+
     // ============ View Functions ============
 
     function getState() external view returns (
         address _owner,
-        address _sequencer,
-        uint256 witnessCount,
-        uint256 _requiredAttestations,
-        uint256 _checkpointInterval,
-        uint256 _sequencerTimeout,
+        address _sequencerWallet,
+        bytes32 _sequencerInstance,
+        uint256 _leaseExpiry,
         uint256 _lastCheckpointHeight,
         bytes32 _lastStateRoot,
         uint256 _lastCheckpointTime
     ) {
         return (
             owner,
-            sequencer,
-            witnesses.length,
-            requiredAttestations,
-            checkpointInterval,
-            sequencerTimeout,
+            sequencerWallet,
+            sequencerInstance,
+            leaseExpiry,
             lastCheckpointHeight,
             lastStateRoot,
             lastCheckpointTime
@@ -264,33 +186,14 @@ contract HPPLite {
         string memory _daScheme,
         address _daContract,
         uint256 _version,
-        uint256 _chainId
+        uint256 _chainId,
+        uint256 _checkpointInterval,
+        uint256 _leaseDuration
     ) {
-        return (daScheme, daContract, version, block.chainid);
+        return (daScheme, daContract, VERSION, block.chainid, checkpointInterval, LEASE_DURATION);
     }
 
-    function getWitnesses() external view returns (address[] memory) {
-        return witnesses;
-    }
-
-    function isSequencerTimedOut() external view returns (bool) {
-        return block.timestamp > lastCheckpointTime + sequencerTimeout;
-    }
-
-    // ============ Internal Functions ============
-
-    function _splitSignature(bytes calldata signatures, uint256 index)
-        internal
-        pure
-        returns (bytes32 r, bytes32 s, uint8 v)
-    {
-        uint256 offset = index * 65;
-        require(signatures.length >= offset + 65, "Invalid signature length");
-
-        assembly {
-            r := calldataload(add(signatures.offset, offset))
-            s := calldataload(add(signatures.offset, add(offset, 32)))
-            v := byte(0, calldataload(add(signatures.offset, add(offset, 64))))
-        }
+    function version() external pure returns (uint256) {
+        return VERSION;
     }
 }

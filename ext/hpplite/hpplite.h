@@ -195,7 +195,7 @@ void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut);
 void hpplite_discard_pending(HppliteCtx *pCtx);
 
 /*
-** Finalize a verified batch (for witnesses).
+** Finalize a verified batch (for observers).
 ** Increments block height and clears pending SQL without creating a batch.
 ** Used after successfully verifying a batch from the sequencer.
 */
@@ -222,7 +222,7 @@ int sqlite3_hpplite_init(
 **
 ** URI Parameters:
 **   hpplite=on        Enable HPPLite (required)
-**   role=sequencer    Role: sequencer|witness|observer
+**   role=sequencer    Role: sequencer|observer
 **   l1=hpp-sepolia    L1 network alias (or chainid=181228)
 **   contract=0x...    L1 contract address
 **   interval=5s       Batch interval (default: 5s)
@@ -284,7 +284,6 @@ HppliteL1 *hpplite_get_l1(sqlite3 *db);
 /*
 ** Get the node for an open database.
 ** Returns NULL if db is not an HPPLite database.
-** Used for advanced operations like ZMQ processing.
 */
 struct HppliteNode *hpplite_get_node(sqlite3 *db);
 

@@ -78,10 +78,8 @@ int main(void) {
     snprintf(uri, sizeof(uri),
         "file:" DATA_DIR "/state.db"
         "?hpplite=on"
-        "&factory=%s"
-        "&privkey=%s"
-        "&l1=hpp-sepolia",
-        HPPLITE_DEFAULT_FACTORY,
+        "&l1=hpp-sepolia"  /* factory auto-set from network alias */
+        "&privkey=%s",
         privkey
     );
 
@@ -121,11 +119,9 @@ int main(void) {
     snprintf(uri, sizeof(uri),
         "file:" DATA_DIR2 "/reconstructed.db"
         "?hpplite=on"
-        "&factory=%s"
-        "&privkey=%s"
         "&l1=hpp-sepolia"
+        "&privkey=%s"
         "&role=replica",  /* replica mode - sync from L1 */
-        HPPLITE_DEFAULT_FACTORY,
         privkey
     );
 

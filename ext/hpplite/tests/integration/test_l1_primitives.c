@@ -87,9 +87,9 @@ static void test_l1_get_state(void) {
     HppliteL1State *state = hpplite_l1_get_state(l1);
     if (state) {
         printf("  PASS: State retrieved\n");
-        printf("    Sequencer: 0x"); print_hex(state->sequencerAddress, 20); printf("\n");
-        printf("    Witnesses: %d\n", state->nWitnesses);
-        printf("    Required attestations: %d\n", state->requiredAttestations);
+        printf("    Owner: 0x"); print_hex(state->owner, 20); printf("\n");
+        printf("    Sequencer wallet: 0x"); print_hex(state->sequencerWallet, 20); printf("\n");
+        printf("    Lease expiry: %llu\n", (unsigned long long)state->leaseExpiry);
         printf("    Last checkpoint: %llu\n", (unsigned long long)state->lastCheckpointHeight);
         tests_passed++;
         hpplite_l1_state_free(state);

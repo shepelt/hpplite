@@ -72,7 +72,6 @@ static int parse_duration_ms(const char *str) {
 HppliteConfigRole hpplite_config_parse_role(const char *str) {
     if (!str) return HPPLITE_CFG_ROLE_UNKNOWN;
     if (strcmp(str, "sequencer") == 0) return HPPLITE_CFG_ROLE_SEQUENCER;
-    if (strcmp(str, "witness") == 0) return HPPLITE_CFG_ROLE_WITNESS;
     if (strcmp(str, "observer") == 0) return HPPLITE_CFG_ROLE_OBSERVER;
     return HPPLITE_CFG_ROLE_UNKNOWN;
 }
@@ -80,7 +79,6 @@ HppliteConfigRole hpplite_config_parse_role(const char *str) {
 const char *hpplite_config_role_str(HppliteConfigRole role) {
     switch (role) {
         case HPPLITE_CFG_ROLE_SEQUENCER: return "sequencer";
-        case HPPLITE_CFG_ROLE_WITNESS: return "witness";
         case HPPLITE_CFG_ROLE_OBSERVER: return "observer";
         default: return "unknown";
     }
@@ -106,8 +104,6 @@ void hpplite_config_free(HppliteConfig *cfg) {
     if (cfg->rpcUrl) free(cfg->rpcUrl);
     if (cfg->dataDir) free(cfg->dataDir);
     if (cfg->dbPath) free(cfg->dbPath);
-    if (cfg->zmqBind) free(cfg->zmqBind);
-    if (cfg->zmqSequencer) free(cfg->zmqSequencer);
     free(cfg);
 }
 
@@ -281,17 +277,23 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
 
     /* L1 network alias */
     if (get_uri_param(uri, HPPLITE_URI_L1, buf, sizeof(buf))) {
-        uint64_t chainId = hpplite_da_resolve_alias(buf);
-        if (chainId > 0) {
-            cfg->chainId = chainId;
+        const HppliteNetworkAlias *network = hpplite_da_lookup_network(buf);
+        if (network) {
+            cfg->chainId = network->chainId;
             cfg->chainIdSource = 2;
 
             /* Also set RPC URL from alias */
-            const char *rpc = hpplite_da_get_rpc_url(chainId);
-            if (rpc) {
+            if (network->rpcUrl) {
                 free(cfg->rpcUrl);
-                cfg->rpcUrl = strdup(rpc);
+                cfg->rpcUrl = strdup(network->rpcUrl);
                 cfg->rpcUrlSource = 2;
+            }
+
+            /* Also set factory from alias (if not already set) */
+            if (network->factory && !cfg->hasFactory) {
+                if (hex_to_bytes(network->factory, cfg->factory, 20) == 0) {
+                    cfg->hasFactory = 1;
+                }
             }
         }
     }
@@ -343,18 +345,6 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
         if (ms > 0) cfg->batchIntervalMs = ms;
-    }
-
-    /* ZMQ bind address (sequencer) */
-    if (get_uri_param(uri, HPPLITE_URI_ZMQ_BIND, buf, sizeof(buf))) {
-        free(cfg->zmqBind);
-        cfg->zmqBind = strdup(buf);
-    }
-
-    /* ZMQ sequencer address (witness) */
-    if (get_uri_param(uri, HPPLITE_URI_ZMQ_SEQUENCER, buf, sizeof(buf))) {
-        free(cfg->zmqSequencer);
-        cfg->zmqSequencer = strdup(buf);
     }
 
     return 0;
@@ -455,20 +445,6 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val) {
         int ms = parse_duration_ms(val);
         if (ms > 0) cfg->batchIntervalMs = ms;
-    }
-
-    /* ZMQ bind address (sequencer) */
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ZMQ_BIND);
-    if (val) {
-        free(cfg->zmqBind);
-        cfg->zmqBind = strdup(val);
-    }
-
-    /* ZMQ sequencer address (witness) */
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ZMQ_SEQUENCER);
-    if (val) {
-        free(cfg->zmqSequencer);
-        cfg->zmqSequencer = strdup(val);
     }
 
     return 0;

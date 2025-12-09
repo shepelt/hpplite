@@ -9,35 +9,33 @@ import "../src/HPPLiteFactory.sol";
 contract DeployHPPLite is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("HPPLITE_PRIVATE_KEY");
+        address deployer = vm.addr(deployerPrivateKey);
 
-        // Config from env or defaults
-        uint256 requiredAttestations = vm.envOr("HPPLITE_REQUIRED_ATTESTATIONS", uint256(0));
-        uint256 checkpointInterval = vm.envOr("HPPLITE_CHECKPOINT_INTERVAL", uint256(10));
-        uint256 sequencerTimeout = vm.envOr("HPPLITE_SEQUENCER_TIMEOUT", uint256(3600));
+        uint256 checkpointInterval = vm.envOr("HPPLITE_CHECKPOINT_INTERVAL", uint256(100));
 
         vm.startBroadcast(deployerPrivateKey);
 
-        // Deploy DA contract first
-        address deployer = vm.addr(deployerPrivateKey);
-        HPPLiteDA da = new HPPLiteDA(deployer, 128 * 1024);
-
-        // Deploy main contract with DA reference
+        // Deploy HPPLite coordination contract first
         HPPLite hpplite = new HPPLite(
-            requiredAttestations,
             checkpointInterval,
-            sequencerTimeout,
             "hppda",
-            address(da)
+            address(0)
         );
 
-        // Set deployer as sequencer
-        hpplite.setSequencer(deployer);
+        // Deploy DA contract linked to HPPLite for lease verification
+        HPPLiteDA da = new HPPLiteDA(
+            address(hpplite),
+            128 * 1024
+        );
+
+        // Link DA to HPPLite
+        hpplite.setDAConfig("hppda", address(da));
 
         console.log("HPPLiteDA deployed at:", address(da));
         console.log("HPPLite deployed at:", address(hpplite));
         console.log("  Owner:", hpplite.owner());
-        console.log("  Sequencer:", hpplite.sequencer());
         console.log("  DA Contract:", address(da));
+        console.log("  Version:", hpplite.version());
 
         vm.stopBroadcast();
     }

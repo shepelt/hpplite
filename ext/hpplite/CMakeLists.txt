@@ -1,30 +1,18 @@
 cmake_minimum_required(VERSION 3.14)
-project(hpplite VERSION 0.1.0 LANGUAGES C)
+project(hpplite VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Options
 option(HPPLITE_BUILD_TESTS "Build test executables" ON)
-option(HPPLITE_ENABLE_ZMQ "Enable ZeroMQ networking (M2+)" ON)
 option(HPPLITE_USE_REAL_L1 "Use real Ethereum L1 (vs mock)" OFF)
 
 # Find dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SECP256K1 REQUIRED libsecp256k1)
 
-# ZeroMQ (optional, for M2 multi-process)
-if(HPPLITE_ENABLE_ZMQ)
-    pkg_check_modules(ZMQ libzmq)
-    if(ZMQ_FOUND)
-        message(STATUS "ZeroMQ found: ${ZMQ_VERSION}")
-    else()
-        message(WARNING "ZeroMQ not found, disabling ZMQ support")
-        set(HPPLITE_ENABLE_ZMQ OFF)
-    endif()
-endif()
-
-# libcurl (for M3 Web3 integration)
+# libcurl (for Web3 integration)
 pkg_check_modules(CURL REQUIRED libcurl)
 
 # Find threads
@@ -64,12 +52,11 @@ target_link_libraries(sqlite3 PUBLIC
 set(HPPLITE_SOURCES
     hpplite.c
     batch.c
-    fs_storage.c
     crypto.c
     node.c
     da_uri.c
     config.c
-    # M3 Web3 integration (eth/ subdirectory)
+    # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
     eth/keccak256.c
     eth/rlp.c
@@ -86,15 +73,6 @@ else()
     message(STATUS "L1 backend: Mock (l1_mock.c)")
 endif()
 
-# Add ZMQ networking source if enabled
-if(HPPLITE_ENABLE_ZMQ)
-    list(APPEND HPPLITE_SOURCES zmq_transport.c)
-    # l1_service is mock L1 over ZMQ - only include with mock L1
-    if(NOT HPPLITE_USE_REAL_L1)
-        list(APPEND HPPLITE_SOURCES l1_service.c)
-    endif()
-endif()
-
 add_library(hpplite STATIC ${HPPLITE_SOURCES})
 
 target_include_directories(hpplite PUBLIC
@@ -108,23 +86,11 @@ target_compile_definitions(hpplite PUBLIC
     SQLITE_ENABLE_PREUPDATE_HOOK
 )
 
-# Add ZMQ definitions and includes
-if(HPPLITE_ENABLE_ZMQ)
-    target_compile_definitions(hpplite PUBLIC HPPLITE_ENABLE_ZMQ)
-    target_include_directories(hpplite PUBLIC ${ZMQ_INCLUDE_DIRS})
-endif()
-
 target_link_libraries(hpplite PUBLIC
     sqlite3
     ${SECP256K1_LIBRARIES}
     ${CURL_LIBRARIES}
 )
-
-# Add ZMQ libraries
-if(HPPLITE_ENABLE_ZMQ)
-    target_link_libraries(hpplite PUBLIC ${ZMQ_LIBRARIES})
-    target_link_directories(hpplite PUBLIC ${ZMQ_LIBRARY_DIRS})
-endif()
 
 target_link_directories(hpplite PUBLIC
     ${SECP256K1_LIBRARY_DIRS}
@@ -137,8 +103,6 @@ if(HPPLITE_BUILD_TESTS)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
     # === Unit Tests (no network required) ===
-    # Located in tests/unit/
-
     add_executable(test_hpplite tests/unit/test_hpplite.c)
     target_link_libraries(test_hpplite hpplite)
 
@@ -161,59 +125,26 @@ if(HPPLITE_BUILD_TESTS)
 
         add_executable(test_checkpoint_flow tests/unit/test_checkpoint_flow.c)
         target_link_libraries(test_checkpoint_flow hpplite)
-
-        add_executable(test_witness tests/unit/test_witness.c)
-        target_link_libraries(test_witness hpplite)
-
-        add_executable(test_reconstruct tests/unit/test_reconstruct.c)
-        target_link_libraries(test_reconstruct hpplite)
-
-        add_executable(test_multinode tests/unit/test_multinode.c)
-        target_link_libraries(test_multinode hpplite)
-
-        add_executable(test_bugs tests/unit/test_bugs.c)
-        target_link_libraries(test_bugs hpplite)
-
-        add_executable(test_full_e2e tests/unit/test_full_e2e.c)
-        target_link_libraries(test_full_e2e hpplite)
     endif()
 
-    # ZMQ tests use l1_service which requires mock L1
-    if(HPPLITE_ENABLE_ZMQ AND NOT HPPLITE_USE_REAL_L1)
-        add_executable(test_zmq tests/unit/test_zmq.c)
-        target_link_libraries(test_zmq hpplite Threads::Threads)
-
-        add_executable(test_zmq_nodes tests/unit/test_zmq_nodes.c)
-        target_link_libraries(test_zmq_nodes hpplite Threads::Threads)
-    endif()
-
-    # Web3 primitive tests (eth/ subdirectory)
+    # Web3 primitive tests (eth/ subdirectory - no network required)
     add_executable(test_keccak eth/test_keccak.c eth/keccak256.c)
     add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
     add_executable(test_abi eth/test_abi.c eth/abi.c eth/keccak256.c)
 
-    # === Integration Tests (require network + HPPLITE_PRIVATE_KEY) ===
-    # Located in tests/integration/
-    # Run manually: ./test_l1_primitives, ./test_single_node, ./test_cluster
-    #
-    # Three non-overlapping scopes:
-    #   test_l1_primitives - L1 client & factory primitives (no HPPLite nodes)
-    #   test_single_node   - Single node E2E with transparent API
-    #   test_cluster       - Multi-node cluster with ZMQ + attestations
+    # === Integration Tests (require real L1 + network + HPPLITE_PRIVATE_KEY) ===
+    if(HPPLITE_USE_REAL_L1)
+        add_executable(test_eth_client eth/test_eth_client.c)
+        target_link_libraries(test_eth_client hpplite)
 
-    add_executable(test_eth_client eth/test_eth_client.c)
-    target_link_libraries(test_eth_client hpplite)
+        add_executable(test_l1_primitives tests/integration/test_l1_primitives.c)
+        target_link_libraries(test_l1_primitives hpplite)
 
-    add_executable(test_l1_primitives tests/integration/test_l1_primitives.c)
-    target_link_libraries(test_l1_primitives hpplite)
+        add_executable(test_single_node tests/integration/test_single_node.c)
+        target_link_libraries(test_single_node hpplite)
+    endif()
 
-    add_executable(test_single_node tests/integration/test_single_node.c)
-    target_link_libraries(test_single_node hpplite)
-
-    add_executable(test_cluster tests/integration/test_full_cluster.c)
-    target_link_libraries(test_cluster hpplite Threads::Threads)
-
-    # === CTest Registration (unit tests only) ===
+    # === CTest Registration ===
     enable_testing()
 
     add_test(NAME test_hpplite COMMAND test_hpplite)
@@ -229,22 +160,16 @@ if(HPPLITE_BUILD_TESTS)
     if(NOT HPPLITE_USE_REAL_L1)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
-        add_test(NAME test_witness COMMAND test_witness)
-        add_test(NAME test_reconstruct COMMAND test_reconstruct)
-        add_test(NAME test_multinode COMMAND test_multinode)
-        add_test(NAME test_bugs COMMAND test_bugs)
-        add_test(NAME test_full_e2e COMMAND test_full_e2e)
-    endif()
-
-    if(HPPLITE_ENABLE_ZMQ AND NOT HPPLITE_USE_REAL_L1)
-        add_test(NAME test_zmq COMMAND test_zmq)
-        add_test(NAME test_zmq_nodes COMMAND test_zmq_nodes)
     endif()
 endif()
 
-# Examples (build with -DHPPLITE_BUILD_EXAMPLES=ON)
-option(HPPLITE_BUILD_EXAMPLES "Build example executables" ON)
+# Examples (require real L1)
+option(HPPLITE_BUILD_EXAMPLES "Build example executables" ${HPPLITE_USE_REAL_L1})
 if(HPPLITE_BUILD_EXAMPLES)
+    if(NOT HPPLITE_USE_REAL_L1)
+        message(FATAL_ERROR "Examples require HPPLITE_USE_REAL_L1=ON")
+    endif()
+
     add_executable(factory_demo examples/factory_demo.c)
     target_link_libraries(factory_demo hpplite)
 
@@ -258,28 +183,12 @@ if(HPPLITE_BUILD_EXAMPLES)
     target_link_libraries(l1_config hpplite)
 endif()
 
-# Benchmarks (not in ctest, run with 'make speedtest')
-# bench_replay uses mock L1
-if(NOT HPPLITE_USE_REAL_L1)
-    add_executable(bench_replay bench_replay.c)
-    target_link_libraries(bench_replay hpplite)
-
-    # speedtest target (like SQLite's make speedtest)
-    add_custom_target(speedtest
-        COMMAND bench_replay --batches 100 --stats
-        DEPENDS bench_replay
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        COMMENT "Running HPPLite replay benchmark..."
-    )
-endif()
-
 # Print configuration
 message(STATUS "")
 message(STATUS "HPPLite Configuration:")
 message(STATUS "  SQLite dir: ${SQLITE_DIR}")
 message(STATUS "  secp256k1: ${SECP256K1_LIBRARIES}")
 message(STATUS "  libcurl: ${CURL_LIBRARIES}")
-message(STATUS "  ZeroMQ: ${HPPLITE_ENABLE_ZMQ}")
 message(STATUS "  Real L1: ${HPPLITE_USE_REAL_L1}")
 message(STATUS "  Build tests: ${HPPLITE_BUILD_TESTS}")
 message(STATUS "  Build examples: ${HPPLITE_BUILD_EXAMPLES}")

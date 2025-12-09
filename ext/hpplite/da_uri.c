@@ -11,13 +11,14 @@
 
 /*
 ** Built-in network aliases
+** Factory addresses are per-network constants
 */
 const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io"},
-    {"hpp-mainnet", 181227, "https://mainnet.hpp.io"},
-    {"ethereum",    1,      "https://eth.llamarpc.com"},
-    {"sepolia",     11155111, "https://sepolia.drpc.org"},
-    {NULL, 0, NULL}
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f"},
+    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL},  /* Not deployed yet */
+    {"ethereum",    1,      "https://eth.llamarpc.com", NULL},
+    {"sepolia",     11155111, "https://sepolia.drpc.org", NULL},
+    {NULL, 0, NULL, NULL}
 };
 
 const int HPPLITE_NETWORKS_COUNT = 4;
@@ -70,6 +71,25 @@ const char *hpplite_da_get_rpc_url(uint64_t chainId) {
     for (int i = 0; HPPLITE_NETWORKS[i].alias; i++) {
         if (HPPLITE_NETWORKS[i].chainId == chainId) {
             return HPPLITE_NETWORKS[i].rpcUrl;
+        }
+    }
+    return NULL;
+}
+
+const char *hpplite_da_get_factory(uint64_t chainId) {
+    for (int i = 0; HPPLITE_NETWORKS[i].alias; i++) {
+        if (HPPLITE_NETWORKS[i].chainId == chainId) {
+            return HPPLITE_NETWORKS[i].factory;
+        }
+    }
+    return NULL;
+}
+
+const HppliteNetworkAlias *hpplite_da_lookup_network(const char *alias) {
+    if (!alias) return NULL;
+    for (int i = 0; HPPLITE_NETWORKS[i].alias; i++) {
+        if (strcmp(alias, HPPLITE_NETWORKS[i].alias) == 0) {
+            return &HPPLITE_NETWORKS[i];
         }
     }
     return NULL;
