@@ -67,6 +67,28 @@ static void test_network_alias(void) {
         FAIL("RPC URL lookup failed");
     }
 
+    /* Test factory address lookup */
+    const char *factory = hpplite_da_get_factory(181228);
+    if (!factory) {
+        FAIL("Factory lookup returned NULL for hpp-sepolia");
+    }
+    if (strncmp(factory, "0x", 2) != 0) {
+        FAIL("Factory address should start with 0x");
+    }
+    printf("  hpp-sepolia factory: %s\n", factory);
+
+    /* Test network lookup */
+    const HppliteNetworkAlias *network = hpplite_da_lookup_network("hpp-sepolia");
+    if (!network) {
+        FAIL("Network lookup returned NULL");
+    }
+    if (network->chainId != 181228) {
+        FAIL("Network lookup wrong chainId");
+    }
+    if (!network->factory) {
+        FAIL("Network should have factory");
+    }
+
     PASS();
 }
 

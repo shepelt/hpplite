@@ -19,8 +19,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="$PROJECT_DIR/build"
+PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+# Use build_real for integration tests (has real L1 client)
+BUILD_DIR="${HPPLITE_BUILD_DIR:-$PROJECT_DIR/build_real}"
 CONTRACTS_DIR="$PROJECT_DIR/contracts"
 
 # Load .env
@@ -162,12 +163,20 @@ HPPLITE_FACTORY_ADDRESS=$FACTORY_ADDRESS
 HPPLITE_PRIVATE_KEY=$TEST_PRIVATE_KEY
 EOF
 
-# Run test
+# Run tests
 cd "$BUILD_DIR"
 cp "$TEST_ENV" .env
 
-./test_factory --create "$@"
+echo "Running test_l1_primitives..."
+./test_l1_primitives --create "$@"
 TEST_RESULT=$?
+
+if [ $TEST_RESULT -eq 0 ]; then
+    echo ""
+    echo "Running test_single_node..."
+    ./test_single_node
+    TEST_RESULT=$?
+fi
 
 # Cleanup
 rm -f .env "$TEST_ENV"

@@ -56,6 +56,7 @@ typedef struct HppliteNetworkAlias {
     const char *alias;
     uint64_t chainId;
     const char *rpcUrl;
+    const char *factory;    /* Factory contract address (hex string) */
 } HppliteNetworkAlias;
 
 /*
@@ -109,6 +110,18 @@ uint64_t hpplite_da_resolve_alias(const char *alias);
 ** Returns static string or NULL if not found.
 */
 const char *hpplite_da_get_rpc_url(uint64_t chainId);
+
+/*
+** Get factory address for chain ID.
+** Returns static string or NULL if not found.
+*/
+const char *hpplite_da_get_factory(uint64_t chainId);
+
+/*
+** Look up network by alias.
+** Returns pointer to static entry or NULL if not found.
+*/
+const HppliteNetworkAlias *hpplite_da_lookup_network(const char *alias);
 
 /*
 ** Get scheme string from enum.

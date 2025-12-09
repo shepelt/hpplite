@@ -7,31 +7,26 @@ Example programs demonstrating HPPLite features.
 HPPLite is built into SQLite - just use `?hpplite=on` in your URI:
 
 ```c
-#include "hpplite.h"
+#include "sqlite3.h"
 
-// Open database with HPPLite enabled - no registration needed!
+// Open database with HPPLite enabled (hpp-sepolia has built-in factory)
 sqlite3 *db;
 sqlite3_open_v2(
-    "file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia",
+    "file:myapp.db?hpplite=on&l1=hpp-sepolia&privkey=0xYOUR_PRIVATE_KEY",
     &db,
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
     NULL
 );
 
-// Use standard SQLite API - changes are tracked automatically!
+// Use standard SQLite API - changes are batched and submitted to L1
 sqlite3_exec(db, "CREATE TABLE users(id, name)", NULL, NULL, NULL);
 sqlite3_exec(db, "INSERT INTO users VALUES(1, 'Alice')", NULL, NULL, NULL);
 
-// State root updates after each commit
-unsigned char root[32];
-hpplite_state_root(db, root);
-
-// Flush batch when ready
-uint64_t height = hpplite_flush(db);
-
-// Close - close hook flushes any pending changes automatically
+// Close - pending batch is flushed automatically
 sqlite3_close(db);
 ```
+
+On first open, the factory auto-deploys your rollup contract. All writes are batched and submitted to L1 for data availability.
 
 ## Building
 
@@ -53,139 +48,86 @@ Or build individually:
 ```bash
 gcc -I.. -I../../build -o basic_sequencer basic_sequencer.c \
     ../build/libhpplite.a ../build/libsqlite3.a \
-    $(pkg-config --libs libsecp256k1 libcurl) -lzmq
+    $(pkg-config --libs libsecp256k1 libcurl)
 ```
 
 ## Examples
 
 ### basic_sequencer.c
 
-Basic sequencer example demonstrating:
+Basic example demonstrating:
 - Opening database with `sqlite3_open_v2()` and `?hpplite=on` URI parameter
 - Using standard `sqlite3_exec()` for all SQL operations
-- Automatic state root tracking
-- Creating batches with `hpplite_flush()`
-- Transparent close via `sqlite3_close()` (close hook handles cleanup)
+- Automatic batch submission to L1
+- Transparent close via `sqlite3_close()`
 
 ```bash
+export HPPLITE_PRIVATE_KEY=0x...
 ./basic_sequencer
-```
-
-### l1_config.c
-
-L1 configuration example showing:
-- Network aliases (`l1=hpp-sepolia` → chainId=181228)
-- Reading system config from L1 contract
-- Building DA URIs
-- Layered configuration (URI params override env vars)
-
-```bash
-./l1_config
-```
-
-**Note:** Requires network access to HPP Sepolia.
-
-### da_uri_demo.c
-
-DA URI scheme demonstration:
-- Parsing `hppda://`, `file://`, `ipfs://` URIs
-- Network alias resolution (hpp-sepolia → 181228)
-- Building URIs from components
-
-```bash
-./da_uri_demo
 ```
 
 ### factory_demo.c
 
 Factory pattern demonstration showing:
-- Auto-discovery of rollup from wallet (private key)
+- Auto-discovery of existing rollup from wallet
 - Auto-creation of rollup if none exists
 - One rollup per wallet (1:1 wallet:rollup mapping)
-- Using factory helper functions
 
 ```bash
 export HPPLITE_PRIVATE_KEY=0x...
 ./factory_demo
 ```
 
-**Note:** Requires network access to HPP Sepolia and the factory contract to be deployed.
+**Note:** Requires network access to HPP Sepolia.
 
 ## URI Parameters
 
 Open databases with configuration in the URI:
 
 ```
-file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia&contract=0x...
+file:myapp.db?hpplite=on&l1=hpp-sepolia&privkey=0x...
 ```
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `hpplite` | Enable HPPLite (required) | `hpplite=on` |
-| `role` | Node role | `sequencer`, `witness`, `observer` |
-| `l1` | L1 network alias | `hpp-sepolia`, `hpp-mainnet` |
-| `chainid` | L1 chain ID (explicit) | `181228` |
-| `rpc` | L1 RPC URL | `https://sepolia.hpp.io` |
-| `contract` | L1 contract address | `0x2Cd27...` |
-| `datadir` | Batch storage directory | `/var/lib/hpplite` |
-| `interval` | Batch interval | `5s`, `100ms`, `1m` |
-| `privkey` | Private key (hex) | `0x01020304...` |
-| `keyfile` | Path to private key file | `/path/to/key` |
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `hpplite` | Yes | Set to `on` to enable |
+| `l1` | Yes* | Network alias (hpp-sepolia) or chain ID |
+| `rpc` | No* | L1 RPC URL (auto-set from l1 alias) |
+| `factory` | No* | Factory contract (auto-set from l1 alias) |
+| `contract` | No | Direct rollup address (if known) |
+| `privkey` | Yes | Private key for signing |
+| `datadir` | No | Local data directory |
+| `interval` | No | Batch interval (e.g., `5s`, `1m`) |
+
+*Use `l1=hpp-sepolia` for simplest config - RPC and factory are built-in.
 
 ## Environment Variables
 
 Configuration can also be set via environment (URI params take priority):
 
 ```bash
-export HPPLITE_ROLE=sequencer
-export HPPLITE_CHAIN_ID=181228
 export HPPLITE_RPC_URL=https://sepolia.hpp.io
-export HPPLITE_CONTRACT=0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc
+export HPPLITE_FACTORY=0x51cD96b8F0BE5bD920326709D39b62130291CaDe
+export HPPLITE_PRIVATE_KEY=0x...
 export HPPLITE_DATA_DIR=/var/lib/hpplite
-export HPPLITE_PRIVKEY=0x0102030405...
-export HPPLITE_BATCH_INTERVAL=5s
+export HPPLITE_BATCH_INTERVAL=60
 ```
 
-## DA URI Formats
+## Network Info
 
-### hppda:// (On-chain L1 DA)
+**HPP Sepolia** (recommended for testing):
+- Chain ID: 181228
+- RPC: https://sepolia.hpp.io
+- Factory: `0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f`
+- Alias: `hpp-sepolia` (use `l1=hpp-sepolia` for auto-config)
 
-```
-hppda://<chainId>/<contract>/<height>
-hppda://<chainId>/<contract>/<from>-<to>
-hppda://<alias>/<contract>/<height>
-```
+## Verification
 
-Examples:
-```
-hppda://181228/0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc/42
-hppda://hpp-sepolia/0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc/1-100
-```
+After running an example, you can verify the state from L1:
 
-### file:// (Local filesystem)
-
-```
-file:///path/to/batch.json
+```bash
+# Verify your rollup state matches L1 data
+hpplite verify 0xYOUR_ROLLUP_ADDRESS --rpc https://sepolia.hpp.io
 ```
 
-### ipfs:// (IPFS)
-
-```
-ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG
-```
-
-## Network Aliases
-
-| Alias | Chain ID | RPC URL |
-|-------|----------|---------|
-| hpp-sepolia | 181228 | https://sepolia.hpp.io |
-| hpp-mainnet | 181227 | https://mainnet.hpp.io |
-| ethereum | 1 | https://eth.llamarpc.com |
-| sepolia | 11155111 | https://sepolia.drpc.org |
-
-## Contract Addresses
-
-HPPLiteDA v2 on HPP Sepolia:
-```
-0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc
-```
+This fetches all batches from L1, replays the SQL, and verifies state roots match.

@@ -1,343 +1,240 @@
 # HPPLite Architecture
 
-**Optimistic Witness Consensus for SQLite**
+**Singleton Sequencer with L1 Data Availability**
 
 ## Overview
 
-HPPLite is a distributed SQLite system that uses L1 blockchain as a coordination layer. It implements an "Optimistic Witness" model where witnesses verify continuously but only attest at checkpoints.
+HPPLite is an L2/L3 rollup that brings SQLite to the blockchain. It uses a **singleton sequencer** model with full data availability on L1, matching the security model of production L2s like Optimism and Arbitrum.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         HPPLite                             │
 │                                                             │
-│   Nodes ◄────────► L1 Contract ◄────────► Nodes            │
-│                    - Sequencer election                     │
-│                    - Witness registry                       │
-│                    - Checkpoint commitments                 │
-│                    - Configuration                          │
+│   Clients ──────► Sequencer ──────► L1 Contract             │
+│                      │               - Batch DA             │
+│                      │               - Checkpoints          │
+│                      ▼               - State roots          │
+│                   SQLite                                    │
+│                                                             │
+│   Anyone can verify: hpplite verify <contract>              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Core Insight: L1 as Zookeeper
+## Core Design
 
-| Zookeeper          | L1 Contract                              |
-|--------------------|------------------------------------------|
-| Leader election    | `sequencer`, `claimSequencer()`          |
-| Group membership   | `witnesses[]`, `addWitness()`            |
-| Distributed lock   | Sequencer role (only one can sequence)   |
-| Configuration      | `requiredSigs`, `timeout`, etc.          |
-| Consensus          | Ethereum/L1 consensus (already solved)   |
+### Why Singleton Sequencer?
 
-**Benefits:**
-- No extra infrastructure (no Zookeeper cluster)
-- Battle-tested consensus (L1 finality)
-- Transparent (anyone can read contract state)
-- Trustless (contract enforces rules)
+SQLite requires strong consistency - apps expect read-your-writes semantics:
+
+```c
+sqlite3_exec(db, "INSERT INTO users VALUES (1, 'alice')", ...);
+sqlite3_exec(db, "SELECT * FROM users WHERE id=1", ...);
+// App expects 'alice' immediately
+```
+
+Distributed writes break this. Solutions like multi-master (AergoLite) require append-only restrictions. HPPLite keeps full SQL by using a single sequencer.
+
+**This is the same model as major L2s:**
+- Optimism: centralized sequencer
+- Arbitrum: centralized sequencer
+- Base: centralized sequencer
+- zkSync: centralized sequencer
+
+### What Makes It Secure?
+
+| Layer | What It Provides |
+|-------|------------------|
+| **L1 Data Availability** | All batch data on-chain, anyone can reconstruct |
+| **Checkpoints** | State roots anchored to L1 |
+| **Verifiability** | Anyone can replay and verify |
+| **Challenge Period** | Time window to detect fraud |
+
+The sequencer cannot:
+- **Corrupt state** - all data is on L1, verifiable
+- **Steal funds** - invalid state transitions detectable
+- **Hide fraud** - full history on L1
+
+The sequencer can only:
+- **Order transactions** (MEV possible)
+- **Censor temporarily** (but not permanently with forced inclusion)
+- **Go offline** (liveness, not safety)
 
 ---
 
-## Roles
+## Security Model: "Trust But Verify"
 
-### Sequencer
+### The Honest Reality
 
-The sequencer is the **single leader** responsible for ordering and producing batches.
+This is the same "optimistic" security as billion-dollar L2s:
 
-**Responsibilities:**
-1. Receive SQL transactions from clients
-2. Order transactions (determines execution order)
-3. Execute SQL against local SQLite
-4. Track state root changes
-5. Package transactions into batches
-6. Broadcast batches to all witnesses
-7. At checkpoint interval: collect attestations, submit to L1
-
-**What Sequencer Controls:**
-- Transaction ordering (can do MEV)
-- Batch timing (when to flush)
-- Which transactions to include (can censor temporarily)
-
-**What Sequencer Cannot Do:**
-- Produce invalid state transitions (witnesses won't attest)
-- Finalize without witness quorum
-- Remain sequencer after timeout without producing checkpoints
-
-### Witness
-
-Witnesses form the **verification committee** that validates sequencer honesty.
-
-**Responsibilities:**
-1. Register on L1 contract
-2. Subscribe to sequencer's batch stream
-3. For each batch: verify, re-execute SQL, check state roots
-4. At checkpoint request: sign if valid, refuse if invalid
-5. Monitor L1 for sequencer timeout
-6. Optionally: claim sequencer role if timeout
-
-**Verification Process:**
 ```
-receive_batch(batch):
-    assert batch.height == local_height + 1
-    assert batch.preStateRoot == local_state_root
-
-    for txn in batch.transactions:
-        execute(txn.sql)
-
-    computed_root = get_state_root()
-    assert computed_root == batch.postStateRoot
-
-    store_batch(batch)
+Sequencer posts batches to L1
+    ↓
+Assumed valid (optimistic)
+    ↓
+Challenge period (anyone can verify)
+    ↓
+Finalized
 ```
+
+**If no one verifies during the challenge period, fraud becomes canonical.**
+
+This works because:
+1. Sequencer has reputation/bond at stake
+2. The *capability* to verify is the deterrent
+3. Actual fraud proofs are like nukes - exist to never be used
+
+### Who Watches the Sequencer?
+
+In Optimism/Arbitrum: permissioned validator sets, mostly run by the teams.
+
+In HPPLite: **anyone can verify on-demand**.
+
+```bash
+# One-click verification from L1 data
+hpplite verify 0x1234...
+
+# Or programmatically
+sqlite3_open("file:db.db?hpplite=...&mode=verify")
+```
+
+No need for 24/7 witness nodes. The ability to launch verification at any time is the deterrent.
 
 ---
 
-## Optimistic Witness Model
+## Architecture
 
-### Why Not Traditional Fraud Proofs?
+### Sequencer Role
 
-| Approach | EVM L2 | SQL L2 (HPPLite) |
-|----------|--------|------------------|
-| Instruction trace | Opcodes are atomic | No standard trace |
-| Bisection game | Narrow to 1 opcode | Can't bisect SQL |
-| On-chain proof | Verify single step | Would need full re-execution |
+The sequencer is the single node that:
+1. Receives SQL from clients
+2. Executes against local SQLite
+3. Batches transactions
+4. Submits to L1 (data availability)
+5. Creates checkpoints (state commitments)
 
-**Conclusion:** Bisection-based fraud proofs are impractical for SQL execution.
+```c
+// Client connects directly to sequencer
+sqlite3_open_v2(
+    "file:myapp.db?hpplite=on&rpc=https://sepolia.hpp.io"
+    "&factory=0x51cD...&privkey=0x...",
+    &db, ...);
 
-### Pre-emptive vs Reactive Validation
-
-```
-Traditional Optimistic Rollup (Reactive):
-Sequencer posts ──► Assumed valid ──► [7 day window] ──► Finalized
-                                            │
-                              Challenge only if fraud detected
-
-HPPLite Optimistic Witness (Pre-emptive):
-Sequencer posts ──► Witnesses verify ──► Co-sign ──► Finalized
-                          │
-            Pre-emptive validation every batch
+// All reads and writes go to sequencer
+sqlite3_exec(db, "INSERT INTO ...", ...);  // Batched, submitted to L1
+sqlite3_exec(db, "SELECT ...", ...);        // Strong consistency
 ```
 
-| Aspect | Reactive (Fraud Proof) | Pre-emptive (Witness) |
-|--------|------------------------|----------------------|
-| Philosophy | "Trust, then verify if suspicious" | "Verify, then trust" |
-| Bad state | Gets posted, challenged later | Never finalized |
-| Finality | Delayed (challenge window) | Fast (once signed) |
+### L1 Contract
 
-**Key insight:** Invalid state never gets finalized because it won't get enough signatures.
+The L1 contract stores:
+- **Batch data** - full DA, enables reconstruction
+- **Checkpoints** - state root commitments
+- **Configuration** - sequencer address, parameters
 
-### Why "Optimistic"?
-- Witnesses verify continuously in the background
-- Only explicit attestations needed at checkpoints
-- Between checkpoints: optimistic trust in sequencer
-- No per-batch attestation overhead
+```solidity
+interface IHPPLite {
+    function claimSequencer(bytes32 instanceId) external;
+    function renewLease(bytes32 instanceId) external;
+    function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;
+    function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
+    function getBatch(uint256 height) external view returns (bytes);
+}
+```
+
+### Verification
+
+Anyone can verify the entire chain:
+
+```
+1. Fetch all batches from L1
+2. Replay SQL in order
+3. Compute state roots
+4. Compare against checkpointed roots
+5. If mismatch → fraud detected
+```
+
+This doesn't require running a node 24/7. It's an on-demand audit.
 
 ---
 
-## Checkpoints
+## Comparison with Other Systems
 
-### What is a Checkpoint?
+| System | Sequencer | Verification | Finality |
+|--------|-----------|--------------|----------|
+| **HPPLite** | Singleton | On-demand | Checkpoint + challenge |
+| **Optimism** | Singleton | Permissioned watchers | 7-day challenge |
+| **Arbitrum** | Singleton | Validator whitelist | ~7-day challenge |
+| **AergoLite** | None (multi-master) | VRF consensus | Block votes |
 
-A checkpoint is a **commitment to a range of batches** that gets:
-1. Attested by witnesses (M-of-N signatures)
-2. Submitted to L1 contract
-3. Becomes the new finality anchor
+HPPLite matches the proven L2 model: centralized sequencer, decentralized verification.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CHECKPOINT                               │
-├─────────────────────────────────────────────────────────────┤
-│  fromHeight: 101         (first batch in range)             │
-│  toHeight:   200         (last batch in range)              │
-│  preStateRoot:  0xabc... (state before batch 101)           │
-│  postStateRoot: 0xdef... (state after batch 200)            │
-│  timestamp:     16839... (when created)                     │
-├─────────────────────────────────────────────────────────────┤
-│  ATTESTATIONS:                                              │
-│    Witness 1: signature_1                                   │
-│    Witness 2: signature_2                                   │
-│    Witness 3: signature_3                                   │
-└─────────────────────────────────────────────────────────────┘
-```
+---
 
-### Checkpoint Flow
+## Why Not Witnesses?
 
-```
-Sequencer                              Witnesses
-    │                                      │
-    │  [batch 101-200]                     │
-    │─────────────────────────────────────►│ verify, store
-    │                                      │
-    │  CHECKPOINT_INTERVAL reached         │
-    │                                      │
-    │  REQUEST_ATTESTATION ───────────────►│
-    │◄─────────────── ATTESTATION ─────────│
-    │                                      │
-    │  quorum reached (e.g., 2 of 3)       │
-    │                                      │
-    │  SUBMIT TO L1 ──────────────────────►│ L1 Contract
-    │◄─────────── CHECKPOINT_FINALIZED ────│
-```
+We considered active witness nodes that:
+- Sync from sequencer in real-time
+- Attest to checkpoints
+- Serve read traffic
 
-### Checkpoint Benefits
+**Problems:**
+1. **Write routing** - if witness receives write, must forward to sequencer (complex)
+2. **Consistency** - reads from witness may be stale (breaks SQLite semantics)
+3. **Infrastructure** - requires 24/7 witness nodes
 
-| Aspect | Per-Batch | Checkpoint |
-|--------|-----------|------------|
-| L1 gas cost | 1 tx per batch | 1 tx per N batches |
-| Attestation traffic | High | Low |
-| Witness availability | Must be online | Can be intermittent |
+**Solution:** Skip client-facing witnesses. Verification is on-demand, not continuous.
 
-### What Checkpoints Enable
-
-1. **Finality**: State after checkpoint cannot be reverted
-2. **Pruning**: Old batches can be archived after checkpoint
-3. **Sync**: New nodes can start from checkpoint, not genesis
-4. **Bridges**: Other chains can trust checkpointed state
+Future optimization: read replicas (explicit opt-in for stale reads) if needed for scale.
 
 ---
 
 ## Finality Levels
 
 ```
-┌─────────────┬─────────────────────────────────────────────────┐
-│ Level       │ Description                                     │
-├─────────────┼─────────────────────────────────────────────────┤
-│ SEQUENCED   │ Sequencer produced batch, not yet broadcast     │
-│ SOFT        │ Witnesses received and verified locally         │
-│ CHECKPOINT  │ Included in attested checkpoint (quorum sigs)   │
-│ L1          │ Checkpoint committed to L1 contract             │
-└─────────────┴─────────────────────────────────────────────────┘
+┌─────────────┬────────────────────────────────────────────┐
+│ Level       │ Description                                │
+├─────────────┼────────────────────────────────────────────┤
+│ SEQUENCED   │ SQL executed by sequencer                  │
+│ L1          │ Batch submitted to L1 (data available)     │
+│ FINALIZED   │ Challenge period passed                    │
+└─────────────┴────────────────────────────────────────────┘
 ```
 
-**Typical latencies:**
-- SEQUENCED → SOFT: ~100ms (network broadcast)
-- SOFT → CHECKPOINT: configurable (every N batches)
-- CHECKPOINT → L1: ~12s (Ethereum block time) + confirmations
+Typical latencies:
+- SEQUENCED: immediate
+- L1: seconds to minutes (batch interval)
+- FINALIZED: challenge period (configurable, e.g., hours to days)
 
 ---
 
-## Role Promotion (Witness → Sequencer)
-
-When the current sequencer fails, a witness can **promote** itself.
-
-### Promotion Timeline
-
-```
-T+0      Sequencer posts checkpoint (height 100)
-T+30min  Sequencer produces batches 101-150
-T+45min  Sequencer crashes
-T+1hr    TIMEOUT EXPIRES - witnesses detect via L1
-T+1hr    Witness calls claimSequencer()
-T+1hr+   New sequencer continues from batch 151
-```
-
-### Why L1 Timeout is Canonical
-
-1. **Consistency**: All witnesses see identical L1 state
-2. **No split-brain**: Cannot have disagreement on sequencer status
-3. **Verifiable**: Anyone can check L1
-4. **Objective**: No subjective timeout judgments
-
-### Witnesses as Hot Standbys
-
-Witnesses maintain **full state replicas** and can step in immediately:
-
-| Benefit | Description |
-|---------|-------------|
-| Zero sync time | Witnesses already have current state |
-| Instant failover | Any witness can take over immediately |
-| High availability | N-1 failures tolerated |
-| Decentralization path | Can rotate sequencer among witnesses |
-
----
-
-## L1 Contract Interface
-
-```solidity
-interface IHPPLite {
-    // State
-    function sequencer() external view returns (address);
-    function witnesses(uint256 index) external view returns (address);
-    function isWitness(address addr) external view returns (bool);
-    function requiredAttestations() external view returns (uint256);
-    function lastCheckpointHeight() external view returns (uint256);
-    function lastStateRoot() external view returns (bytes32);
-
-    // Actions
-    function addWitness(address _witness) external;
-    function removeWitness(address _witness) external;
-    function setSequencer(address _sequencer) external;
-
-    function submitCheckpoint(
-        uint256 fromHeight,
-        uint256 toHeight,
-        bytes32 stateRoot,
-        bytes calldata signatures
-    ) external;
-
-    // Events
-    event CheckpointSubmitted(uint256 fromHeight, uint256 toHeight, bytes32 stateRoot);
-    event SequencerChanged(address indexed oldSequencer, address indexed newSequencer);
-}
-```
-
----
-
-## Security Model
-
-### Trust Assumptions
-
-| Component | Trust Level |
-|-----------|-------------|
-| L1 | Fully trusted (Ethereum consensus) |
-| Sequencer | Trusted for liveness, not correctness |
-| Witnesses | Threshold trust (M-of-N must be honest) |
-| State roots | Verified by witness re-execution |
-
-### Attack Vectors & Mitigations
-
-| Attack | Mitigation |
-|--------|------------|
-| Sequencer posts bad state | Witnesses won't attest, no finality |
-| Sequencer censors txs | Users can submit directly (future) |
-| Sequencer goes offline | L1 timeout → new sequencer election |
-| Witness collusion | Requires M-of-N threshold to be broken |
-| L1 reorg | Wait for L1 finality before trusting |
-
----
-
-## Comparison with Other Systems
-
-| System | Consensus Model | Finality | Trust |
-|--------|-----------------|----------|-------|
-| **HPPLite** | Optimistic Witness | Checkpoint | M-of-N witness |
-| Optimistic L2 | Fraud proofs | 7 days | 1-of-N honest |
-| ZK Rollup | Validity proofs | ~minutes | Math (ZK) |
-| Tendermint | BFT | Immediate | 2/3 validators |
-
-**HPPLite's niche**: Simple, practical, SQL-native consensus without ZK complexity or 7-day delays.
-
----
-
-## Configuration Parameters
+## Configuration
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `requiredAttestations` | Signatures needed for checkpoint | 2 of 3 |
+| `batchInterval` | Time between batch submissions | 60s |
 | `checkpointInterval` | Batches between checkpoints | 100 |
-| `sequencerTimeout` | Time before sequencer can be replaced | 1 hour |
+| `challengePeriod` | Time window for fraud detection | 1 hour |
 
 ---
 
 ## Summary
 
-HPPLite implements a practical distributed SQLite system:
+HPPLite implements a practical L2/L3 for SQLite:
 
-1. **L1 as coordinator** - No Zookeeper needed
-2. **Optimistic witnesses** - Verify always, attest at checkpoints
-3. **Checkpoint finality** - Efficient, batched L1 commits
-4. **Simple security** - Sequencer can't cheat, only delay
+1. **Singleton sequencer** - strong consistency, full SQL support
+2. **L1 data availability** - all data on-chain, reconstructable
+3. **On-demand verification** - anyone can verify, no 24/7 nodes needed
+4. **Same security as major L2s** - if it's good enough for Optimism, it's good enough
 
 ```
-SQLite + L1 Coordination + Optimistic Witnesses = HPPLite
+"Centralized sequencer, decentralized verification"
+```
+
+Or more honestly:
+
+```
+"Your data on-chain, one server, verify anytime"
 ```

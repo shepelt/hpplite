@@ -39,20 +39,8 @@ struct HppliteBatch {
 };
 
 /*
-** Commitment record (stored in contract/index)
-** Deprecated: use HppliteCheckpoint for checkpoint-based finality
-*/
-typedef struct HppliteCommitment HppliteCommitment;
-struct HppliteCommitment {
-  uint64_t height;                           /* Batch height */
-  unsigned char stateRoot[HPPLITE_HASH_SIZE]; /* Post-state root */
-  char *zBatchRef;                           /* Reference to batch file */
-  uint64_t timestamp;                        /* When committed */
-};
-
-/*
 ** Checkpoint - covers a range of batches
-** This is what gets attested and posted to L1
+** Posted to L1 by the sequencer
 */
 typedef struct HppliteCheckpoint HppliteCheckpoint;
 struct HppliteCheckpoint {
@@ -65,26 +53,11 @@ struct HppliteCheckpoint {
 };
 
 /*
-** Checkpoint attestation from a witness
-*/
-typedef struct HppliteCheckpointAttestation HppliteCheckpointAttestation;
-struct HppliteCheckpointAttestation {
-  uint64_t fromHeight;
-  uint64_t toHeight;
-  unsigned char postStateRoot[HPPLITE_HASH_SIZE];
-  unsigned char witnessPubkey[33];           /* Compressed pubkey */
-  unsigned char signature[64];               /* secp256k1 signature */
-  int recid;                                 /* Recovery ID */
-};
-
-/*
 ** Finality levels for batches
 */
 typedef enum {
   HPPLITE_FINALITY_NONE = 0,      /* Not yet produced */
   HPPLITE_FINALITY_SEQUENCED,     /* Sequencer produced */
-  HPPLITE_FINALITY_SOFT,          /* Witnesses verified locally */
-  HPPLITE_FINALITY_CHECKPOINT,    /* Included in attested checkpoint */
   HPPLITE_FINALITY_L1             /* Committed to L1 */
 } HppliteFinalityLevel;
 
@@ -124,32 +97,6 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch);
 ** Caller must free returned batch with hpplite_batch_free()
 */
 HppliteBatch *hpplite_batch_from_json(const char *zJson);
-
-/*
-** Create a commitment from a batch
-*/
-HppliteCommitment *hpplite_commitment_new(
-  uint64_t height,
-  const unsigned char *pStateRoot,
-  const char *zBatchRef
-);
-
-/*
-** Free a commitment
-*/
-void hpplite_commitment_free(HppliteCommitment *pCommit);
-
-/*
-** Serialize commitment to JSON (single line)
-** Caller must free returned string with sqlite3_free()
-*/
-char *hpplite_commitment_to_json(const HppliteCommitment *pCommit);
-
-/*
-** Parse commitment from JSON line
-** Caller must free returned commitment with hpplite_commitment_free()
-*/
-HppliteCommitment *hpplite_commitment_from_json(const char *zJson);
 
 /* === Checkpoint Functions === */
 

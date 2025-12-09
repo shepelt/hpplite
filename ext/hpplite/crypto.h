@@ -1,8 +1,8 @@
 /*
-** HPPLite Crypto - secp256k1 signing for L2 attestations
+** HPPLite Crypto - secp256k1 signing for L1 transactions
 **
 ** Uses Bitcoin's secp256k1 library for Ethereum-compatible signatures.
-** L1 contracts can verify these signatures using ecrecover().
+** Used for signing L1 transactions and deriving addresses.
 */
 
 #ifndef HPPLITE_CRYPTO_H

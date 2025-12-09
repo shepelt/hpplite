@@ -1,8 +1,8 @@
 # HPPLite
 
-A lightweight L2 rollup built on SQLite with L1 anchoring to HPP Network.
+A lightweight L2/L3 rollup for SQLite with L1 data availability.
 
-HPPLite enables verifiable SQL state transitions with checkpoint finality on Ethereum-compatible L1 chains. It combines SQLite's proven reliability with blockchain's trust guarantees.
+HPPLite enables verifiable SQL with checkpoint finality on Ethereum-compatible L1 chains. It uses the same security model as Optimism and Arbitrum: singleton sequencer with on-chain data availability.
 
 ## Quick Start
 
@@ -28,41 +28,36 @@ On first open, the factory auto-deploys your rollup contract (~3s). All writes a
 ## Architecture
 
 ```
-HPPLiteFactory (singleton on L1)
-    │
-    └── getOrCreateRollup() ──► HPPLiteDA (your rollup)
-                                    │
-                                    ├── submitBatch() - store batch data
-                                    ├── getBatch() - retrieve for reconstruction
-                                    └── submitCheckpoint() - finalize with attestations
-
 ┌─────────────────────────────────────────────────────────────────┐
-│                         HPPLite L2 Nodes                        │
+│                         HPPLite                                 │
 │                                                                 │
-│  ┌──────────────┐              ┌──────────────┐                │
-│  │  Sequencer   │   batches    │  Witness(es) │                │
-│  │              │ ───────────► │              │                │
-│  │  - Execute   │              │  - Verify    │                │
-│  │    SQL       │              │  - Attest    │                │
-│  │  - Submit    │              │  - Sync      │                │
-│  │    to L1     │              └──────────────┘                │
-│  └──────────────┘                                              │
-│         │                      ┌──────────────┐                │
-│         ▼                      │   Replica    │                │
-│  ┌──────────────┐              │              │                │
-│  │   SQLite     │   L1 sync    │  - Read-only │                │
-│  │  Database    │ ◄─────────── │  - Reconstruct│               │
-│  └──────────────┘              └──────────────┘                │
+│   App ──► sqlite3_open() ──► Sequencer ──► L1 Contract          │
+│                                  │          - Batch DA          │
+│                                  ▼          - Checkpoints       │
+│                              SQLite         - State roots       │
+│                                                                 │
+│   Verify anytime: hpplite verify <contract>                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**Security model:** Same as Optimism/Arbitrum - centralized sequencer, decentralized verification. All data is on L1, anyone can verify.
 
 ## Features
 
 - **Transparent API** - Just use `sqlite3_open_v2()` with URI parameters
 - **Factory Deploy** - One-click rollup creation, no manual contract deployment
 - **On-Chain DA** - Full batch data stored on L1 for reconstruction
-- **Witness Attestation** - Multi-sig checkpoint verification
-- **State Reconstruction** - Any node can rebuild from L1 batches alone
+- **On-Demand Verification** - Anyone can verify state from L1 data
+- **State Reconstruction** - Rebuild entire database from L1 alone
+
+## Why Singleton Sequencer?
+
+SQLite apps expect strong consistency (read-your-writes). Distributed writes break this - you'd either need:
+- Write forwarding (complex routing)
+- Eventual consistency (breaks app expectations)
+- Append-only restrictions (limits SQL)
+
+HPPLite keeps full SQL semantics by using a single sequencer. This is the same trade-off made by every major L2.
 
 ## Contracts
 
@@ -83,7 +78,6 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 | `contract` | Yes* | Direct rollup address (if known) |
 | `privkey` | Yes | Private key for signing |
 | `datadir` | No | Local data directory |
-| `role` | No | `sequencer`, `witness`, or `replica` |
 
 *Either `factory` or `contract` is required.
 
@@ -91,8 +85,8 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 ```bash
 # Prerequisites
-brew install libsecp256k1 zeromq curl pkg-config  # macOS
-# apt install libsecp256k1-dev libzmq3-dev libcurl4-openssl-dev  # Linux
+brew install libsecp256k1 curl pkg-config  # macOS
+# apt install libsecp256k1-dev libcurl4-openssl-dev  # Linux
 
 # Build SQLite first (from repo root)
 mkdir build && cd build
@@ -109,25 +103,11 @@ make
 
 ```bash
 # Unit tests (mock L1, fast, no network)
-ctest                    # Run all 15 unit tests (~4s)
-
-# Individual unit tests
-./test_hpplite           # Core state tracking
-./test_batch             # Batch serialization
-./test_node              # Node lifecycle
-./test_l1_mock           # Mock L1 operations
-./test_checkpoint_flow   # Checkpoint logic
-./test_witness           # Attestation flow
-./test_reconstruct       # State reconstruction
-./test_multinode         # Multi-node coordination
+ctest                    # Run all unit tests (~4s)
 
 # Integration tests (real L1, requires funded wallet)
 export HPPLITE_PRIVATE_KEY=0x...
-./test_l1_full_e2e       # Simple transparent API test
-./test_full_cluster      # Full sequencer/witness/reconstruction
-
-# Benchmarks
-make speedtest           # Replay performance
+./tests/integration/run_integration.sh
 ```
 
 ## Gas Costs (HPP Sepolia)
@@ -136,7 +116,6 @@ make speedtest           # Replay performance
 |-----------|-----|------------|-------------|
 | Factory deploy | 3.5M | 0.000035 | $0.12 |
 | Batch submit (~1KB) | 1.3M | 0.000013 | $0.04 |
-| Witness registration | 46K | 0.0000005 | $0.002 |
 
 *At $3,500/ETH, 10 gwei gas price
 
@@ -145,10 +124,10 @@ make speedtest           # Replay performance
 | Usage | Batches/day | Monthly Cost |
 |-------|-------------|--------------|
 | Light (personal) | 10 | ~$13 |
-| Medium (small app) | 100 | ~$264 |
-| Heavy (production) | 1,000 | ~$6,600 |
+| Medium (small app) | 100 | ~$130 |
+| Heavy (production) | 1,000 | ~$1,300 |
 
-**Cost driver**: 97% of cost is on-chain DA storage. Consider compression (4x savings) or off-chain DA (14x savings) for high-volume apps.
+**Cost driver**: 97% of cost is on-chain DA storage. Consider compression for high-volume apps.
 
 ## Components
 
@@ -163,55 +142,6 @@ make speedtest           # Replay performance
 | `l1_mock.c` | Mock L1 for testing |
 | `eth/` | Web3 primitives (RLP, ABI, keccak256) |
 
-## Test Structure
-
-```
-tests/
-├── unit/              # Mock L1, no network required
-│   ├── test_hpplite.c
-│   ├── test_batch.c
-│   ├── test_node.c
-│   ├── test_l1_mock.c
-│   ├── test_checkpoint_flow.c
-│   ├── test_witness.c
-│   ├── test_reconstruct.c
-│   ├── test_multinode.c
-│   └── test_zmq*.c
-│
-└── integration/       # Real L1 (HPP Sepolia)
-    ├── test_l1_full_e2e.c      # Transparent API
-    ├── test_full_cluster.c     # Sequencer + witness + reconstruction
-    ├── test_factory.c
-    └── test_l1_*.c
-```
-
-## Example: Full Cluster Setup
-
-```c
-// Sequencer node
-sqlite3_open_v2(
-    "file:seq.db?hpplite=on&role=sequencer"
-    "&rpc=https://sepolia.hpp.io"
-    "&contract=0xYOUR_ROLLUP"
-    "&privkey=0xSEQ_KEY",
-    &seq_db, ...);
-
-// Witness node (different machine)
-sqlite3_open_v2(
-    "file:wit.db?hpplite=on&role=witness"
-    "&rpc=https://sepolia.hpp.io"
-    "&contract=0xYOUR_ROLLUP"
-    "&privkey=0xWIT_KEY",
-    &wit_db, ...);
-
-// Read-only replica (reconstructs from L1)
-sqlite3_open_v2(
-    "file:replica.db?hpplite=on&role=replica"
-    "&rpc=https://sepolia.hpp.io"
-    "&contract=0xYOUR_ROLLUP",
-    &replica_db, ...);
-```
-
 ## Contract Interface
 
 ```solidity
@@ -220,19 +150,34 @@ function getOrCreateRollup() external returns (address);
 function getRollup(address owner) external view returns (address);
 
 // HPPLiteDA (per-rollup)
-function submitBatch(uint256 height, bytes data) external;
+function claimSequencer(bytes32 instanceId) external;
+function renewLease(bytes32 instanceId) external;
+function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;
 function getBatch(uint256 height) external view returns (bytes);
-function submitCheckpoint(uint256 from, uint256 to, bytes32 root, bytes sigs) external;
-function addWitness(address witness) external;
-function setSequencer(address seq) external;
+function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
 ```
+
+## Verification
+
+Anyone can verify the chain state from L1 data:
+
+```bash
+# Verify a rollup (fetches all batches from L1, replays, checks state roots)
+hpplite verify 0xYOUR_CONTRACT_ADDRESS --rpc https://sepolia.hpp.io
+```
+
+Or programmatically:
+```c
+sqlite3_open_v2("file:verify.db?hpplite=on&mode=verify&contract=0x...", &db, ...);
+```
+
+No need to run 24/7 nodes. The ability to verify is the security guarantee.
 
 ## Roadmap
 
 ### Completed
 - [x] SQLite state tracking with Merkle roots
 - [x] Batch creation and signing
-- [x] ZeroMQ networking (sequencer ↔ witness)
 - [x] L1 checkpoint anchoring
 - [x] Factory-based deployment
 - [x] On-chain data availability
@@ -240,11 +185,23 @@ function setSequencer(address seq) external;
 - [x] State reconstruction from L1
 
 ### Planned
+- [ ] Verify CLI (`hpplite verify`)
 - [ ] Batch compression (reduce DA costs)
-- [ ] Off-chain DA (IPFS/Arweave)
-- [ ] Virtual tables for L1 state queries
+- [ ] Challenge/fraud proof submission
 - [ ] Light client mode (Merkle proofs only)
-- [ ] Fraud proofs
+- [ ] Read replicas (opt-in stale reads for scale)
+
+## Security Model
+
+| What Sequencer Can Do | What Sequencer Cannot Do |
+|-----------------------|--------------------------|
+| Order transactions | Corrupt state (verifiable) |
+| Censor temporarily | Steal funds (detectable) |
+| Go offline | Hide fraud (full DA on L1) |
+
+This is "trust but verify" - the same model securing billions on Optimism and Arbitrum.
+
+See [doc/architecture.md](doc/architecture.md) for details.
 
 ## License
 

@@ -37,15 +37,11 @@ struct HppliteL1 {
 
 /* Function selectors - HPPLite contract (coordination) */
 static uint8_t SEL_GET_STATE[4];
-static uint8_t SEL_SET_SEQUENCER[4];
-static uint8_t SEL_ADD_WITNESS[4];
+static uint8_t SEL_CLAIM_SEQUENCER[4];
+static uint8_t SEL_RENEW_LEASE[4];
 static uint8_t SEL_SUBMIT_CHECKPOINT[4];
-static uint8_t SEL_IS_SEQUENCER_TIMED_OUT[4];
-static uint8_t SEL_GET_WITNESSES[4];
+static uint8_t SEL_IS_LEASE_ACTIVE[4];
 static uint8_t SEL_GET_SYSTEM_CONFIG[4];
-static uint8_t SEL_SET_ENDPOINT[4];
-static uint8_t SEL_GET_SEQUENCER_ENDPOINT[4];
-static uint8_t SEL_GET_WITNESS_ENDPOINTS[4];
 
 /* Function selectors - HPPLiteDA contract (data availability) */
 static uint8_t SEL_SUBMIT_BATCH[4];
@@ -69,18 +65,14 @@ static void init_selectors(void) {
 
     /* HPPLite selectors (coordination) */
     abi_function_selector("getState()", SEL_GET_STATE);
-    abi_function_selector("setSequencer(address)", SEL_SET_SEQUENCER);
-    abi_function_selector("addWitness(address)", SEL_ADD_WITNESS);
-    abi_function_selector("submitCheckpoint(uint256,uint256,bytes32,bytes)", SEL_SUBMIT_CHECKPOINT);
-    abi_function_selector("isSequencerTimedOut()", SEL_IS_SEQUENCER_TIMED_OUT);
-    abi_function_selector("getWitnesses()", SEL_GET_WITNESSES);
+    abi_function_selector("claimSequencer(bytes32)", SEL_CLAIM_SEQUENCER);
+    abi_function_selector("renewLease(bytes32)", SEL_RENEW_LEASE);
+    abi_function_selector("submitCheckpoint(bytes32,uint256,uint256,bytes32)", SEL_SUBMIT_CHECKPOINT);
+    abi_function_selector("isLeaseActive()", SEL_IS_LEASE_ACTIVE);
     abi_function_selector("getSystemConfig()", SEL_GET_SYSTEM_CONFIG);
-    abi_function_selector("setEndpoint(string,uint32)", SEL_SET_ENDPOINT);
-    abi_function_selector("getSequencerEndpoint()", SEL_GET_SEQUENCER_ENDPOINT);
-    abi_function_selector("getWitnessEndpoints()", SEL_GET_WITNESS_ENDPOINTS);
 
     /* HPPLiteDA selectors (data availability) */
-    abi_function_selector("submitBatch(uint256,bytes)", SEL_SUBMIT_BATCH);
+    abi_function_selector("submitBatch(bytes32,uint256,bytes)", SEL_SUBMIT_BATCH);
     abi_function_selector("getBatch(uint256)", SEL_GET_BATCH);
     abi_function_selector("getBatchHash(uint256)", SEL_GET_BATCH_HASH);
     abi_function_selector("getDAState()", SEL_GET_DA_STATE);
@@ -171,93 +163,63 @@ int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
 
 HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     if (!l1) return NULL;
-    
+
     /* Call getState() on contract */
     uint8_t calldata[4];
     memcpy(calldata, SEL_GET_STATE, 4);
-    
+
     size_t result_len;
     uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
     if (!result) return NULL;
-    
-    /* Parse result: (owner, sequencer, witnessCount, requiredAtt, cpInterval, seqTimeout, lastCpHeight, lastStateRoot, lastCpTime) */
-    if (result_len < 9 * 32) {
+
+    /* Parse result: (owner, sequencerWallet, sequencerInstance, leaseExpiry, lastCpHeight, lastStateRoot, lastCpTime) */
+    if (result_len < 7 * 32) {
         free(result);
         return NULL;
     }
-    
+
     HppliteL1State *state = calloc(1, sizeof(HppliteL1State));
     if (!state) {
         free(result);
         return NULL;
     }
-    
+
     /* Parse each field (32 bytes each) */
     uint8_t *p = result;
-    
-    /* owner - skip for now */
+
+    /* owner */
+    abi_decode_address(p, state->owner);
     p += 32;
-    
-    /* sequencer address */
-    abi_decode_address(p, state->sequencerAddress);
+
+    /* sequencerWallet */
+    abi_decode_address(p, state->sequencerWallet);
     p += 32;
-    
-    /* witnessCount */
-    state->nWitnesses = (int)abi_decode_uint64(p);
+
+    /* sequencerInstance (bytes32) */
+    abi_decode_bytes32(p, state->sequencerInstance);
     p += 32;
-    
-    /* requiredAttestations */
-    state->requiredAttestations = (int)abi_decode_uint64(p);
+
+    /* leaseExpiry */
+    state->leaseExpiry = abi_decode_uint64(p);
     p += 32;
-    
-    /* checkpointInterval */
-    state->checkpointInterval = abi_decode_uint64(p);
-    p += 32;
-    
-    /* sequencerTimeout */
-    state->sequencerTimeout = abi_decode_uint64(p);
-    p += 32;
-    
+
     /* lastCheckpointHeight */
     state->lastCheckpointHeight = abi_decode_uint64(p);
     p += 32;
-    
+
     /* lastStateRoot */
     abi_decode_bytes32(p, state->lastStateRoot);
     p += 32;
-    
-    /* lastCheckpointTime - using as lastCheckpointBlock for now */
-    state->lastCheckpointBlock = abi_decode_uint64(p);
-    
+
+    /* lastCheckpointTime */
+    state->lastCheckpointTime = abi_decode_uint64(p);
+
     free(result);
-    
-    /* Get witnesses if any */
-    if (state->nWitnesses > 0) {
-        memcpy(calldata, SEL_GET_WITNESSES, 4);
-        result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
-        if (result && result_len >= 64) {
-            /* Dynamic array: offset (32) + length (32) + data */
-            uint64_t offset = abi_decode_uint64(result);
-            if (offset < result_len) {
-                uint64_t count = abi_decode_uint64(result + offset);
-                if (count > 0 && count == (uint64_t)state->nWitnesses) {
-                    state->witnessAddresses = calloc(count, 20);
-                    for (uint64_t i = 0; i < count; i++) {
-                        abi_decode_address(result + offset + 32 + i * 32, state->witnessAddresses[i]);
-                    }
-                }
-            }
-        }
-        free(result);
-    }
-    
     return state;
 }
 
 void hpplite_l1_state_free(HppliteL1State *state) {
     if (!state) return;
-    if (state->witnessPubkeys) free(state->witnessPubkeys);
-    if (state->witnessAddresses) free(state->witnessAddresses);
     free(state);
 }
 
@@ -340,32 +302,7 @@ int hpplite_l1_is_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
         return 0;
     }
 
-    int result = (memcmp(address, state->sequencerAddress, 20) == 0);
-    hpplite_l1_state_free(state);
-    return result;
-}
-
-int hpplite_l1_is_witness(HppliteL1 *l1, const unsigned char *pubkey) {
-    HppliteL1State *state = hpplite_l1_get_state(l1);
-    if (!state) return 0;
-
-    /* Derive address from compressed pubkey */
-    uint8_t address[20];
-    if (eth_address_from_compressed_pubkey(pubkey, address) != 0) {
-        hpplite_l1_state_free(state);
-        return 0;
-    }
-
-    int result = 0;
-    if (state->witnessAddresses) {
-        for (int i = 0; i < state->nWitnesses; i++) {
-            if (memcmp(address, state->witnessAddresses[i], 20) == 0) {
-                result = 1;
-                break;
-            }
-        }
-    }
-
+    int result = (memcmp(address, state->sequencerWallet, 20) == 0);
     hpplite_l1_state_free(state);
     return result;
 }
@@ -373,107 +310,90 @@ int hpplite_l1_is_witness(HppliteL1 *l1, const unsigned char *pubkey) {
 char *hpplite_l1_submit_checkpoint(
     HppliteL1 *l1,
     const HppliteCheckpoint *checkpoint,
-    const HppliteCheckpointAttestation *attestations,
-    int nAttestations
+    const unsigned char instanceId[32]
 ) {
-    if (!l1 || !l1->has_privkey || !checkpoint || !attestations) return NULL;
-    
-    /* Build calldata for submitCheckpoint(uint256,uint256,bytes32,bytes) */
-    /* Static params: 4 + 32 + 32 + 32 + 32 (offset) = 132 bytes */
-    /* Dynamic bytes: 32 (length) + nAttestations * 65 (padded to 32) */
-    
-    size_t sig_data_len = nAttestations * 65;
-    size_t sig_padded_len = ((sig_data_len + 31) / 32) * 32;
-    size_t calldata_len = 4 + 32 + 32 + 32 + 32 + 32 + sig_padded_len;
-    
+    if (!l1 || !l1->has_privkey || !checkpoint || !instanceId) return NULL;
+
+    /* Build calldata for submitCheckpoint(bytes32,uint256,uint256,bytes32) */
+    size_t calldata_len = 4 + 32 + 32 + 32 + 32;
+
     uint8_t *calldata = calloc(1, calldata_len);
     if (!calldata) return NULL;
-    
+
     uint8_t *p = calldata;
-    
+
     /* Function selector */
     memcpy(p, SEL_SUBMIT_CHECKPOINT, 4);
     p += 4;
-    
+
+    /* instanceId */
+    memcpy(p, instanceId, 32);
+    p += 32;
+
     /* fromHeight */
     abi_encode_uint64(checkpoint->fromHeight, p);
     p += 32;
-    
+
     /* toHeight */
     abi_encode_uint64(checkpoint->toHeight, p);
     p += 32;
-    
+
     /* stateRoot */
     abi_encode_bytes32(checkpoint->postStateRoot, p);
-    p += 32;
-    
-    /* bytes offset (4 * 32 = 128 from start of params) */
-    abi_encode_uint64(128, p);
-    p += 32;
-    
-    /* bytes length */
-    abi_encode_uint64(sig_data_len, p);
-    p += 32;
-    
-    /* attestation signatures (r, s, v for each) */
-    for (int i = 0; i < nAttestations; i++) {
-        memcpy(p + i * 65, attestations[i].signature, 64);
-        p[i * 65 + 64] = attestations[i].recid + 27;
-    }
-    
-    /* Send transaction (needs ~530k gas for checkpoint with 2 sigs) */
+
+    /* Send transaction */
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, calldata_len,
-                                           1000000, 0);
+                                           500000, 0);
     free(calldata);
-    
+
     if (!tx_hash) return NULL;
-    
+
     char *hash_hex = eth_hex_encode(tx_hash, 32);
     free(tx_hash);
     return hash_hex;
 }
 
-int hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char *privkey) {
-    /* Note: In current contract, only owner can setSequencer */
-    /* This would need to be the owner's privkey */
-    if (!l1) return -1;
-    
-    /* For now, this is a no-op - owner manages sequencer externally */
-    return -1;
-}
-
-int hpplite_l1_register_witness(HppliteL1 *l1, const unsigned char *privkey) {
-    /* Note: In current contract, only owner can addWitness */
-    /* The l1 connection should be from the owner/sequencer, privkey is the witness to add */
-    if (!l1 || !privkey || !l1->eth) return -1;
+char *hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || !l1->has_privkey || !instanceId) return NULL;
     init_selectors();
 
-    /* Derive witness address from privkey */
-    uint8_t witness_addr[20];
-    if (eth_address_from_privkey(privkey, witness_addr) != 0) {
-        return -1;
-    }
-
-    /* Build calldata: addWitness(address) */
+    /* Build calldata: claimSequencer(bytes32) */
     uint8_t calldata[4 + 32];
-    memcpy(calldata, SEL_ADD_WITNESS, 4);
-    memset(calldata + 4, 0, 12);  /* Pad address to 32 bytes */
-    memcpy(calldata + 4 + 12, witness_addr, 20);
+    memcpy(calldata, SEL_CLAIM_SEQUENCER, 4);
+    memcpy(calldata + 4, instanceId, 32);
 
-    /* Send transaction - use higher gas limit for witness registration */
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 500000, 0);
-    if (!tx_hash) {
-        return -1;
-    }
+    /* Send transaction */
+    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 200000, 0);
+    if (!tx_hash) return NULL;
+
+    char *hash_hex = eth_hex_encode(tx_hash, 32);
     free(tx_hash);
-    return 0;
+    return hash_hex;
 }
 
-int hpplite_l1_sequencer_timeout_expired(HppliteL1 *l1) {
+char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || !l1->has_privkey || !instanceId) return NULL;
+    init_selectors();
+
+    /* Build calldata: renewLease(bytes32) */
+    uint8_t calldata[4 + 32];
+    memcpy(calldata, SEL_RENEW_LEASE, 4);
+    memcpy(calldata + 4, instanceId, 32);
+
+    /* Send transaction */
+    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 100000, 0);
+    if (!tx_hash) return NULL;
+
+    char *hash_hex = eth_hex_encode(tx_hash, 32);
+    free(tx_hash);
+    return hash_hex;
+}
+
+int hpplite_l1_is_lease_active(HppliteL1 *l1) {
     if (!l1) return 0;
-    
+
     uint8_t calldata[4];
-    memcpy(calldata, SEL_IS_SEQUENCER_TIMED_OUT, 4);
+    memcpy(calldata, SEL_IS_LEASE_ACTIVE, 4);
     
     size_t result_len;
     uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
@@ -633,9 +553,12 @@ char *hpplite_l1_factory_get_or_create_rollup(
 
     /* Send transaction - needs high gas for deploying child HPPLiteDA contract */
     uint8_t *tx_hash = eth_client_send_tx(eth, factory, calldata, 4, 15000000, 0);
-    eth_client_destroy(eth);
 
-    if (!tx_hash) return NULL;
+    if (!tx_hash) {
+        eth_client_destroy(eth);
+        return NULL;
+    }
+    eth_client_destroy(eth);
 
     char *hash_hex = eth_hex_encode(tx_hash, 32);
     free(tx_hash);
@@ -708,18 +631,19 @@ static int ensure_da_contract(HppliteL1 *l1) {
 
 char *hpplite_l1_submit_batch(
     HppliteL1 *l1,
+    const uint8_t instanceId[32],
     uint64_t height,
     const uint8_t *data,
     size_t data_len
 ) {
-    if (!l1 || !l1->has_privkey || !data || data_len == 0) return NULL;
+    if (!l1 || !l1->has_privkey || !instanceId || !data || data_len == 0) return NULL;
     if (!ensure_da_contract(l1)) return NULL;  /* Need DA contract */
 
-    /* Build calldata: submitBatch(uint256 height, bytes data) */
-    /* Static: 4 + 32 + 32 (offset) = 68 */
+    /* Build calldata: submitBatch(bytes32 instanceId, uint256 height, bytes data) */
+    /* Static: 4 + 32 + 32 + 32 (offset) = 100 */
     /* Dynamic: 32 (length) + padded data */
     size_t padded_len = ((data_len + 31) / 32) * 32;
-    size_t calldata_len = 4 + 32 + 32 + 32 + padded_len;
+    size_t calldata_len = 4 + 32 + 32 + 32 + 32 + padded_len;
 
     uint8_t *calldata = calloc(1, calldata_len);
     if (!calldata) return NULL;
@@ -730,12 +654,16 @@ char *hpplite_l1_submit_batch(
     memcpy(p, SEL_SUBMIT_BATCH, 4);
     p += 4;
 
+    /* instanceId (bytes32) */
+    memcpy(p, instanceId, 32);
+    p += 32;
+
     /* height */
     abi_encode_uint64(height, p);
     p += 32;
 
-    /* bytes offset (64 from start of params) */
-    abi_encode_uint64(64, p);
+    /* bytes offset (96 from start of params = 3 * 32) */
+    abi_encode_uint64(96, p);
     p += 32;
 
     /* bytes length */
@@ -886,173 +814,4 @@ int hpplite_l1_get_da_state(
 
 /* ============ Peer Discovery Functions ============ */
 
-char *hpplite_l1_set_endpoint(
-    HppliteL1 *l1,
-    const char *endpoint,
-    uint32_t node_version
-) {
-    if (!l1 || !l1->has_privkey || !endpoint) return NULL;
-
-    size_t ep_len = strlen(endpoint);
-    if (ep_len == 0 || ep_len > 256) return NULL;
-
-    /* Build calldata: setEndpoint(string, uint32)
-     * Layout:
-     * [0-3]    selector
-     * [4-35]   offset to string (64)
-     * [36-67]  uint32 nodeVersion (right-padded)
-     * [68-99]  string length
-     * [100+]   string data (padded to 32)
-     */
-    size_t padded_len = ((ep_len + 31) / 32) * 32;
-    size_t calldata_len = 4 + 32 + 32 + 32 + padded_len;
-
-    uint8_t *calldata = calloc(1, calldata_len);
-    if (!calldata) return NULL;
-
-    uint8_t *p = calldata;
-
-    /* Selector */
-    memcpy(p, SEL_SET_ENDPOINT, 4);
-    p += 4;
-
-    /* Offset to string (64 = 2 * 32) */
-    abi_encode_uint64(64, p);
-    p += 32;
-
-    /* nodeVersion */
-    abi_encode_uint64(node_version, p);
-    p += 32;
-
-    /* String length */
-    abi_encode_uint64(ep_len, p);
-    p += 32;
-
-    /* String data */
-    memcpy(p, endpoint, ep_len);
-
-    /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, calldata_len,
-                                           200000, 0);
-    free(calldata);
-
-    if (!tx_hash) return NULL;
-
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
-    return hash_hex;
-}
-
-int hpplite_l1_get_sequencer_endpoint(
-    HppliteL1 *l1,
-    char *endpoint_out,
-    size_t endpoint_out_len,
-    uint32_t *version_out
-) {
-    if (!l1 || !endpoint_out || endpoint_out_len < 1) return -1;
-
-    endpoint_out[0] = '\0';
-
-    /* Call getSequencerEndpoint() */
-    uint8_t calldata[4];
-    memcpy(calldata, SEL_GET_SEQUENCER_ENDPOINT, 4);
-
-    size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
-    if (!result || result_len < 64) {
-        free(result);
-        return -1;
-    }
-
-    /* Returns: (string endpoint, uint32 nodeVersion)
-     * [0-31]   offset to string
-     * [32-63]  nodeVersion
-     * [offset] string length
-     * [offset+32] string data
-     */
-    uint64_t strOffset = abi_decode_uint64(result);
-    if (version_out) {
-        *version_out = (uint32_t)abi_decode_uint64(result + 32);
-    }
-
-    if (strOffset < result_len) {
-        uint64_t strLen = abi_decode_uint64(result + strOffset);
-        if (strLen > 0 && strOffset + 32 + strLen <= result_len) {
-            size_t copy_len = strLen < endpoint_out_len - 1 ? strLen : endpoint_out_len - 1;
-            memcpy(endpoint_out, result + strOffset + 32, copy_len);
-            endpoint_out[copy_len] = '\0';
-        }
-    }
-
-    free(result);
-    return 0;
-}
-
-int hpplite_l1_get_witness_endpoints(
-    HppliteL1 *l1,
-    HpplitePeerInfo **peers_out,
-    int *count_out
-) {
-    if (!l1 || !peers_out || !count_out) return -1;
-
-    *peers_out = NULL;
-    *count_out = 0;
-
-    /* Call getWitnessEndpoints() */
-    uint8_t calldata[4];
-    memcpy(calldata, SEL_GET_WITNESS_ENDPOINTS, 4);
-
-    size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
-    if (!result || result_len < 96) {
-        free(result);
-        return -1;
-    }
-
-    /* Returns: (address[] addrs, string[] eps, uint32[] versions)
-     * This is complex ABI decoding - three dynamic arrays
-     * For now, just get the count from first array
-     */
-    uint64_t addrsOffset = abi_decode_uint64(result);
-    if (addrsOffset >= result_len) {
-        free(result);
-        return -1;
-    }
-
-    uint64_t count = abi_decode_uint64(result + addrsOffset);
-    if (count == 0) {
-        free(result);
-        return 0;  /* No witnesses */
-    }
-
-    /* Allocate peer info array */
-    HpplitePeerInfo *peers = calloc(count, sizeof(HpplitePeerInfo));
-    if (!peers) {
-        free(result);
-        return -1;
-    }
-
-    /* Parse addresses */
-    for (uint64_t i = 0; i < count && addrsOffset + 32 + (i + 1) * 32 <= result_len; i++) {
-        abi_decode_address(result + addrsOffset + 32 + i * 32, peers[i].address);
-    }
-
-    /* Parse endpoints (second array) and versions (third array) would need
-     * more complex ABI decoding. For now, leave endpoints NULL and versions 0.
-     * Full implementation would parse the dynamic string array.
-     */
-
-    *peers_out = peers;
-    *count_out = (int)count;
-
-    free(result);
-    return 0;
-}
-
-void hpplite_l1_free_peers(HpplitePeerInfo *peers, int count) {
-    if (!peers) return;
-    for (int i = 0; i < count; i++) {
-        if (peers[i].endpoint) free(peers[i].endpoint);
-    }
-    free(peers);
-}
+/* Endpoint functions removed in singleton model - no peer discovery needed */

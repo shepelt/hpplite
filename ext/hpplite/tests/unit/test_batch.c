@@ -15,7 +15,6 @@ static void print_hex(const unsigned char *data, int len) {
 
 int main(void) {
   HppliteBatch *batch, *parsed;
-  HppliteCommitment *commit, *parsedCommit;
   char *json;
   unsigned char preRoot[32] = {0};
   unsigned char postRoot[32] = {0xa1, 0xb2, 0xc3, 0xd4};
@@ -86,39 +85,8 @@ int main(void) {
   }
   printf("PASS\n\n");
 
-  /* Test 4: Commitment serialization */
-  printf("--- Test 4: Commitment serialization ---\n");
-  commit = hpplite_commitment_new(1, postRoot, "batches/00000001.json");
-  if (!commit) {
-    printf("FAIL: Could not create commitment\n");
-    return 1;
-  }
-
-  char *commitJson = hpplite_commitment_to_json(commit);
-  printf("Commitment JSON:\n%s\n", commitJson);
-
-  parsedCommit = hpplite_commitment_from_json(commitJson);
-  if (!parsedCommit) {
-    printf("FAIL: Could not parse commitment\n");
-    return 1;
-  }
-
-  if (parsedCommit->height != commit->height) {
-    printf("FAIL: Commitment height mismatch\n");
-    return 1;
-  }
-  if (memcmp(parsedCommit->stateRoot, commit->stateRoot, 32) != 0) {
-    printf("FAIL: Commitment state root mismatch\n");
-    return 1;
-  }
-  if (strcmp(parsedCommit->zBatchRef, commit->zBatchRef) != 0) {
-    printf("FAIL: Commitment batch ref mismatch\n");
-    return 1;
-  }
-  printf("PASS\n\n");
-
-  /* Test 5: SQL with special characters */
-  printf("--- Test 5: SQL with special characters ---\n");
+  /* Test 4: SQL with special characters */
+  printf("--- Test 4: SQL with special characters ---\n");
   HppliteBatch *batch2 = hpplite_batch_new(2);
   hpplite_batch_add_txn(batch2, "INSERT INTO t VALUES ('it''s \"quoted\"')", 1);
   hpplite_batch_add_txn(batch2, "INSERT INTO t VALUES ('line1\nline2\ttab')", 1);
@@ -138,13 +106,10 @@ int main(void) {
   /* Cleanup */
   sqlite3_free(json);
   sqlite3_free(json2);
-  sqlite3_free(commitJson);
   hpplite_batch_free(batch);
   hpplite_batch_free(parsed);
   hpplite_batch_free(batch2);
   hpplite_batch_free(parsed2);
-  hpplite_commitment_free(commit);
-  hpplite_commitment_free(parsedCommit);
 
   printf("=== All Tests Passed ===\n");
   return 0;

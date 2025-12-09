@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+import "./HPPLite.sol";
+
 /**
  * @title HPPLiteDA
- * @notice Pure Data Availability contract - batch CRUD only
- * @dev Stores batch data on L1 for full reconstructability
- *      Used by HPPLite main contract when daScheme = "hppda"
+ * @notice Data Availability contract - batch storage with lease verification
+ * @dev Stores batch data on L1 for full reconstructability.
+ *      Validates submitter against HPPLite lease to ensure singleton sequencer.
  */
 contract HPPLiteDA {
     // ============ State ============
     address public owner;
-    address public submitter;  // Who can submit batches (usually HPPLite contract or sequencer)
+    HPPLite public coordinator;  // HPPLite contract for lease verification
 
     // ============ Batch Storage ============
-    mapping(uint256 => bytes) public batchData;      // height => compressed batch JSON
-    mapping(uint256 => bytes32) public batchHashes;  // height => keccak256(batchData)
+    mapping(uint256 => bytes) public batchData;
+    mapping(uint256 => bytes32) public batchHashes;
     uint256 public lastBatchHeight;
     uint256 public batchSizeLimit;
 
     // ============ Events ============
-    event BatchSubmitted(
-        uint256 indexed height,
-        bytes32 indexed batchHash,
-        uint256 dataSize
-    );
-    event SubmitterChanged(address indexed oldSubmitter, address indexed newSubmitter);
+    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, uint256 dataSize);
+    event CoordinatorChanged(address indexed oldCoordinator, address indexed newCoordinator);
 
     // ============ Modifiers ============
     modifier onlyOwner() {
@@ -32,26 +30,34 @@ contract HPPLiteDA {
         _;
     }
 
-    modifier onlySubmitter() {
-        require(msg.sender == submitter || msg.sender == owner, "Not submitter");
+    modifier onlyActiveSequencer(bytes32 instanceId) {
+        require(address(coordinator) != address(0), "No coordinator set");
+        require(msg.sender == coordinator.sequencerWallet(), "Not sequencer wallet");
+        require(instanceId == coordinator.sequencerInstance(), "Wrong instance");
+        require(block.timestamp < coordinator.leaseExpiry(), "Lease expired");
         _;
     }
 
     // ============ Constructor ============
-    constructor(address _submitter, uint256 _batchSizeLimit) {
+    constructor(address _coordinator, uint256 _batchSizeLimit) {
         owner = msg.sender;
-        submitter = _submitter;
-        batchSizeLimit = _batchSizeLimit > 0 ? _batchSizeLimit : 128 * 1024;  // 128KB default
+        coordinator = HPPLite(_coordinator);
+        batchSizeLimit = _batchSizeLimit > 0 ? _batchSizeLimit : 128 * 1024;
     }
 
     // ============ Batch Functions ============
 
     /**
      * @notice Submit batch data for storage
+     * @param instanceId Sequencer instance ID (must match lease)
      * @param height Batch height (must be sequential)
      * @param data Batch data (JSON or compressed)
      */
-    function submitBatch(uint256 height, bytes calldata data) external onlySubmitter {
+    function submitBatch(
+        bytes32 instanceId,
+        uint256 height,
+        bytes calldata data
+    ) external onlyActiveSequencer(instanceId) {
         require(height == lastBatchHeight + 1, "Non-sequential batch");
         require(data.length > 0, "Empty batch");
         require(data.length <= batchSizeLimit, "Batch too large");
@@ -66,10 +72,15 @@ contract HPPLiteDA {
 
     /**
      * @notice Submit multiple batches in one transaction
+     * @param instanceId Sequencer instance ID (must match lease)
      * @param startHeight Starting height
      * @param batches Array of batch data
      */
-    function submitBatches(uint256 startHeight, bytes[] calldata batches) external onlySubmitter {
+    function submitBatches(
+        bytes32 instanceId,
+        uint256 startHeight,
+        bytes[] calldata batches
+    ) external onlyActiveSequencer(instanceId) {
         require(startHeight == lastBatchHeight + 1, "Non-sequential batch");
 
         for (uint256 i = 0; i < batches.length; i++) {
@@ -89,8 +100,6 @@ contract HPPLiteDA {
 
     /**
      * @notice Get batch data by height
-     * @param height Batch height
-     * @return data Batch data bytes
      */
     function getBatch(uint256 height) external view returns (bytes memory) {
         return batchData[height];
@@ -98,8 +107,6 @@ contract HPPLiteDA {
 
     /**
      * @notice Get batch hash by height
-     * @param height Batch height
-     * @return hash Batch data hash
      */
     function getBatchHash(uint256 height) external view returns (bytes32) {
         return batchHashes[height];
@@ -107,9 +114,6 @@ contract HPPLiteDA {
 
     /**
      * @notice Get range of batch hashes for verification
-     * @param fromHeight Start height (inclusive)
-     * @param toHeight End height (inclusive)
-     * @return hashes Array of batch hashes
      */
     function getBatchHashes(uint256 fromHeight, uint256 toHeight)
         external
@@ -129,28 +133,21 @@ contract HPPLiteDA {
 
     /**
      * @notice Get DA state summary
-     * @return _lastBatchHeight Last submitted batch height
-     * @return _totalBatches Total number of batches
-     * @return _latestBatchHash Hash of the latest batch
      */
     function getDAState() external view returns (
         uint256 _lastBatchHeight,
         uint256 _totalBatches,
         bytes32 _latestBatchHash
     ) {
-        return (
-            lastBatchHeight,
-            lastBatchHeight,  // Sequential from 1
-            batchHashes[lastBatchHeight]
-        );
+        return (lastBatchHeight, lastBatchHeight, batchHashes[lastBatchHeight]);
     }
 
     // ============ Admin Functions ============
 
-    function setSubmitter(address _submitter) external onlyOwner {
-        address old = submitter;
-        submitter = _submitter;
-        emit SubmitterChanged(old, _submitter);
+    function setCoordinator(address _coordinator) external onlyOwner {
+        address old = address(coordinator);
+        coordinator = HPPLite(_coordinator);
+        emit CoordinatorChanged(old, _coordinator);
     }
 
     function setBatchSizeLimit(uint256 _limit) external onlyOwner {

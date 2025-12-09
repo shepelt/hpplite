@@ -732,7 +732,7 @@ void hpplite_discard_pending(HppliteCtx *pCtx) {
 }
 
 /*
-** Finalize a verified batch (for witnesses).
+** Finalize a verified batch (for observers).
 ** Increments block height and clears pending SQL without creating a batch.
 ** Used after successfully verifying a batch from the sequencer.
 */
@@ -757,7 +757,6 @@ void hpplite_finalize_verified_batch(HppliteCtx *pCtx) {
 
 #include "config.h"
 #include "crypto.h"
-#include "fs_storage.h"
 #include "batch.h"
 #include "l1_interface.h"
 #include "node.h"
@@ -876,16 +875,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->hasContract = cfg->hasContract;
     nc->batchIntervalMs = cfg->batchIntervalMs;
 
-    /* Role from config, default to sequencer */
-    switch (cfg->role) {
-        case HPPLITE_CFG_ROLE_SEQUENCER: nc->role = HPPLITE_ROLE_SEQUENCER; break;
-        case HPPLITE_CFG_ROLE_WITNESS:   nc->role = HPPLITE_ROLE_WITNESS; break;
-        default:                          nc->role = HPPLITE_ROLE_SEQUENCER; break;
-    }
-
-    /* ZMQ networking */
-    nc->bindAddress = cfg->zmqBind ? strdup(cfg->zmqBind) : NULL;
-    nc->sequencerAddress = cfg->zmqSequencer ? strdup(cfg->zmqSequencer) : NULL;
+    /* Role removed - always sequencer in simplified model */
 }
 
 /*
@@ -896,8 +886,6 @@ static void free_node_config(HppliteNodeConfig *nc) {
     free(nc->dbPath);
     free(nc->rpcUrl);
     free(nc->nodeId);
-    free(nc->bindAddress);
-    free(nc->sequencerAddress);
 }
 
 sqlite3 *hpplite_open(const char *uri) {
@@ -953,10 +941,8 @@ sqlite3 *hpplite_open(const char *uri) {
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
 
-    /* Start ZMQ transport if configured */
-    if (config->zmqBind || config->zmqSequencer) {
-        hpplite_node_start(node);
-    }
+    /* Start node (claim lease if L1 connected) */
+    hpplite_node_start(node);
 
     return db;
 }
@@ -1019,7 +1005,7 @@ void hpplite_state_root(sqlite3 *db, unsigned char *out) {
 
 /*
 ** SQL function: hpplite_sync()
-** Triggers sync from L1 for witness/replica nodes.
+** Triggers sync from L1 for observer/replica nodes.
 */
 static void hpplite_sync_func(
     sqlite3_context *ctx,
@@ -1061,19 +1047,14 @@ static void hpplite_sync_func(
         if (data && dataLen > 0) {
             HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
             if (batch) {
-                /* Set checkpoint window start for first batch */
-                if (synced == 0 && h == currentHeight + 1) {
-                    node->checkpointFromHeight = batch->height;
-                    memcpy(node->checkpointPreRoot, batch->preStateRoot, HPPLITE_HASH_SIZE);
-                }
                 for (int i = 0; i < batch->nTxns; i++) {
                     if (batch->aTxns[i].zSql) {
                         sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
                     }
                 }
                 node->ctx->blockHeight = batch->height + 1;
-                node->lastVerifiedHeight = batch->height;
-                memcpy(node->lastVerifiedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
+                node->lastCheckpointHeight = batch->height;
+                memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
                 memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
                 hpplite_batch_free(batch);
                 synced++;
@@ -1100,7 +1081,7 @@ static void hpplite_flush_func(
     sqlite3 *db = sqlite3_context_db_handle(ctx);
     HppliteNode *node = findNode(db);
 
-    if (!node || node->role != HPPLITE_ROLE_SEQUENCER) {
+    if (!node) {
         sqlite3_result_int64(ctx, 0);
         return;
     }
@@ -1180,11 +1161,6 @@ static int hpplite_auto_init(
 
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
-
-    /* Start ZMQ transport if configured */
-    if (config->zmqBind || config->zmqSequencer) {
-        hpplite_node_start(node);
-    }
 
     return SQLITE_OK;
 }
