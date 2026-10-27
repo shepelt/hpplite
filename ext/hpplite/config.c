@@ -6,7 +6,7 @@
 
 #include "config.h"
 #include "da_uri.h"
-#include <sqlite3.h>
+#include "hpplite_sqlite.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

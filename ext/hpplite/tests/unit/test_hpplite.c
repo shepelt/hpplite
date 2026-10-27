@@ -42,9 +42,7 @@ int main(int argc, char **argv) {
   (void)argv;
 
   printf("=== HPPLite State Root Tracking Test ===\n\n");
-  printf("SQLite version: %s\n", sqlite3_libversion());
-  printf("Preupdate hook enabled: %d\n\n",
-         sqlite3_compileoption_used("ENABLE_PREUPDATE_HOOK"));
+  printf("SQLite version: %s\n\n", sqlite3_libversion());
 
   /* Open in-memory database */
   rc = sqlite3_open(":memory:", &db);

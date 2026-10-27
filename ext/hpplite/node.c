@@ -338,8 +338,10 @@ void hpplite_node_destroy(HppliteNode *node) {
         sqlite3_close(node->bkDb);
     }
 
-    /* Close database only if we own it */
+    /* Close database only if we own it. Unregister first so the close
+    ** (which disconnects hpplite_status) does not tear this node down again. */
     if (node->db && node->ownsDb) {
+        hpplite_unregister_node(node->db);
         sqlite3_close(node->db);
     }
 

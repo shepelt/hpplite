@@ -10,12 +10,11 @@
 #   2. tag the current head (hpplite-pre-<newtag>) so it can be restored
 #   3. git rebase --onto <newtag> <currentbase> hpplite
 #   4. rebuild the amalgamation, build ext/hpplite (mock L1), run ctest
-#   5. refresh patches/ from the bottom commit and record the new base
+#   5. record the new base in patches/UPSTREAM_BASE
 #   6. optionally force-push (with lease)
 #
-# The branch layout is: <base tag> -> core patch -> ext/hpplite commits.
-# Only the core patch can conflict; if it does, fix it, `git rebase --continue`,
-# then rerun this script with the same tag to finish steps 4-6.
+# The branch layout is: <base tag> -> ext/hpplite commits only. HPPLite
+# carries no SQLite core patches, so the rebase cannot conflict with upstream.
 
 set -euo pipefail
 
@@ -50,17 +49,16 @@ cmake -S "$EXT" -B "$EXT/build_mock" >/dev/null
 cmake --build "$EXT/build_mock" -j8 >/dev/null
 (cd "$EXT/build_mock" && ctest --timeout 120 | tail -3)
 
-echo "== refreshing patches/"
-CORE="$(git rev-list --reverse "$NEW..$BRANCH" | head -1)"
-git show --stat --format= "$CORE" -- src/ | grep -q . || { echo "bottom commit does not touch src/ — branch layout broken"; exit 1; }
-rm -f "$EXT"/patches/0001-*.patch
-git format-patch -1 "$CORE" -o "$EXT/patches/" --no-signature --zero-commit >/dev/null
+echo "== recording base"
+if git log --format=%H "$NEW..$BRANCH" -- src/ | grep -q .; then
+  echo "   warning: a commit on $BRANCH touches src/ — HPPLite is meant to carry no core patches"
+fi
 echo "$NEW" > "$BASE_FILE"
 sed -i.bak -E "s/version-[0-9]+\.[0-9]+\.[0-9]+/$NEW/g" "$EXT/patches/README.md" && rm -f "$EXT/patches/README.md.bak"
 if [ -n "$(git status --porcelain -- "$EXT/patches")" ]; then
   git add "$EXT/patches"
-  git commit -q -m "Rebase onto SQLite $NEW" -m "Base: $OLD -> $NEW. Core patch unchanged unless noted." -m "Claude-Session: https://claude.ai/code/session_01Q53TJXLGu6nHNKu2Lz7TUL"
-  echo "   committed patches/ refresh"
+  git commit -q -m "Rebase onto SQLite $NEW" -m "Base: $OLD -> $NEW." -m "Claude-Session: https://claude.ai/code/session_01Q53TJXLGu6nHNKu2Lz7TUL"
+  echo "   recorded new base"
 fi
 
 echo "== done: $BRANCH is on $NEW"

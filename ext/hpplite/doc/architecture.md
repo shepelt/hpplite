@@ -167,6 +167,13 @@ file, or history written elsewhere), the missing batches are replayed with
 tracking disabled and are not logged again. If local pending SQL and the
 batch on L1 disagree, the node refuses to continue rather than fork.
 
+Close is handled without touching SQLite core: `hpplite_status` is an
+eponymous virtual table whose instance lives for the connection; SQLite
+disconnects it at the start of `sqlite3_close()` while the connection is
+still usable, and that `xDisconnect` flushes, releases the lease and frees
+the node. The same code builds as a loadable extension against stock
+SQLite.
+
 On graceful close the sequencer lease is released (`forceExpireLease`, the
 wallet owns its rollup). After a crash the old lease blocks submission until
 it expires (5 minutes); writes keep accumulating in `_hpplite_pending` and

@@ -22,7 +22,7 @@
 #ifndef HPPLITE_H
 #define HPPLITE_H
 
-#include "sqlite3.h"
+#include "hpplite_sqlite.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -301,6 +301,13 @@ struct HppliteNode *hpplite_get_node(sqlite3 *db);
 ** Called automatically by hpplite_node_create() and hpplite_node_create_with_db().
 */
 void hpplite_register_node(sqlite3 *db, struct HppliteNode *node);
+
+/*
+** Remove a connection from the registry (no-op if not registered).
+** hpplite_node_destroy() calls this before closing a database it owns, so
+** the close does not re-enter the node teardown.
+*/
+void hpplite_unregister_node(sqlite3 *db);
 
 /*
 ** Force flush pending changes to a batch immediately.

@@ -6,7 +6,7 @@
 */
 
 #include "batch.h"
-#include "sqlite3.h"
+#include "hpplite_sqlite.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>

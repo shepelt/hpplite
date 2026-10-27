@@ -7,7 +7,7 @@
 
 #include "l1_interface.h"
 #include "crypto.h"
-#include "sqlite3.h"
+#include "hpplite_sqlite.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>

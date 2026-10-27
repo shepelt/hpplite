@@ -333,7 +333,7 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
 
   sha256_init(&h);
   rc = sqlite3_prepare_v2(db,
-    "SELECT type, name, tbl_name, sql FROM sqlite_schema"
+    "SELECT type, name, tbl_name, sql FROM sqlite_master"
     " WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
     "   AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'"
     " ORDER BY type, name", -1, &pStmt, NULL);
@@ -912,8 +912,173 @@ static void removeNode(sqlite3 *db) {
 static void hpplite_sync_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
+static void hpplite_on_close(sqlite3 *db);
+
 /*
-** Register a node with the global registry and set up SQL functions.
+** ============================================================================
+** hpplite_status: eponymous virtual table
+** ============================================================================
+**
+**   SELECT * FROM hpplite_status;
+**
+** One row: height, pending, state_root, prev_block_hash,
+** last_checkpoint_height, lease, log_errors.
+**
+** The table is referenced once when the node is registered so that an
+** instance exists for the life of the connection; its xDisconnect then fires
+** inside sqlite3_close() and performs the HPPLite shutdown (flush, release
+** lease, free). No change to SQLite core is needed for this.
+*/
+typedef struct StatusVtab {
+    sqlite3_vtab base;
+    sqlite3 *db;
+} StatusVtab;
+
+typedef struct StatusCursor {
+    sqlite3_vtab_cursor base;
+    int eof;
+} StatusCursor;
+
+#define STATUS_COL_HEIGHT 0
+#define STATUS_COL_PENDING 1
+#define STATUS_COL_STATE_ROOT 2
+#define STATUS_COL_PREV_BLOCK_HASH 3
+#define STATUS_COL_LAST_CHECKPOINT 4
+#define STATUS_COL_LEASE 5
+#define STATUS_COL_LOG_ERRORS 6
+
+static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
+                         sqlite3_vtab **ppVtab, char **pzErr) {
+    StatusVtab *p;
+    int rc;
+    (void)pAux; (void)argc; (void)argv; (void)pzErr;
+    rc = sqlite3_declare_vtab(db,
+        "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
+        " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
+        " log_errors INTEGER)");
+    if (rc != SQLITE_OK) return rc;
+    p = sqlite3_malloc(sizeof(StatusVtab));
+    if (!p) return SQLITE_NOMEM;
+    memset(p, 0, sizeof(StatusVtab));
+    p->db = db;
+    *ppVtab = &p->base;
+    return SQLITE_OK;
+}
+
+static int statusDisconnect(sqlite3_vtab *pVtab) {
+    StatusVtab *p = (StatusVtab *)pVtab;
+    hpplite_on_close(p->db);
+    sqlite3_free(p);
+    return SQLITE_OK;
+}
+
+static int statusBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+    (void)pVtab;
+    pInfo->estimatedCost = 1;
+    pInfo->estimatedRows = 1;
+    return SQLITE_OK;
+}
+
+static int statusOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
+    StatusCursor *c = sqlite3_malloc(sizeof(StatusCursor));
+    (void)pVtab;
+    if (!c) return SQLITE_NOMEM;
+    memset(c, 0, sizeof(StatusCursor));
+    *ppCur = &c->base;
+    return SQLITE_OK;
+}
+
+static int statusClose(sqlite3_vtab_cursor *pCur) {
+    sqlite3_free(pCur);
+    return SQLITE_OK;
+}
+
+static int statusFilter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
+                        int argc, sqlite3_value **argv) {
+    (void)idxNum; (void)idxStr; (void)argc; (void)argv;
+    ((StatusCursor *)pCur)->eof = 0;
+    return SQLITE_OK;
+}
+
+static int statusNext(sqlite3_vtab_cursor *pCur) {
+    ((StatusCursor *)pCur)->eof = 1;
+    return SQLITE_OK;
+}
+
+static int statusEof(sqlite3_vtab_cursor *pCur) {
+    return ((StatusCursor *)pCur)->eof;
+}
+
+static void statusResultHex(sqlite3_context *ctx, const unsigned char *p) {
+    char hex[HPPLITE_HASH_SIZE * 2 + 3];
+    hex[0] = '0'; hex[1] = 'x';
+    hpplite_to_hex(p, HPPLITE_HASH_SIZE, hex + 2);
+    sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
+}
+
+static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
+    StatusVtab *p = (StatusVtab *)pCur->pVtab;
+    HppliteNode *node = findNode(p->db);
+    unsigned char root[HPPLITE_HASH_SIZE];
+    if (!node || !node->ctx) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+    switch (col) {
+        case STATUS_COL_HEIGHT:
+            sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));
+            break;
+        case STATUS_COL_PENDING:
+            sqlite3_result_int(ctx, hpplite_pending_count(node->ctx));
+            break;
+        case STATUS_COL_STATE_ROOT:
+            hpplite_get_state_root(node->ctx, root);
+            statusResultHex(ctx, root);
+            break;
+        case STATUS_COL_PREV_BLOCK_HASH:
+            statusResultHex(ctx, node->ctx->prevBlockHash);
+            break;
+        case STATUS_COL_LAST_CHECKPOINT:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->lastCheckpointHeight);
+            break;
+        case STATUS_COL_LEASE:
+            sqlite3_result_int(ctx, node->hasLease);
+            break;
+        case STATUS_COL_LOG_ERRORS:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nLogErrors);
+            break;
+        default:
+            sqlite3_result_null(ctx);
+    }
+    return SQLITE_OK;
+}
+
+static int statusRowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid) {
+    (void)pCur;
+    *pRowid = 1;
+    return SQLITE_OK;
+}
+
+static sqlite3_module hpplite_status_module = {
+    0,                  /* iVersion */
+    0,                  /* xCreate: eponymous only */
+    statusConnect,
+    statusBestIndex,
+    statusDisconnect,
+    0,                  /* xDestroy */
+    statusOpen,
+    statusClose,
+    statusFilter,
+    statusNext,
+    statusEof,
+    statusColumn,
+    statusRowid,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+/*
+** Register a node with the global registry and set up the SQL surface:
+** hpplite_sync(), hpplite_flush() and the hpplite_status table.
 ** Called by hpplite_node_create() and hpplite_node_create_with_db().
 */
 void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
@@ -928,7 +1093,7 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
 
     entry->db = db;
     entry->node = node;
-    entry->config = NULL;  /* No config for direct node creation */
+    entry->config = NULL;  /* Filled in by hpplite_open() / auto-init */
     entry->next = g_nodeRegistry;
     g_nodeRegistry = entry;
 
@@ -937,17 +1102,26 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_sync_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
                             hpplite_flush_func, NULL, NULL);
+
+    /* Status table; touch it once so its instance lives until close */
+    if (sqlite3_create_module(db, "hpplite_status", &hpplite_status_module, NULL) == SQLITE_OK) {
+        sqlite3_exec(db, "SELECT * FROM hpplite_status LIMIT 0", NULL, NULL, NULL);
+    }
 }
 
 /*
-** Close hook callback - called automatically by sqlite3_close()
-** This performs all HPPLite cleanup before SQLite tears down the connection.
+** Connection close. Runs from the hpplite_status virtual table's xDisconnect,
+** which SQLite invokes at the start of sqlite3_close() / sqlite3_close_v2()
+** while the connection is still fully usable - the same point a close hook
+** in core would give us, without patching core.
 */
-static void hpplite_close_hook(void *pArg, sqlite3 *db) {
-    (void)pArg;  /* Unused - we look up node by db */
-
+static void hpplite_on_close(sqlite3 *db) {
     HppliteNode *node = findNode(db);
     if (!node) return;
+
+    /* Unregister first: the teardown below closes connections and must not
+    ** find this node again. */
+    removeNode(db);
 
     /*
     ** IMPORTANT: Set ownsDb to 0 because sqlite3_close() is already closing
@@ -958,8 +1132,9 @@ static void hpplite_close_hook(void *pArg, sqlite3 *db) {
 
     /* Destroy the node (stops timer, flushes pending, frees resources) */
     hpplite_node_destroy(node);
+}
 
-    /* Remove from registry */
+void hpplite_unregister_node(sqlite3 *db) {
     removeNode(db);
 }
 
@@ -1020,27 +1195,14 @@ sqlite3 *hpplite_open(const char *uri) {
 
     sqlite3 *db = node->db;
 
-    /* Add to registry */
-    NodeEntry *entry = calloc(1, sizeof(NodeEntry));
+    /* Node creation registered the connection; keep the config with it */
+    NodeEntry *entry = findEntry(db);
     if (!entry) {
         hpplite_config_free(config);
         hpplite_node_destroy(node);
         return NULL;
     }
-    entry->db = db;
-    entry->node = node;
     entry->config = config;  /* Store config for hpplite_get_config() */
-    entry->next = g_nodeRegistry;
-    g_nodeRegistry = entry;
-
-    /* Register SQL functions */
-    sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
-                            hpplite_sync_func, NULL, NULL);
-    sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
-                            hpplite_flush_func, NULL, NULL);
-
-    /* Register close hook for automatic cleanup */
-    sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
@@ -1053,9 +1215,8 @@ sqlite3 *hpplite_open(const char *uri) {
 
 int hpplite_close(sqlite3 *db) {
     /*
-    ** With the close hook registered, sqlite3_close() will automatically
-    ** trigger hpplite_close_hook() which handles all cleanup.
-    ** This function is kept for API compatibility.
+    ** sqlite3_close() disconnects the hpplite_status table, whose
+    ** xDisconnect performs the HPPLite shutdown. Kept for API compatibility.
     */
     return sqlite3_close(db);
 }
@@ -1204,27 +1365,14 @@ static int hpplite_auto_init(
         return SQLITE_OK;  /* Don't fail the open, just skip HPPLite */
     }
 
-    /* Add to registry */
-    NodeEntry *entry = calloc(1, sizeof(NodeEntry));
+    /* Node creation registered the connection; keep the config with it */
+    NodeEntry *entry = findEntry(db);
     if (!entry) {
         hpplite_config_free(config);
         hpplite_node_destroy(node);
         return SQLITE_OK;
     }
-    entry->db = db;
-    entry->node = node;
     entry->config = config;  /* Store config for hpplite_get_config() */
-    entry->next = g_nodeRegistry;
-    g_nodeRegistry = entry;
-
-    /* Register SQL functions */
-    sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
-                            hpplite_sync_func, NULL, NULL);
-    sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
-                            hpplite_flush_func, NULL, NULL);
-
-    /* Register close hook for automatic cleanup */
-    sqlite3_close_hook(db, hpplite_close_hook, NULL);
 
     /* Start auto-flush timer thread */
     hpplite_node_start_timer(node);
@@ -1232,8 +1380,9 @@ static int hpplite_auto_init(
     return SQLITE_OK;
 }
 
+#ifndef HPPLITE_EXTENSION
 /*
-** Auto-register HPPLite when the library is loaded.
+** Auto-register HPPLite when the library is linked in.
 ** This uses a constructor attribute so registration happens automatically
 ** before main() is called.
 */
@@ -1241,6 +1390,7 @@ __attribute__((constructor))
 static void hpplite_auto_register(void) {
     sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
 }
+#endif
 
 /*
 ** Register HPPLite as an auto-extension.
@@ -1263,21 +1413,55 @@ void hpplite_unregister(void) {
 }
 
 /*
-** Loadable extension entry point
+** Loadable extension entry point:
+**
+**   sqlite> .load ./hpplite
+**   sqlite> .open 'file:app.db?hpplite=on&l1=hpp-sepolia&privkey=0x...'
+**
+** or sqlite3_load_extension() from any program linked against stock SQLite.
+** Activates HPPLite on the loading connection if its URI asks for it, and
+** registers the auto-extension so later connections in the process get the
+** same treatment.
 */
 #ifdef HPPLITE_EXTENSION
-#include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+/*
+** SQLite unloads a loadable extension when the connection that loaded it is
+** closed. HPPLite registers an auto-extension and runs timer threads, so its
+** code must stay mapped for the life of the process: take an extra,
+** never-released reference to our own image.
+*/
+static void hpplite_pin_in_memory(void) {
+#ifdef _WIN32
+  HMODULE h;
+  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                     (LPCSTR)hpplite_pin_in_memory, &h);
+#else
+  Dl_info info;
+  if (dladdr((void*)hpplite_pin_in_memory, &info) && info.dli_fname) {
+    (void)dlopen(info.dli_fname, RTLD_NOW | RTLD_NODELETE);
+  }
+#endif
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
 int sqlite3_hpplite_init(
   sqlite3 *db,
   char **pzErrMsg,
   const sqlite3_api_routines *pApi
 ) {
   SQLITE_EXTENSION_INIT2(pApi);
-  (void)pzErrMsg;
-
-  /* For loadable extension, user must call hpplite_init() manually */
-  return SQLITE_OK;
+  hpplite_pin_in_memory();
+  sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
+  return hpplite_auto_init(db, pzErrMsg, pApi);
 }
 #endif

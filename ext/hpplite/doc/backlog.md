@@ -26,6 +26,14 @@
 - Factory auto-deploy on first open
 - Timer thread for time-based batch flushing
 
+### Zero-patch extension (issue #2)
+- `sqlite3_close_hook` core patch replaced by the `hpplite_status` eponymous
+  virtual table: its `xDisconnect` runs inside `sqlite3_close()` on stock SQLite
+- Loadable module `hpplite.dylib` / `.so` (`.load ./hpplite`), entry point
+  `sqlite3_hpplite_init`, pinned in memory, auto-extension for later connections
+- `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
+  links only stock SQLite and loads the module
+
 ### Durability (issue #6)
 - Pending SQL in `_hpplite_pending`, written inside the user's transaction
 - `_hpplite_meta` for height / prev hash / root / checkpoint
@@ -62,13 +70,18 @@ See [architecture.md](architecture.md) for details.
 
 ## Upstream Tracking
 
-The `hpplite` branch sits on an upstream SQLite **release tag** (currently `version-3.54.1`, recorded in `patches/UPSTREAM_BASE`) with exactly one core commit at the bottom (`sqlite3_close_hook`, exported to `patches/`) and all extension commits above it. Move to a new release with:
+HPPLite needs **no SQLite core patches** (issue #2): it is a plain extension
+and also builds as a loadable module against any stock amalgamation >= 3.24
+(`cmake -DHPPLITE_SQLITE_SRC=...`, then `.load ./hpplite`). The `hpplite`
+branch sits on an upstream SQLite **release tag** (currently
+`version-3.54.1`, recorded in `patches/UPSTREAM_BASE`) with only
+`ext/hpplite/` commits above it. Move to a new release with:
 
 ```bash
 ext/hpplite/tools/sync_upstream.sh version-3.55.0
 ```
 
-Rebase, never merge, so `git log version-X..hpplite` always answers "what did we change". Long-term goal is zero core patches (loadable extension against stock SQLite) — see GitHub issue #2.
+Rebase, never merge, so `git log version-X..hpplite` always answers "what did we change".
 
 ---
 

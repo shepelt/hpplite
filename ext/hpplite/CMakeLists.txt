@@ -7,6 +7,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Options
 option(HPPLITE_BUILD_TESTS "Build test executables" ON)
 option(HPPLITE_USE_REAL_L1 "Use real Ethereum L1 (vs mock)" OFF)
+option(HPPLITE_BUILD_EXTENSION "Build the loadable extension (hpplite.so/.dylib)" ON)
+set(HPPLITE_SQLITE_SRC "" CACHE PATH
+    "Directory holding a stock SQLite amalgamation (sqlite3.c, sqlite3.h, sqlite3ext.h). Default: ../../build of the parent tree")
 
 # Find dependencies
 find_package(PkgConfig REQUIRED)
@@ -18,16 +21,21 @@ pkg_check_modules(CURL REQUIRED libcurl)
 # Find threads
 find_package(Threads REQUIRED)
 
-# SQLite paths (use pre-built from parent directory)
+# SQLite amalgamation. HPPLite needs no SQLite patches and no non-default
+# compile options; any amalgamation >= 3.24 works. By default the one built
+# in the parent tree is used (cd build && ../configure && make sqlite3.c).
 set(SQLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-set(SQLITE_BUILD_DIR "${SQLITE_DIR}/build")
+if(HPPLITE_SQLITE_SRC)
+    set(SQLITE_BUILD_DIR "${HPPLITE_SQLITE_SRC}")
+else()
+    set(SQLITE_BUILD_DIR "${SQLITE_DIR}/build")
+endif()
 
-# Check SQLite exists
 if(NOT EXISTS "${SQLITE_BUILD_DIR}/sqlite3.c")
     message(FATAL_ERROR
         "SQLite amalgamation not found at ${SQLITE_BUILD_DIR}/sqlite3.c\n"
-        "Please build SQLite first:\n"
-        "  cd ${SQLITE_DIR}/build && ../configure && make sqlite3.c"
+        "Either build the parent tree (cd ${SQLITE_DIR}/build && ../configure && make sqlite3.c)\n"
+        "or point HPPLITE_SQLITE_SRC at a directory with sqlite3.c/sqlite3.h/sqlite3ext.h"
     )
 endif()
 
@@ -36,11 +44,9 @@ add_library(sqlite3 STATIC
     ${SQLITE_BUILD_DIR}/sqlite3.c
 )
 target_include_directories(sqlite3 PUBLIC
-    ${SQLITE_DIR}
     ${SQLITE_BUILD_DIR}
 )
 target_compile_definitions(sqlite3 PUBLIC
-    SQLITE_ENABLE_PREUPDATE_HOOK
     SQLITE_THREADSAFE=1
 )
 target_link_libraries(sqlite3 PUBLIC
@@ -82,10 +88,6 @@ target_include_directories(hpplite PUBLIC
     ${CURL_INCLUDE_DIRS}
 )
 
-target_compile_definitions(hpplite PUBLIC
-    SQLITE_ENABLE_PREUPDATE_HOOK
-)
-
 target_link_libraries(hpplite PUBLIC
     sqlite3
     ${SECP256K1_LIBRARIES}
@@ -96,6 +98,34 @@ target_link_directories(hpplite PUBLIC
     ${SECP256K1_LIBRARY_DIRS}
     ${CURL_LIBRARY_DIRS}
 )
+
+# Loadable extension: the same sources, every sqlite3_* call routed through
+# the host's sqlite3_api_routines (HPPLITE_EXTENSION), no SQLite linked in.
+#   sqlite> .load ./hpplite
+if(HPPLITE_BUILD_EXTENSION)
+    add_library(hpplite_ext MODULE ${HPPLITE_SOURCES})
+    set_target_properties(hpplite_ext PROPERTIES OUTPUT_NAME hpplite PREFIX "")
+    if(APPLE)
+        set_target_properties(hpplite_ext PROPERTIES SUFFIX ".dylib")
+    endif()
+    target_include_directories(hpplite_ext PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/eth
+        ${SQLITE_BUILD_DIR}
+        ${SECP256K1_INCLUDE_DIRS}
+        ${CURL_INCLUDE_DIRS}
+    )
+    target_compile_definitions(hpplite_ext PRIVATE HPPLITE_EXTENSION)
+    target_link_libraries(hpplite_ext PRIVATE
+        Threads::Threads
+        ${SECP256K1_LIBRARIES}
+        ${CURL_LIBRARIES}
+    )
+    target_link_directories(hpplite_ext PRIVATE
+        ${SECP256K1_LIBRARY_DIRS}
+        ${CURL_LIBRARY_DIRS}
+    )
+endif()
 
 # Test executables
 if(HPPLITE_BUILD_TESTS)
@@ -129,6 +159,16 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_durability hpplite)
     endif()
 
+    # Loadable extension against stock SQLite: links only the amalgamation,
+    # loads hpplite.so/.dylib at runtime
+    if(HPPLITE_BUILD_EXTENSION)
+        add_executable(test_loadable tests/unit/test_loadable.c)
+        target_link_libraries(test_loadable sqlite3)
+        target_compile_definitions(test_loadable PRIVATE
+            HPPLITE_EXT_PATH="$<TARGET_FILE:hpplite_ext>")
+        add_dependencies(test_loadable hpplite_ext)
+    endif()
+
     # Web3 primitive tests (eth/ subdirectory - no network required)
     add_executable(test_keccak eth/test_keccak.c eth/keccak256.c)
     add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
@@ -157,6 +197,9 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
+    if(HPPLITE_BUILD_EXTENSION)
+        add_test(NAME test_loadable COMMAND test_loadable)
+    endif()
 
     # Mock L1 tests - only register when not using real L1
     if(NOT HPPLITE_USE_REAL_L1)
@@ -193,7 +236,8 @@ endif()
 # Print configuration
 message(STATUS "")
 message(STATUS "HPPLite Configuration:")
-message(STATUS "  SQLite dir: ${SQLITE_DIR}")
+message(STATUS "  SQLite amalgamation: ${SQLITE_BUILD_DIR}")
+message(STATUS "  Loadable extension: ${HPPLITE_BUILD_EXTENSION}")
 message(STATUS "  secp256k1: ${SECP256K1_LIBRARIES}")
 message(STATUS "  libcurl: ${CURL_LIBRARIES}")
 message(STATUS "  Real L1: ${HPPLITE_USE_REAL_L1}")

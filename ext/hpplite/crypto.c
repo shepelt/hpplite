@@ -3,7 +3,7 @@
 */
 
 #include "crypto.h"
-#include "sqlite3.h"
+#include "hpplite_sqlite.h"
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
 #include <string.h>

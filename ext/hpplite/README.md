@@ -48,6 +48,7 @@ sqlite3_close(db);
 - **On-Chain DA** - Full batch data stored on L1 for reconstruction
 - **On-Demand Verification** - Anyone can verify state from L1 data
 - **State Reconstruction** - Rebuild entire database from L1 alone
+- **Stock SQLite** - No core patches; builds as a loadable extension (`.load ./hpplite`) against any SQLite >= 3.24
 - **Nothing to Lose** - Pending SQL lives in the database file itself, written inside your own transactions; a crash or a failed L1 submission never loses or duplicates a batch
 
 ## Why Singleton Sequencer?
@@ -88,20 +89,39 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 
 ## Building
 
+HPPLite is an ordinary SQLite extension: **no patches to SQLite, no special
+compile options**, any amalgamation from 3.24 on. Two ways to use it.
+
+**As a loadable extension** (`hpplite.dylib` / `hpplite.so`) against the
+SQLite you already have:
+
 ```bash
-# Prerequisites
 brew install libsecp256k1 curl pkg-config  # macOS
 # apt install libsecp256k1-dev libcurl4-openssl-dev  # Linux
 
-# Build SQLite first (from repo root)
-mkdir build && cd build
-../configure && make sqlite3.c
+cmake -S ext/hpplite -B build -DHPPLITE_USE_REAL_L1=ON \
+      -DHPPLITE_SQLITE_SRC=/path/to/sqlite-amalgamation   # dir with sqlite3.c/.h/ext.h
+cmake --build build
+```
 
-# Build HPPLite
-cd ext/hpplite
-mkdir build && cd build
-cmake .. -DHPPLITE_USE_REAL_L1=ON
-make
+```
+sqlite> .load ./build/hpplite
+sqlite> .open 'file:app.db?hpplite=on&l1=hpp-sepolia&privkey=0x...'
+sqlite> CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+sqlite> INSERT INTO users VALUES(1,'alice');
+sqlite> SELECT * FROM hpplite_status;      -- height, pending, state_root, ...
+sqlite> SELECT hpplite_flush();            -- or just wait for the interval / close
+```
+
+Programs call `sqlite3_load_extension()` once; every later connection in the
+process that opens with `?hpplite=on` is handled automatically.
+
+**Statically linked** with the SQLite built in this tree (what the tests use):
+
+```bash
+mkdir build && cd build && ../configure && make sqlite3.c   # from repo root
+cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_USE_REAL_L1=ON
+cmake --build ext/hpplite/build_real
 ```
 
 ## Testing
@@ -138,7 +158,7 @@ export HPPLITE_PRIVATE_KEY=0x...
 
 | File | Description |
 |------|-------------|
-| `hpplite.c` | Statement capture into `_hpplite_pending`, content-hash state root, batch build/finalize/replay, transparent API |
+| `hpplite.c` | Statement capture into `_hpplite_pending`, content-hash state root, batch build/finalize/replay, `hpplite_status` table, transparent API, extension entry point |
 | `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
 | `batch.c` | Batch creation and serialization |
 | `crypto.c` | secp256k1 signing |
