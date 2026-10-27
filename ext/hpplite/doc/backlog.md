@@ -52,6 +52,18 @@ See [architecture.md](architecture.md) for details.
 
 ---
 
+## Upstream Tracking
+
+The `hpplite` branch sits on an upstream SQLite **release tag** (currently `version-3.54.1`, recorded in `patches/UPSTREAM_BASE`) with exactly one core commit at the bottom (`sqlite3_close_hook`, exported to `patches/`) and all extension commits above it. Move to a new release with:
+
+```bash
+ext/hpplite/tools/sync_upstream.sh version-3.55.0
+```
+
+Rebase, never merge, so `git log version-X..hpplite` always answers "what did we change". Long-term goal is zero core patches (loadable extension against stock SQLite) — see GitHub issue #2.
+
+---
+
 ## M4: Verify CLI (Next)
 
 One-click verification from L1 data:
@@ -142,6 +154,8 @@ ext/hpplite/
 │   ├── unit/            # Mock L1 tests
 │   └── integration/     # Real L1 tests
 ├── examples/            # Usage examples
+├── patches/             # The one SQLite core patch + UPSTREAM_BASE
+├── tools/               # sync_upstream.sh
 └── doc/                 # Documentation
     ├── architecture.md
     └── backlog.md
