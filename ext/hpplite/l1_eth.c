@@ -52,6 +52,7 @@ static uint8_t SEL_GET_DA_STATE[4];
 /* Function selectors - HPPLiteFactory contract */
 static uint8_t SEL_GET_ROLLUP[4];
 static uint8_t SEL_HAS_ROLLUP[4];
+static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
 static uint8_t SEL_CREATE_SIMPLE_ROLLUP[4];
 
@@ -69,6 +70,7 @@ static void init_selectors(void) {
     abi_function_selector("renewLease(bytes32)", SEL_RENEW_LEASE);
     abi_function_selector("submitCheckpoint(bytes32,uint256,uint256,bytes32)", SEL_SUBMIT_CHECKPOINT);
     abi_function_selector("isLeaseActive()", SEL_IS_LEASE_ACTIVE);
+    abi_function_selector("forceExpireLease()", SEL_FORCE_EXPIRE_LEASE);
     abi_function_selector("getSystemConfig()", SEL_GET_SYSTEM_CONFIG);
 
     /* HPPLiteDA selectors (data availability) */
@@ -382,6 +384,22 @@ char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
 
     /* Send transaction */
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 100000, 0);
+    if (!tx_hash) return NULL;
+
+    char *hash_hex = eth_hex_encode(tx_hash, 32);
+    free(tx_hash);
+    return hash_hex;
+}
+
+char *hpplite_l1_release_lease(HppliteL1 *l1) {
+    if (!l1 || !l1->has_privkey) return NULL;
+    init_selectors();
+
+    /* Build calldata: forceExpireLease() - owner only */
+    uint8_t calldata[4];
+    memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
+
+    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
 
     char *hash_hex = eth_hex_encode(tx_hash, 32);

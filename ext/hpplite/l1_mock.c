@@ -57,6 +57,7 @@ struct HppliteL1 {
     void *callbackArg;
 
     /* Batch DA storage */
+    int failSubmit;              /* Test hook: reject batch submissions */
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
@@ -235,6 +236,17 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
 }
 
 /*
+** Release the lease (owner expires it)
+*/
+char *hpplite_l1_release_lease(HppliteL1 *l1) {
+    if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
+    l1->leaseExpiry = l1->currentTimestamp;
+    return sqlite3_mprintf("0x%08x%08x",
+        (unsigned int)(l1->currentBlock),
+        (unsigned int)(l1->currentTimestamp));
+}
+
+/*
 ** Get remaining lease time
 */
 uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
@@ -406,6 +418,10 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
 
 /* === Mock-specific functions for testing === */
 
+void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
+    if (l1) l1->failSubmit = fail;
+}
+
 void hpplite_l1_mock_set_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
     if (!l1 || !pubkey) return;
 
@@ -529,6 +545,7 @@ char *hpplite_l1_submit_batch(
 ) {
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
+    if (l1->failSubmit) return NULL;
 
     /* Verify instanceId matches active lease */
     if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {

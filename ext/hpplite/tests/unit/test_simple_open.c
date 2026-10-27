@@ -135,10 +135,6 @@ int main(void) {
             FAIL("sqlite3_exec failed");
         }
 
-        /* Debug: check changes count */
-        int changes = ctx->nChanges;
-        printf("(changes=%d) ", changes);
-
         unsigned char root2[HPPLITE_HASH_SIZE];
         hpplite_state_root(db, root2);
 

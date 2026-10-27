@@ -26,6 +26,14 @@
 - Factory auto-deploy on first open
 - Timer thread for time-based batch flushing
 
+### Durability (issue #6)
+- Pending SQL in `_hpplite_pending`, written inside the user's transaction
+- `_hpplite_meta` for height / prev hash / root / checkpoint
+- Content-hash state root (`hpplite_db_hash`)
+- Retry-safe flush: adopt batches already on L1, keep pending on failure
+- Bookkeeping connection + WAL; lease released on close
+- Bound parameters expanded in captured SQL
+
 ### Testing
 - Unit tests with mock L1
 - Integration tests with real L1 (HPP Sepolia)
@@ -96,6 +104,7 @@ This is the "ability to verify" that provides security without running 24/7 node
 - [ ] Fraud proof generation
 
 ### Light Clients
+- [ ] Incremental state root (per-table Merkle) instead of full content scan per flush
 - [ ] Merkle proofs for state queries
 - [ ] Verify specific rows without full replay
 - [ ] Mobile-friendly verification

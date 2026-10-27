@@ -67,9 +67,11 @@ typedef struct HppliteNode {
 
     /* Instance ID for lease (unique per process) */
     unsigned char instanceId[32];
+    int hasLease;                   /* We claimed the lease and have not released it */
 
     /* Database and context */
     sqlite3 *db;
+    sqlite3 *bkDb;                  /* Bookkeeping connection (NULL for :memory:) */
     HppliteCtx *ctx;
 
     /* L1 connection */
@@ -97,7 +99,6 @@ typedef struct HppliteNode {
     void *flushMutex;               /* pthread_mutex_t */
     volatile int timerRunning;
     int64_t lastFlushTime;
-    unsigned char lastFlushedRoot[HPPLITE_HASH_SIZE];
 
     /* Ownership flags */
     int ownsDb;
@@ -145,6 +146,13 @@ int hpplite_node_claim_lease(HppliteNode *node);
 int hpplite_node_renew_lease(HppliteNode *node);
 
 /*
+** Release our sequencer lease on L1 (called on graceful shutdown so a
+** restart does not have to wait for the lease to expire).
+** Returns 0 on success, -1 on failure.
+*/
+int hpplite_node_release_lease(HppliteNode *node);
+
+/*
 ** Check if our lease is still active.
 ** Returns 1 if active, 0 if expired/not held.
 */
@@ -167,9 +175,20 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg);
 
 /*
 ** Flush pending SQL to create a batch and post to L1.
-** Returns the batch height, or 0 if no pending SQL.
+** Returns the batch height, or 0 if nothing was pending or the batch could
+** not be confirmed on L1 (pending rows are kept and retried later).
 */
 uint64_t hpplite_node_flush_batch(HppliteNode *node);
+
+/*
+** Bring the local database up to date with L1: batches already on L1 that
+** match local pending rows are finalized; batches beyond local history are
+** replayed. With useTxn, each transaction group is replayed in its own
+** transaction (use 0 when called from inside a statement).
+** Returns the number of batches processed, or -1 if local and L1 history
+** have diverged.
+*/
+int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn);
 
 /*
 ** Get number of pending SQL statements.

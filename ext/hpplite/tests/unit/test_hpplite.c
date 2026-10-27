@@ -21,9 +21,8 @@ static void print_hash(const char *label, unsigned char *hash) {
 
 /* Callback for commit notifications */
 static void on_commit(void *arg, unsigned char *stateRoot, int nChanges) {
-  (void)arg;
-  printf("COMMIT: %d changes\n", nChanges);
-  print_hash("New state root", stateRoot);
+  (void)arg; (void)stateRoot; (void)nChanges;
+  printf("  [commit hook fired]\n");
 }
 
 /* Callback for rollback notifications */

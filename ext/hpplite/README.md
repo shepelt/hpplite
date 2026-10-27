@@ -48,6 +48,7 @@ sqlite3_close(db);
 - **On-Chain DA** - Full batch data stored on L1 for reconstruction
 - **On-Demand Verification** - Anyone can verify state from L1 data
 - **State Reconstruction** - Rebuild entire database from L1 alone
+- **Nothing to Lose** - Pending SQL lives in the database file itself, written inside your own transactions; a crash or a failed L1 submission never loses or duplicates a batch
 
 ## Why Singleton Sequencer?
 
@@ -137,8 +138,8 @@ export HPPLITE_PRIVATE_KEY=0x...
 
 | File | Description |
 |------|-------------|
-| `hpplite.c` | Core state tracking, transparent API |
-| `node.c` | Node lifecycle, L1 sync, batch management |
+| `hpplite.c` | Statement capture into `_hpplite_pending`, content-hash state root, batch build/finalize/replay, transparent API |
+| `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
 | `batch.c` | Batch creation and serialization |
 | `crypto.c` | secp256k1 signing |
 | `config.c` | URI parsing, configuration |
@@ -180,7 +181,8 @@ No need to run 24/7 nodes. The ability to verify is the security guarantee.
 ## Roadmap
 
 ### Completed
-- [x] SQLite state tracking with Merkle roots
+- [x] Content-hash state roots (recomputable from the file by anyone)
+- [x] Crash-safe pending log inside the database file
 - [x] Batch creation and signing
 - [x] L1 checkpoint anchoring
 - [x] Factory-based deployment
@@ -194,6 +196,21 @@ No need to run 24/7 nodes. The ability to verify is the security guarantee.
 - [ ] Challenge/fraud proof submission
 - [ ] Light client mode (Merkle proofs only)
 - [ ] Read replicas (opt-in stale reads for scale)
+
+## Durability
+
+HPPLite keeps no state outside your database file. Captured SQL goes into
+`_hpplite_pending` from inside your own transaction (rolled back with it,
+committed with it); height and roots go into `_hpplite_meta` once a batch is
+confirmed on L1. Kill the process at any point and reopen: pending SQL
+flushes, height continues, nothing is replayed twice. A batch that L1 does
+not confirm stays pending and is retried at the same height.
+
+File databases are switched to WAL mode on open (bookkeeping runs on a
+second connection) and get a 5 s busy timeout. In-memory databases work
+too, with bookkeeping on the same connection.
+
+See [doc/architecture.md](doc/architecture.md#local-durability).
 
 ## Security Model
 

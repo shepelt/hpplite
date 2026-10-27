@@ -207,9 +207,20 @@ static int test_continue(sqlite3 *db) {
         NULL, NULL, NULL);
     if (rc != SQLITE_OK) FAIL("INSERT after reconstruct failed");
 
-    /* Flush again */
+    /* Flush again - must be confirmed on L1, at the next height */
     uint64_t height = hpplite_flush(db);
     printf("  New batch at height: %llu\n", (unsigned long long)height);
+    if (height != 2) FAIL("Second batch was not confirmed on L1 at height 2");
+
+    HppliteL1 *l1 = hpplite_get_l1(db);
+    uint64_t last_batch = 0, total = 0;
+    unsigned char hash[32];
+    if (!l1 || hpplite_l1_get_da_state(l1, &last_batch, &total, hash) != 0) {
+        FAIL("Could not get L1 DA state");
+    }
+    printf("  L1 state: last_batch=%llu, total=%llu\n",
+           (unsigned long long)last_batch, (unsigned long long)total);
+    if (last_batch != 2) FAIL("L1 does not hold batch 2");
 
     int rows = count_rows(db, "items");
     printf("  Total rows: %d\n", rows);

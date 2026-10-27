@@ -23,6 +23,7 @@ typedef struct HppliteTxn HppliteTxn;
 struct HppliteTxn {
   char *zSql;              /* SQL statement */
   int64_t nRowsAffected;   /* Number of rows affected (-1 if unknown) */
+  int64_t txn;             /* Transaction group within the batch (0, 1, ...) */
 };
 
 /*
@@ -72,9 +73,15 @@ HppliteBatch *hpplite_batch_new(uint64_t height);
 void hpplite_batch_free(HppliteBatch *pBatch);
 
 /*
-** Add a transaction to a batch
+** Add a statement to a batch as its own transaction group
 */
 int hpplite_batch_add_txn(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected);
+
+/*
+** Add a statement to a batch with an explicit transaction group.
+** Statements sharing a group are replayed inside one transaction.
+*/
+int hpplite_batch_add_stmt(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected, int64_t txn);
 
 /*
 ** Set pre-state root

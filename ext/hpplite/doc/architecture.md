@@ -118,14 +118,72 @@ The sequencer is the single node that:
 ```c
 // Client connects directly to sequencer
 sqlite3_open_v2(
-    "file:myapp.db?hpplite=on&rpc=https://sepolia.hpp.io"
-    "&factory=0x51cD...&privkey=0x...",
+    "file:myapp.db?hpplite=on&l1=hpp-sepolia&privkey=0x...",
     &db, ...);
 
 // All reads and writes go to sequencer
 sqlite3_exec(db, "INSERT INTO ...", ...);  // Batched, submitted to L1
 sqlite3_exec(db, "SELECT ...", ...);        // Strong consistency
 ```
+
+### Local Durability
+
+The local SQLite file is the only durable state HPPLite keeps. Nothing
+lives only in memory, so a crash at any point loses nothing and a restart
+needs no special recovery:
+
+| Table | Holds | Written |
+|-------|-------|---------|
+| `_hpplite_pending` | SQL of every committed write, in order, grouped by transaction | From inside the user's own statement, so the row commits or rolls back **with** the user's transaction |
+| `_hpplite_meta` | Next batch height, previous block hash, state root after the last confirmed batch, checkpoint progress | When a batch is confirmed on L1 |
+
+How a statement gets logged: SQLite's statement trace fires at the start of
+every statement on the connection. HPPLite inserts the statement text (with
+bound parameters expanded) into `_hpplite_pending` through the same
+connection. Because the insert runs inside the statement's own transaction
+(implicit or explicit), a failed statement or a `ROLLBACK` discards the log
+row too. No separate journal, no sync interval, no durability model beyond
+SQLite's own.
+
+Flushing a batch:
+
+```
+1. If L1 already holds a batch at our next height, it was produced from our
+   pending rows by an earlier attempt (crash after submit, lost RPC reply):
+   adopt it - delete those rows, advance meta.
+2. Read pending rows and compute the post-state root in one snapshot.
+3. Submit to L1 and wait for the transaction.
+4. Confirmed  -> delete the rows, advance height / prev hash / root (one txn).
+   Not confirmed -> leave everything; retry next interval at the same height.
+```
+
+Bookkeeping (steps 1, 2, 4) runs on a second connection to the same file,
+so the background flush never touches the application's transaction state.
+File databases are switched to WAL and both connections get a 5 s busy
+timeout; readers and the writer then never block each other.
+
+Reopening a file continues at the recorded height. If L1 is ahead (a fresh
+file, or history written elsewhere), the missing batches are replayed with
+tracking disabled and are not logged again. If local pending SQL and the
+batch on L1 disagree, the node refuses to continue rather than fork.
+
+On graceful close the sequencer lease is released (`forceExpireLease`, the
+wallet owns its rollup). After a crash the old lease blocks submission until
+it expires (5 minutes); writes keep accumulating in `_hpplite_pending` and
+flush once the lease is free.
+
+### State Root
+
+The state root is a **content hash** of all user tables: SHA-256 over the
+schema entries (type, name, table, SQL) and every row of every table in
+rowid order, with typed values. `sqlite_*` and `_hpplite_*` tables are
+excluded; a database with no user schema has the zero root.
+
+It is a function of the file, not of the history that produced it. Two
+databases with the same content have the same root whatever statements
+built them, and anyone holding a reconstructed database can recompute it
+(`hpplite_db_hash()`) and compare with what the sequencer posted. Batches
+carry the root before and after; checkpoints anchor it on L1.
 
 ### L1 Contract
 
@@ -150,11 +208,14 @@ Anyone can verify the entire chain:
 
 ```
 1. Fetch all batches from L1
-2. Replay SQL in order
-3. Compute state roots
-4. Compare against checkpointed roots
+2. Replay SQL in order (each batch's transaction groups as transactions)
+3. Compute the content hash after each batch
+4. Compare against the batch's posted root and checkpointed roots
 5. If mismatch → fraud detected
 ```
+
+Replay already does step 3-4 and warns on mismatch; `hpplite verify`
+packages it as a command.
 
 This doesn't require running a node 24/7. It's an on-demand audit.
 

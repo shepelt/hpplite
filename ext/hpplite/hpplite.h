@@ -1,8 +1,22 @@
 /*
-** HPPLite - State Root Tracking for SQLite
+** HPPLite - Verifiable SQLite
 **
-** This extension provides deterministic state root computation
-** for SQLite databases, enabling L2 blockchain integration.
+** Tracks every write made through a connection, batches the SQL, and posts
+** the batches to an L1 contract for data availability. Anyone can rebuild
+** the database from L1 alone and check the resulting state root.
+**
+** The local database file is the only durable state HPPLite keeps:
+**
+**   _hpplite_pending  SQL captured by the statement trace. The row is written
+**                     from inside the user's own statement, so it commits or
+**                     rolls back together with the user's transaction. Rows
+**                     are deleted once the batch they belong to is confirmed.
+**   _hpplite_meta     Next batch height, previous block hash, the state root
+**                     after the last confirmed batch, and checkpoint tracking.
+**
+** The state root is a content hash of all user tables (schema + rows). It is a
+** function of the file, not of the path taken to produce it, so it can be
+** recomputed at any time and compared against what was posted to L1.
 */
 
 #ifndef HPPLITE_H
@@ -10,6 +24,7 @@
 
 #include "sqlite3.h"
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,86 +35,82 @@ extern "C" {
 */
 #define HPPLITE_HASH_SIZE 32
 
-/*
-** Row change types
-*/
-#define HPPLITE_INSERT 1
-#define HPPLITE_UPDATE 2
-#define HPPLITE_DELETE 3
-
-/*
-** A single row change tracked during a transaction
-*/
-typedef struct HppliteChange HppliteChange;
-struct HppliteChange {
-  HppliteChange *pNext;      /* Next change in list */
-  int op;                     /* HPPLITE_INSERT, UPDATE, or DELETE */
-  char *zDb;                  /* Database name */
-  char *zTable;               /* Table name */
-  sqlite3_int64 iRowid;       /* Rowid of affected row */
-  unsigned char *pOldData;    /* Serialized old row (UPDATE/DELETE) */
-  int nOldData;               /* Size of old data */
-  unsigned char *pNewData;    /* Serialized new row (INSERT/UPDATE) */
-  int nNewData;               /* Size of new data */
-};
-
-/*
-** Pending SQL transaction in the mempool
-*/
-typedef struct HpplitePendingSql HpplitePendingSql;
-struct HpplitePendingSql {
-  HpplitePendingSql *pNext;   /* Next in list */
-  char *zSql;                 /* SQL statement */
-  int nRowsAffected;          /* Rows affected by this statement */
-};
+/* Forward declaration for batch */
+struct HppliteBatch;
 
 /*
 ** HPPLite context attached to a database connection
 */
 typedef struct HppliteCtx HppliteCtx;
 struct HppliteCtx {
-  sqlite3 *db;                /* Database connection */
-  HppliteChange *pChanges;    /* List of changes in current transaction */
-  HppliteChange *pLast;       /* Last change in list */
-  int nChanges;               /* Number of changes */
-  unsigned char stateRoot[HPPLITE_HASH_SIZE];  /* Current state root */
+  sqlite3 *db;                /* Application connection: trace + pending log */
+  sqlite3 *bkDb;              /* Bookkeeping connection (== db for :memory:) */
   int bEnabled;               /* Tracking enabled flag */
+  int bInternal;              /* Set while HPPLite runs its own statements */
+  uint64_t txnSeq;            /* Groups pending SQL by transaction */
+  sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
 
-  /* Block building state */
-  uint64_t blockHeight;       /* Current block height (next block to produce) */
-  unsigned char prevBlockHash[HPPLITE_HASH_SIZE]; /* Hash of previous block */
-  unsigned char preStateRoot[HPPLITE_HASH_SIZE];  /* State root at block start */
-  HpplitePendingSql *pPending;  /* Pending SQL (mempool) */
-  HpplitePendingSql *pPendingLast; /* Last pending SQL */
-  int nPending;               /* Number of pending SQL statements */
-  int bInBlock;               /* Currently building a block */
+  /* Mirror of _hpplite_meta (the row in the database is authoritative) */
+  uint64_t blockHeight;       /* Next batch height to produce */
+  unsigned char prevBlockHash[HPPLITE_HASH_SIZE];
+  unsigned char stateRoot[HPPLITE_HASH_SIZE];  /* Root after last confirmed batch */
+  uint64_t lastCheckpointHeight;
+  unsigned char lastCheckpointRoot[HPPLITE_HASH_SIZE];
+
+  /* Cached content hash of the committed state */
+  unsigned char curRoot[HPPLITE_HASH_SIZE];
+  int bRootDirty;
+
+  uint64_t nLogErrors;        /* Statements that could not be logged */
 
   /* Callbacks for external integration */
   void *pCallbackArg;
-  void (*xOnCommit)(void*, unsigned char*, int);  /* Called on commit with new state root */
-  void (*xOnRollback)(void*);                     /* Called on rollback */
+  void (*xOnCommit)(void*, unsigned char*, int);  /* root is NULL; use hpplite_get_state_root() */
+  void (*xOnRollback)(void*);
 };
 
 /*
 ** Initialize HPPLite tracking on a database connection.
+** Creates _hpplite_meta / _hpplite_pending if missing and installs hooks.
 ** Returns SQLITE_OK on success.
 */
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
 
 /*
 ** Shutdown HPPLite tracking and free resources.
+** Does not close db or the bookkeeping connection.
 */
 void hpplite_shutdown(HppliteCtx *pCtx);
 
 /*
-** Enable/disable state tracking.
+** Use a second connection to the same file for bookkeeping (reading pending
+** rows, computing roots, finalizing batches). This keeps the flush path off
+** the application's connection, so a background flush never interferes with
+** the application's transaction. Pass NULL to fall back to the main connection.
+*/
+int hpplite_set_bookkeeping_db(HppliteCtx *pCtx, sqlite3 *bkDb);
+
+/*
+** Enable/disable tracking.
 */
 void hpplite_enable(HppliteCtx *pCtx, int bEnable);
 
 /*
-** Get current state root (32 bytes).
+** Current state root (32 bytes): content hash of committed user tables.
+** All zeros for a database with no user schema.
 */
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut);
+
+/*
+** Content hash of any connection's main database, same definition as the
+** state root. Excludes sqlite_* and _hpplite_* tables.
+*/
+int hpplite_db_hash(sqlite3 *db, unsigned char *pOut);
+
+/*
+** SHA-256 helper (used for state roots, block hashes, batch identity).
+*/
+void hpplite_sha256(const uint8_t *data, size_t len, uint8_t *out);
 
 /*
 ** Set callbacks for commit/rollback notifications.
@@ -112,43 +123,13 @@ void hpplite_set_callbacks(
 );
 
 /*
-** Get list of changes in current transaction.
-** Returns number of changes.
-*/
-int hpplite_get_changes(HppliteCtx *pCtx, HppliteChange **ppChanges);
-
-/*
-** Compute state root from a list of changes.
-** This is a pure function for testing/verification.
-*/
-void hpplite_compute_state_root(
-  unsigned char *pPrevRoot,    /* Previous state root (32 bytes) */
-  HppliteChange *pChanges,     /* List of changes */
-  unsigned char *pNewRoot      /* Output: new state root (32 bytes) */
-);
-
-/*
-** Serialize the current transaction changes to a buffer.
-** Caller must free the returned buffer with sqlite3_free().
-*/
-unsigned char *hpplite_serialize_changes(
-  HppliteCtx *pCtx,
-  int *pnSize                  /* Output: size of serialized data */
-);
-
-/*
 ** ============================================================================
 ** Block Builder API (Sequencer-style)
 ** ============================================================================
 */
 
-/* Forward declaration for batch */
-struct HppliteBatch;
-
 /*
-** Execute SQL and track it for the current block.
-** This is the main entry point for sequencers.
-** Returns SQLITE_OK on success, error code on failure.
+** Execute SQL (tracked like any other statement on the connection).
 */
 int hpplite_exec(
   HppliteCtx *pCtx,
@@ -168,38 +149,65 @@ int hpplite_exec_cb(
 );
 
 /*
-** Flush pending SQL into a batch (creates a block).
-** Returns NULL if no pending transactions.
-** Caller must free returned batch with hpplite_batch_free().
+** Build a batch from the committed pending SQL. Has no side effects: the
+** pending rows stay until hpplite_finalize_batch(). *pMaxId receives the id of
+** the last pending row included. Returns NULL if nothing is pending.
+*/
+struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId);
+
+/*
+** Mark a batch confirmed: delete its pending rows (id <= maxId) and advance
+** height / previous block hash / state root in _hpplite_meta, atomically.
+*/
+int hpplite_finalize_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch, sqlite3_int64 maxId);
+
+/*
+** Build and immediately finalize a batch (no L1). Returns NULL if nothing
+** is pending. Caller must free returned batch with hpplite_batch_free().
 */
 struct HppliteBatch *hpplite_flush_block(HppliteCtx *pCtx);
 
 /*
-** Get number of pending transactions in mempool.
+** Apply a batch fetched from L1 with tracking disabled, then advance meta.
+** The batch height must equal the current block height. With useTxn, each
+** transaction group in the batch is applied in its own transaction.
+** Returns SQLITE_OK, SQLITE_DONE if already applied, or an error code.
+*/
+int hpplite_replay_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch, int useTxn);
+
+/*
+** A batch at the current height already exists on L1 and was produced from
+** this file's pending rows (e.g. the process died after submitting but before
+** finalizing). If the batch's SQL matches the first pending rows, finalize
+** them. Returns SQLITE_OK on adoption, SQLITE_MISMATCH if the batch was not
+** produced from these pending rows.
+*/
+int hpplite_adopt_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch);
+
+/*
+** Number of committed pending SQL statements.
 */
 int hpplite_pending_count(HppliteCtx *pCtx);
 
 /*
-** Get current block height.
+** Next block height to produce.
 */
 uint64_t hpplite_get_block_height(HppliteCtx *pCtx);
 
 /*
-** Get previous block hash.
+** Hash of the previous block.
 */
 void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut);
 
 /*
-** Discard all pending transactions (rollback mempool).
+** Block hash: sha256(height || prevHash || preRoot || postRoot || sql...)
 */
-void hpplite_discard_pending(HppliteCtx *pCtx);
+void hpplite_block_hash(const struct HppliteBatch *pBatch, const unsigned char *pPrevHash, unsigned char *pOut);
 
 /*
-** Finalize a verified batch (for observers).
-** Increments block height and clears pending SQL without creating a batch.
-** Used after successfully verifying a batch from the sequencer.
+** Persist checkpoint progress.
 */
-void hpplite_finalize_verified_batch(HppliteCtx *pCtx);
+int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRoot);
 
 /*
 ** Register HPPLite as a loadable extension.
@@ -218,19 +226,24 @@ int sqlite3_hpplite_init(
 ** ============================================================================
 **
 ** Usage:
-**   sqlite3 *db = hpplite_open("file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia");
+**   sqlite3 *db = hpplite_open("file:state.db?hpplite=on&l1=hpp-sepolia&privkey=0x...");
 **
 ** URI Parameters:
 **   hpplite=on        Enable HPPLite (required)
-**   role=sequencer    Role: sequencer|observer
-**   l1=hpp-sepolia    L1 network alias (or chainid=181228)
-**   contract=0x...    L1 contract address
-**   interval=5s       Batch interval (default: 5s)
-**   datadir=/path     Data directory for batches
+**   l1=hpp-sepolia    L1 network alias (sets rpc + factory)
+**   rpc=https://...   L1 RPC endpoint
+**   factory=0x...     Factory contract (auto-creates a rollup per wallet)
+**   contract=0x...    Existing rollup contract
 **   privkey=0x...     Private key (or keyfile=/path)
+**   interval=5s       Batch interval (default: 5s)
+**   datadir=/path     Data directory
 **
 ** Environment variables (lower priority than URI):
 **   HPPLITE_PRIVATE_KEY, HPPLITE_L1_RPC, HPPLITE_FACTORY_ADDRESS, etc. (see config.h)
+**
+** On open HPPLite switches a file database to WAL mode and sets a 5 s busy
+** timeout, so bookkeeping on the second connection never blocks the
+** application and vice versa.
 */
 
 /* Forward declaration */
@@ -257,7 +270,7 @@ int hpplite_close(sqlite3 *db);
 
 /*
 ** Get HPPLite context from an open database.
-** Returns NULL if database was not opened with hpplite_open().
+** Returns NULL if HPPLite is not active on the connection.
 */
 HppliteCtx *hpplite_context(sqlite3 *db);
 
@@ -273,11 +286,7 @@ typedef struct HppliteL1 HppliteL1;
 
 /*
 ** Get the L1 connection for an open database.
-** Returns NULL if L1 was not configured (missing rpcUrl or contract),
-** or if the connection failed (network unavailable).
-**
-** The L1 connection is auto-established when the database is opened
-** with l1=... and contract=... URI parameters.
+** Returns NULL if L1 was not configured or the connection failed.
 */
 HppliteL1 *hpplite_get_l1(sqlite3 *db);
 
@@ -290,22 +299,18 @@ struct HppliteNode *hpplite_get_node(sqlite3 *db);
 /*
 ** Register a node with the global registry and set up SQL functions.
 ** Called automatically by hpplite_node_create() and hpplite_node_create_with_db().
-** Can also be called manually for custom node setups.
 */
 void hpplite_register_node(sqlite3 *db, struct HppliteNode *node);
 
 /*
 ** Force flush pending changes to a batch immediately.
-** Normally batches are created automatically on the interval.
-** Returns batch height or 0 if no pending changes.
+** Returns batch height, or 0 if nothing was pending or the batch could not
+** be confirmed on L1 (it stays pending and is retried).
 */
 uint64_t hpplite_flush(sqlite3 *db);
 
 /*
-** Check if auto-flush interval passed and flush if so.
-** Call this periodically in applications, or rely on automatic
-** progress handler for automatic flushing during SQL execution.
-** Returns batch height if flushed, 0 otherwise.
+** Same as hpplite_flush(); kept for API compatibility.
 */
 uint64_t hpplite_check_flush(sqlite3 *db);
 
@@ -315,17 +320,9 @@ uint64_t hpplite_check_flush(sqlite3 *db);
 void hpplite_state_root(sqlite3 *db, unsigned char *out);
 
 /*
-** DEPRECATED: No longer needed.
-**
-** HPPLite auto-registers via a constructor when the library is loaded.
-** Just use sqlite3_open_v2() directly:
-**
-** Example:
-**   sqlite3_open_v2("file:db.sqlite?hpplite=on&role=sequencer", &db, flags, NULL);
-**   sqlite3_exec(db, "INSERT ...", ...);  // Changes tracked automatically
-**   sqlite3_close(db);  // Flushes pending batch automatically
-**
-** These functions are retained for backwards compatibility but do nothing.
+** DEPRECATED: HPPLite auto-registers via a constructor when the library is
+** loaded. These functions are retained for backwards compatibility and do
+** nothing.
 */
 void hpplite_register(void);
 void hpplite_unregister(void);

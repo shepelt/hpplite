@@ -79,9 +79,9 @@ void hpplite_batch_free(HppliteBatch *pBatch) {
 }
 
 /*
-** Add a transaction to a batch
+** Add a statement to a batch with an explicit transaction group
 */
-int hpplite_batch_add_txn(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected) {
+int hpplite_batch_add_stmt(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected, int64_t txn) {
   HppliteTxn *aNew;
 
   aNew = sqlite3_realloc(pBatch->aTxns, sizeof(HppliteTxn) * (pBatch->nTxns + 1));
@@ -90,9 +90,17 @@ int hpplite_batch_add_txn(HppliteBatch *pBatch, const char *zSql, int64_t nRowsA
   pBatch->aTxns = aNew;
   pBatch->aTxns[pBatch->nTxns].zSql = sqlite3_mprintf("%s", zSql);
   pBatch->aTxns[pBatch->nTxns].nRowsAffected = nRowsAffected;
+  pBatch->aTxns[pBatch->nTxns].txn = txn;
   pBatch->nTxns++;
 
   return 0;
+}
+
+/*
+** Add a statement as its own transaction group
+*/
+int hpplite_batch_add_txn(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected) {
+  return hpplite_batch_add_stmt(pBatch, zSql, nRowsAffected, pBatch->nTxns);
 }
 
 /*
@@ -164,7 +172,8 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
 
   for (i = 0; i < pBatch->nTxns; i++) {
     char *escaped = json_escape_string(pBatch->aTxns[i].zSql);
-    sqlite3_str_appendf(pStr, "    {\"sql\": \"%s\"", escaped ? escaped : "");
+    sqlite3_str_appendf(pStr, "    {\"sql\": \"%s\", \"txn\": %lld", escaped ? escaped : "",
+                        (long long)pBatch->aTxns[i].txn);
     sqlite3_free(escaped);
 
     if (pBatch->aTxns[i].nRowsAffected >= 0) {
@@ -312,6 +321,7 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         /* Parse transaction object */
         char *zSql = NULL;
         int64_t nRows = -1;
+        int64_t txn = pBatch->nTxns;  /* Older batches: one group per statement */
 
         while (*p && *p != '}') {
           p = json_skip_ws(p);
@@ -328,6 +338,8 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
             zSql = json_parse_string(&p);
           } else if (strcmp(txKey, "rows_affected") == 0) {
             nRows = json_parse_number(&p);
+          } else if (strcmp(txKey, "txn") == 0) {
+            txn = json_parse_number(&p);
           } else {
             /* Skip unknown value */
             if (*p == '"') {
@@ -343,7 +355,7 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         if (*p == '}') p++;
 
         if (zSql) {
-          hpplite_batch_add_txn(pBatch, zSql, nRows);
+          hpplite_batch_add_stmt(pBatch, zSql, nRows, txn);
           sqlite3_free(zSql);
         }
       }

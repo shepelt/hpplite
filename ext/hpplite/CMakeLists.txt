@@ -125,6 +125,8 @@ if(HPPLITE_BUILD_TESTS)
 
         add_executable(test_checkpoint_flow tests/unit/test_checkpoint_flow.c)
         target_link_libraries(test_checkpoint_flow hpplite)
+        add_executable(test_durability tests/unit/test_durability.c)
+        target_link_libraries(test_durability hpplite)
     endif()
 
     # Web3 primitive tests (eth/ subdirectory - no network required)
@@ -160,6 +162,7 @@ if(HPPLITE_BUILD_TESTS)
     if(NOT HPPLITE_USE_REAL_L1)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
+        add_test(NAME test_durability COMMAND test_durability)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address

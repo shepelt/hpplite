@@ -1,7 +1,8 @@
 /*
-** HPPLite - State Root Tracking for SQLite
+** HPPLite - Verifiable SQLite
 **
-** Implementation of state tracking via preupdate hooks.
+** Core: statement capture into _hpplite_pending, batch building, content-hash
+** state roots, replay from L1. See hpplite.h for the persistence model.
 */
 
 #include "hpplite.h"
@@ -143,310 +144,410 @@ static void sha256(const uint8_t *data, size_t len, uint8_t *hash) {
   sha256_final(&ctx, hash);
 }
 
-/* Forward declaration */
-static void freeAllPending(HppliteCtx *pCtx);
-
 /*
-** Free a change record
+** Public SHA-256 helper
 */
-static void freeChange(HppliteChange *p) {
-  if (p) {
-    sqlite3_free(p->zDb);
-    sqlite3_free(p->zTable);
-    sqlite3_free(p->pOldData);
-    sqlite3_free(p->pNewData);
-    sqlite3_free(p);
-  }
+void hpplite_sha256(const uint8_t *data, size_t len, uint8_t *out) {
+  sha256(data, len, out);
 }
 
+#include "batch.h"
+#include <time.h>
+
 /*
-** Free all changes in a context
+** ============================================================================
+** Local persistence
+** ============================================================================
 */
-static void freeAllChanges(HppliteCtx *pCtx) {
-  HppliteChange *p = pCtx->pChanges;
-  while (p) {
-    HppliteChange *pNext = p->pNext;
-    freeChange(p);
-    p = pNext;
-  }
-  pCtx->pChanges = NULL;
-  pCtx->pLast = NULL;
-  pCtx->nChanges = 0;
+
+static const char *HPPLITE_SCHEMA =
+  "CREATE TABLE IF NOT EXISTS _hpplite_meta("
+  "  id INTEGER PRIMARY KEY CHECK(id=1),"
+  "  next_height INTEGER NOT NULL,"
+  "  prev_block_hash BLOB NOT NULL,"
+  "  state_root BLOB NOT NULL,"
+  "  last_checkpoint_height INTEGER NOT NULL DEFAULT 0,"
+  "  last_checkpoint_root BLOB"
+  ");"
+  "INSERT OR IGNORE INTO _hpplite_meta(id, next_height, prev_block_hash, state_root)"
+  "  VALUES(1, 1, zeroblob(32), zeroblob(32));"
+  "CREATE TABLE IF NOT EXISTS _hpplite_pending("
+  "  id INTEGER PRIMARY KEY,"
+  "  txn INTEGER NOT NULL,"
+  "  sql TEXT NOT NULL"
+  ");";
+
+/*
+** Run SQL on behalf of HPPLite itself. Statements issued while bInternal is
+** set are ignored by the trace and commit hooks.
+*/
+static int internalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql) {
+  int saved = pCtx->bInternal;
+  int rc;
+  pCtx->bInternal = 1;
+  rc = sqlite3_exec(db, zSql, NULL, NULL, NULL);
+  pCtx->bInternal = saved;
+  return rc;
 }
 
-/*
-** Preupdate hook callback - captures row changes
-*/
-static void hpplitePreupdateHook(
-  void *pArg,
-  sqlite3 *db,
-  int op,
-  const char *zDb,
-  const char *zTable,
-  sqlite3_int64 iKey1,
-  sqlite3_int64 iKey2
-) {
-  HppliteCtx *pCtx = (HppliteCtx*)pArg;
-  HppliteChange *pChange;
-  int nCol, i, rc;
-  sqlite3_value *pVal;
-
-  if (!pCtx->bEnabled) return;
-
-  pChange = (HppliteChange*)sqlite3_malloc(sizeof(HppliteChange));
-  if (!pChange) return;
-  memset(pChange, 0, sizeof(HppliteChange));
-
-  /* Set operation type */
-  switch (op) {
-    case SQLITE_INSERT: pChange->op = HPPLITE_INSERT; break;
-    case SQLITE_UPDATE: pChange->op = HPPLITE_UPDATE; break;
-    case SQLITE_DELETE: pChange->op = HPPLITE_DELETE; break;
-    default:
-      sqlite3_free(pChange);
-      return;
-  }
-
-  /* Copy database and table names */
-  pChange->zDb = sqlite3_mprintf("%s", zDb);
-  pChange->zTable = sqlite3_mprintf("%s", zTable);
-
-  /* Set rowid based on operation */
-  pChange->iRowid = (op == SQLITE_DELETE) ? iKey1 : iKey2;
-
-  /* Get column count */
-  nCol = sqlite3_preupdate_count(db);
-
-  /* Serialize old values for UPDATE/DELETE */
-  if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
-    /* Simple serialization: concatenate column values */
-    sqlite3_str *pStr = sqlite3_str_new(db);
-    for (i = 0; i < nCol; i++) {
-      rc = sqlite3_preupdate_old(db, i, &pVal);
-      if (rc == SQLITE_OK && pVal) {
-        int type = sqlite3_value_type(pVal);
-        sqlite3_str_appendf(pStr, "%d:", type);
-        switch (type) {
-          case SQLITE_INTEGER:
-            sqlite3_str_appendf(pStr, "%lld|", sqlite3_value_int64(pVal));
-            break;
-          case SQLITE_FLOAT:
-            sqlite3_str_appendf(pStr, "%g|", sqlite3_value_double(pVal));
-            break;
-          case SQLITE_TEXT:
-            sqlite3_str_appendf(pStr, "%s|", sqlite3_value_text(pVal));
-            break;
-          case SQLITE_BLOB: {
-            int n = sqlite3_value_bytes(pVal);
-            sqlite3_str_appendf(pStr, "[%d bytes]|", n);
-            break;
-          }
-          default:
-            sqlite3_str_appendf(pStr, "NULL|");
-        }
-      }
-    }
-    pChange->nOldData = sqlite3_str_length(pStr);
-    pChange->pOldData = (unsigned char*)sqlite3_str_finish(pStr);
-  }
-
-  /* Serialize new values for INSERT/UPDATE */
-  if (op == SQLITE_INSERT || op == SQLITE_UPDATE) {
-    sqlite3_str *pStr = sqlite3_str_new(db);
-    for (i = 0; i < nCol; i++) {
-      rc = sqlite3_preupdate_new(db, i, &pVal);
-      if (rc == SQLITE_OK && pVal) {
-        int type = sqlite3_value_type(pVal);
-        sqlite3_str_appendf(pStr, "%d:", type);
-        switch (type) {
-          case SQLITE_INTEGER:
-            sqlite3_str_appendf(pStr, "%lld|", sqlite3_value_int64(pVal));
-            break;
-          case SQLITE_FLOAT:
-            sqlite3_str_appendf(pStr, "%g|", sqlite3_value_double(pVal));
-            break;
-          case SQLITE_TEXT:
-            sqlite3_str_appendf(pStr, "%s|", sqlite3_value_text(pVal));
-            break;
-          case SQLITE_BLOB: {
-            int n = sqlite3_value_bytes(pVal);
-            sqlite3_str_appendf(pStr, "[%d bytes]|", n);
-            break;
-          }
-          default:
-            sqlite3_str_appendf(pStr, "NULL|");
-        }
-      }
-    }
-    pChange->nNewData = sqlite3_str_length(pStr);
-    pChange->pNewData = (unsigned char*)sqlite3_str_finish(pStr);
-  }
-
-  /* Add to change list */
-  pChange->pNext = NULL;
-  if (pCtx->pLast) {
-    pCtx->pLast->pNext = pChange;
+static void columnHash(sqlite3_stmt *pStmt, int i, unsigned char *pOut) {
+  const void *p = sqlite3_column_blob(pStmt, i);
+  int n = sqlite3_column_bytes(pStmt, i);
+  if (p && n == HPPLITE_HASH_SIZE) {
+    memcpy(pOut, p, HPPLITE_HASH_SIZE);
   } else {
-    pCtx->pChanges = pChange;
+    memset(pOut, 0, HPPLITE_HASH_SIZE);
   }
-  pCtx->pLast = pChange;
-  pCtx->nChanges++;
 }
 
 /*
-** Commit hook callback - compute new state root
+** Load the _hpplite_meta row and the transaction counter into the context.
+*/
+static int loadMeta(HppliteCtx *pCtx) {
+  sqlite3_stmt *pStmt;
+  int rc;
+
+  pCtx->bInternal = 1;
+  rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "SELECT next_height, prev_block_hash, state_root,"
+    "       last_checkpoint_height, last_checkpoint_root"
+    "  FROM _hpplite_meta WHERE id=1", -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) {
+    if (sqlite3_step(pStmt) == SQLITE_ROW) {
+      pCtx->blockHeight = (uint64_t)sqlite3_column_int64(pStmt, 0);
+      columnHash(pStmt, 1, pCtx->prevBlockHash);
+      columnHash(pStmt, 2, pCtx->stateRoot);
+      pCtx->lastCheckpointHeight = (uint64_t)sqlite3_column_int64(pStmt, 3);
+      columnHash(pStmt, 4, pCtx->lastCheckpointRoot);
+    }
+    sqlite3_finalize(pStmt);
+  }
+
+  /* Pending rows carry transaction numbers; keep numbering above them */
+  if (sqlite3_prepare_v2(pCtx->bkDb,
+        "SELECT COALESCE(MAX(txn), 0) + 1 FROM _hpplite_pending",
+        -1, &pStmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(pStmt) == SQLITE_ROW) {
+      pCtx->txnSeq = (uint64_t)sqlite3_column_int64(pStmt, 0);
+    }
+    sqlite3_finalize(pStmt);
+  }
+  pCtx->bInternal = 0;
+  pCtx->bRootDirty = 1;
+  return rc;
+}
+
+/*
+** ============================================================================
+** Content hash (state root)
+** ============================================================================
+*/
+
+static void hashU64(SHA256_CTX *pH, uint64_t v) {
+  uint8_t b[8];
+  int i;
+  for (i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (56 - i * 8));
+  sha256_update(pH, b, 8);
+}
+
+static void hashBytes(SHA256_CTX *pH, const void *p, int n) {
+  hashU64(pH, (uint64_t)n);
+  if (n > 0) sha256_update(pH, (const uint8_t*)p, (size_t)n);
+}
+
+static void hashText(SHA256_CTX *pH, const unsigned char *z) {
+  hashBytes(pH, z, z ? (int)strlen((const char*)z) : 0);
+}
+
+static void hashValue(SHA256_CTX *pH, sqlite3_stmt *pStmt, int i) {
+  switch (sqlite3_column_type(pStmt, i)) {
+    case SQLITE_INTEGER: {
+      sha256_update(pH, (const uint8_t*)"I", 1);
+      hashU64(pH, (uint64_t)sqlite3_column_int64(pStmt, i));
+      break;
+    }
+    case SQLITE_FLOAT: {
+      double d = sqlite3_column_double(pStmt, i);
+      uint64_t bits;
+      memcpy(&bits, &d, 8);
+      sha256_update(pH, (const uint8_t*)"F", 1);
+      hashU64(pH, bits);
+      break;
+    }
+    case SQLITE_TEXT:
+      sha256_update(pH, (const uint8_t*)"T", 1);
+      hashBytes(pH, sqlite3_column_text(pStmt, i), sqlite3_column_bytes(pStmt, i));
+      break;
+    case SQLITE_BLOB:
+      sha256_update(pH, (const uint8_t*)"B", 1);
+      hashBytes(pH, sqlite3_column_blob(pStmt, i), sqlite3_column_bytes(pStmt, i));
+      break;
+    default:
+      sha256_update(pH, (const uint8_t*)"N", 1);
+      break;
+  }
+}
+
+/*
+** Hash every row of one table in a deterministic order.
+*/
+static int hashTableRows(sqlite3 *db, SHA256_CTX *pH, const char *zName, const char *zSql) {
+  sqlite3_stmt *pStmt;
+  char *zQuery;
+  int rc, nCol, i;
+  int withoutRowid = (zSql && strstr(zSql, "WITHOUT ROWID") != NULL);
+
+  if (withoutRowid) {
+    /* No rowid: order by every column (the primary key is among them) */
+    sqlite3_str *pStr;
+    zQuery = sqlite3_mprintf("SELECT * FROM \"%w\"", zName);
+    rc = sqlite3_prepare_v2(db, zQuery, -1, &pStmt, NULL);
+    sqlite3_free(zQuery);
+    if (rc != SQLITE_OK) return rc;
+    nCol = sqlite3_column_count(pStmt);
+    sqlite3_finalize(pStmt);
+    pStr = sqlite3_str_new(db);
+    sqlite3_str_appendf(pStr, "SELECT * FROM \"%w\" ORDER BY 1", zName);
+    for (i = 2; i <= nCol; i++) sqlite3_str_appendf(pStr, ",%d", i);
+    zQuery = sqlite3_str_finish(pStr);
+  } else {
+    zQuery = sqlite3_mprintf("SELECT * FROM \"%w\" ORDER BY rowid", zName);
+  }
+  rc = sqlite3_prepare_v2(db, zQuery, -1, &pStmt, NULL);
+  sqlite3_free(zQuery);
+  if (rc != SQLITE_OK) return rc;
+
+  nCol = sqlite3_column_count(pStmt);
+  while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {
+    sha256_update(pH, (const uint8_t*)"R", 1);
+    for (i = 0; i < nCol; i++) hashValue(pH, pStmt, i);
+  }
+  sqlite3_finalize(pStmt);
+  return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
+  SHA256_CTX h;
+  sqlite3_stmt *pStmt;
+  int rc, nEntries = 0;
+
+  sha256_init(&h);
+  rc = sqlite3_prepare_v2(db,
+    "SELECT type, name, tbl_name, sql FROM sqlite_schema"
+    " WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    "   AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'"
+    " ORDER BY type, name", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+
+  while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {
+    const unsigned char *zType = sqlite3_column_text(pStmt, 0);
+    const unsigned char *zName = sqlite3_column_text(pStmt, 1);
+    const unsigned char *zSql = sqlite3_column_text(pStmt, 3);
+    nEntries++;
+    sha256_update(&h, (const uint8_t*)"S", 1);
+    hashText(&h, zType);
+    hashText(&h, zName);
+    hashText(&h, sqlite3_column_text(pStmt, 2));
+    hashText(&h, zSql);
+    if (zType && strcmp((const char*)zType, "table") == 0
+        && zSql && sqlite3_strnicmp((const char*)zSql, "CREATE VIRTUAL", 14) != 0) {
+      rc = hashTableRows(db, &h, (const char*)zName, (const char*)zSql);
+      if (rc != SQLITE_OK) break;
+    }
+  }
+  sqlite3_finalize(pStmt);
+  if (rc != SQLITE_DONE && rc != SQLITE_OK) return rc;
+
+  if (nEntries == 0) {
+    memset(pOut, 0, HPPLITE_HASH_SIZE);  /* Genesis: no user schema */
+  } else {
+    sha256_final(&h, pOut);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** ============================================================================
+** Hooks
+** ============================================================================
+*/
+
+/*
+** Decide whether a statement is a write worth logging, by its first keyword.
+*/
+static int isTrackedSql(const char *z) {
+  static const char *aSkip[] = {
+    "SELECT", "EXPLAIN", "PRAGMA", "BEGIN", "COMMIT", "END", "ROLLBACK",
+    "SAVEPOINT", "RELEASE", "VACUUM", "ANALYZE", "REINDEX", "ATTACH", "DETACH",
+    NULL
+  };
+  int i;
+
+  /* Skip whitespace and comments. Trigger sub-programs are traced as a bare
+  ** "-- TRIGGER name" comment; they are reproduced by replaying the statement
+  ** that fired them. */
+  for (;;) {
+    while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+    if (z[0] == '-' && z[1] == '-') {
+      while (*z && *z != '\n') z++;
+    } else if (z[0] == '/' && z[1] == '*') {
+      const char *zEnd = strstr(z + 2, "*/");
+      if (!zEnd) return 0;
+      z = zEnd + 2;
+    } else {
+      break;
+    }
+  }
+  if (*z == '\0') return 0;
+  for (i = 0; aSkip[i]; i++) {
+    int n = (int)strlen(aSkip[i]);
+    if (sqlite3_strnicmp(z, aSkip[i], n) == 0) {
+      char c = z[n];
+      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+/*
+** Trace callback: runs at the start of every statement on the application
+** connection. Writes the statement text into _hpplite_pending through the
+** same connection, so the row is part of whatever transaction the statement
+** runs in - it commits with the statement and rolls back with it.
+*/
+static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
+  HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
+  const char *zSql = (const char*)pX;
+  char *zExpanded;
+  int rc;
+  (void)mask;
+
+  if (!pCtx || !pCtx->bEnabled || pCtx->bInternal || !zSql) return 0;
+  if (!isTrackedSql(zSql)) return 0;
+  if (strstr(zSql, "_hpplite_")) return 0;  /* never log our own tables */
+
+  /* Bound parameters are substituted so the statement can be replayed */
+  zExpanded = sqlite3_expanded_sql(pS);
+
+  pCtx->bInternal = 1;
+  if (!pCtx->pLogStmt) {
+    rc = sqlite3_prepare_v3(pCtx->db,
+      "INSERT INTO _hpplite_pending(txn, sql) VALUES(?1, ?2)",
+      -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pLogStmt, NULL);
+    if (rc != SQLITE_OK) pCtx->pLogStmt = NULL;
+  }
+  if (pCtx->pLogStmt) {
+    sqlite3_bind_int64(pCtx->pLogStmt, 1, (sqlite3_int64)pCtx->txnSeq);
+    sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded ? zExpanded : zSql, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(pCtx->pLogStmt);
+    sqlite3_reset(pCtx->pLogStmt);
+    sqlite3_clear_bindings(pCtx->pLogStmt);
+  } else {
+    rc = SQLITE_ERROR;
+  }
+  if (rc != SQLITE_DONE) {
+    pCtx->nLogErrors++;
+    fprintf(stderr, "hpplite: could not log statement: %s\n", sqlite3_errmsg(pCtx->db));
+  }
+  pCtx->bInternal = 0;
+  sqlite3_free(zExpanded);
+  return 0;
+}
+
+/*
+** Commit hook: close the current transaction group.
 */
 static int hppliteCommitHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
-  unsigned char newRoot[HPPLITE_HASH_SIZE];
-
-  if (!pCtx->bEnabled || pCtx->nChanges == 0) {
-    freeAllChanges(pCtx);
-    return 0;  /* Allow commit */
-  }
-
-  /* Compute new state root */
-  hpplite_compute_state_root(pCtx->stateRoot, pCtx->pChanges, newRoot);
-  memcpy(pCtx->stateRoot, newRoot, HPPLITE_HASH_SIZE);
-
-  /* Notify callback if registered */
+  if (pCtx->bInternal) return 0;
+  pCtx->txnSeq++;
+  pCtx->bRootDirty = 1;
   if (pCtx->xOnCommit) {
-    pCtx->xOnCommit(pCtx->pCallbackArg, newRoot, pCtx->nChanges);
+    pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
   }
-
-  /* Clean up changes */
-  freeAllChanges(pCtx);
-
   return 0;  /* Allow commit */
 }
 
 /*
-** Rollback hook callback - discard changes
+** Rollback hook: pending rows written in the transaction are gone with it.
 */
 static void hppliteRollbackHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
-
+  if (pCtx->bInternal) return;
   if (pCtx->xOnRollback) {
     pCtx->xOnRollback(pCtx->pCallbackArg);
   }
-
-  freeAllChanges(pCtx);
-}
-
-/* Forward declaration */
-static int addPendingSql(HppliteCtx *pCtx, const char *zSql, int nRows);
-
-/*
-** Trace callback to capture SQL statements for transparent API.
-** This allows standard sqlite3_exec() calls to be captured for batching.
-*/
-static int hppliteTraceCallback(
-    unsigned mask,
-    void *pCtx,
-    void *pStmt,
-    void *pSql
-) {
-    (void)mask;
-    HppliteCtx *ctx = (HppliteCtx*)pCtx;
-    sqlite3_stmt *stmt = (sqlite3_stmt*)pStmt;
-    const char *sql = (const char*)pSql;
-
-    if (!ctx || !ctx->bEnabled || !sql) return 0;
-
-    /* Skip internal SQLite statements, empty SQL, and read-only queries */
-    if (sql[0] == '\0') return 0;
-    if (strncmp(sql, "PRAGMA", 6) == 0) return 0;
-    if (strncmp(sql, "pragma", 6) == 0) return 0;
-    if (strncmp(sql, "SELECT", 6) == 0) return 0;
-    if (strncmp(sql, "select", 6) == 0) return 0;
-    if (strncmp(sql, "EXPLAIN", 7) == 0) return 0;
-    if (strncmp(sql, "explain", 7) == 0) return 0;
-
-    /* Save pre-state before first SQL in a batch */
-    if (ctx->nPending == 0) {
-        memcpy(ctx->preStateRoot, ctx->stateRoot, HPPLITE_HASH_SIZE);
-    }
-
-    /* Add SQL to pending list */
-    addPendingSql(ctx, sql, -1);  /* -1 = rows affected unknown */
-
-    (void)stmt;
-    return 0;
 }
 
 /*
-** Initialize HPPLite tracking on a database connection.
+** ============================================================================
+** Lifecycle
+** ============================================================================
 */
+
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   HppliteCtx *pCtx;
+  int rc;
 
   pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
   if (!pCtx) return SQLITE_NOMEM;
   memset(pCtx, 0, sizeof(HppliteCtx));
 
   pCtx->db = db;
+  pCtx->bkDb = db;
   pCtx->bEnabled = 1;
 
-  /* Initialize state root to zeros (genesis state) */
-  memset(pCtx->stateRoot, 0, HPPLITE_HASH_SIZE);
+  rc = internalExec(pCtx, db, HPPLITE_SCHEMA);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(pCtx);
+    return rc;
+  }
+  loadMeta(pCtx);
 
-  /* Initialize block builder state */
-  pCtx->blockHeight = 1;  /* First block is height 1 */
-  memset(pCtx->prevBlockHash, 0, HPPLITE_HASH_SIZE);  /* Genesis has zero prev hash */
-  memset(pCtx->preStateRoot, 0, HPPLITE_HASH_SIZE);
-
-  /* Register hooks */
-#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
-  sqlite3_preupdate_hook(db, hpplitePreupdateHook, pCtx);
-#endif
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
-
-  /* Register trace callback to capture SQL for transparent API */
   sqlite3_trace_v2(db, SQLITE_TRACE_STMT, hppliteTraceCallback, pCtx);
 
   *ppCtx = pCtx;
   return SQLITE_OK;
 }
 
-/*
-** Shutdown HPPLite tracking and free resources.
-*/
 void hpplite_shutdown(HppliteCtx *pCtx) {
   if (!pCtx) return;
 
-  /* Unregister hooks */
-#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
-  sqlite3_preupdate_hook(pCtx->db, NULL, NULL);
-#endif
   sqlite3_commit_hook(pCtx->db, NULL, NULL);
   sqlite3_rollback_hook(pCtx->db, NULL, NULL);
   sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
-
-  freeAllChanges(pCtx);
-  freeAllPending(pCtx);
+  if (pCtx->pLogStmt) sqlite3_finalize(pCtx->pLogStmt);
   sqlite3_free(pCtx);
 }
 
-/*
-** Enable/disable state tracking.
-*/
+int hpplite_set_bookkeeping_db(HppliteCtx *pCtx, sqlite3 *bkDb) {
+  if (!pCtx) return SQLITE_MISUSE;
+  pCtx->bkDb = bkDb ? bkDb : pCtx->db;
+  return loadMeta(pCtx);
+}
+
 void hpplite_enable(HppliteCtx *pCtx, int bEnable) {
   if (pCtx) pCtx->bEnabled = bEnable;
 }
 
-/*
-** Get current state root.
-*/
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut) {
-  if (pCtx && pOut) {
-    memcpy(pOut, pCtx->stateRoot, HPPLITE_HASH_SIZE);
+  if (!pCtx || !pOut) return;
+  if (pCtx->bRootDirty) {
+    int saved = pCtx->bInternal;
+    pCtx->bInternal = 1;
+    if (hpplite_db_hash(pCtx->bkDb, pCtx->curRoot) == SQLITE_OK) {
+      pCtx->bRootDirty = 0;
+    }
+    pCtx->bInternal = saved;
   }
+  memcpy(pOut, pCtx->curRoot, HPPLITE_HASH_SIZE);
 }
 
-/*
-** Set callbacks for commit/rollback notifications.
-*/
 void hpplite_set_callbacks(
   HppliteCtx *pCtx,
   void *pArg,
@@ -461,170 +562,15 @@ void hpplite_set_callbacks(
 }
 
 /*
-** Get list of changes in current transaction.
-*/
-int hpplite_get_changes(HppliteCtx *pCtx, HppliteChange **ppChanges) {
-  if (pCtx) {
-    if (ppChanges) *ppChanges = pCtx->pChanges;
-    return pCtx->nChanges;
-  }
-  return 0;
-}
-
-/*
-** Compute state root from a list of changes.
-**
-** Algorithm: hash(prev_root || hash(change1) || hash(change2) || ...)
-** This is a simple incremental Merkle-like structure.
-*/
-void hpplite_compute_state_root(
-  unsigned char *pPrevRoot,
-  HppliteChange *pChanges,
-  unsigned char *pNewRoot
-) {
-  SHA256_CTX ctx;
-  HppliteChange *p;
-  unsigned char changeHash[HPPLITE_HASH_SIZE];
-
-  sha256_init(&ctx);
-
-  /* Include previous state root */
-  sha256_update(&ctx, pPrevRoot, HPPLITE_HASH_SIZE);
-
-  /* Hash each change and include in state */
-  for (p = pChanges; p; p = p->pNext) {
-    SHA256_CTX changeCtx;
-    sha256_init(&changeCtx);
-
-    /* Hash: op | db | table | rowid | old_data | new_data */
-    sha256_update(&changeCtx, (uint8_t*)&p->op, sizeof(p->op));
-    if (p->zDb) sha256_update(&changeCtx, (uint8_t*)p->zDb, strlen(p->zDb));
-    if (p->zTable) sha256_update(&changeCtx, (uint8_t*)p->zTable, strlen(p->zTable));
-    sha256_update(&changeCtx, (uint8_t*)&p->iRowid, sizeof(p->iRowid));
-    if (p->pOldData) sha256_update(&changeCtx, p->pOldData, p->nOldData);
-    if (p->pNewData) sha256_update(&changeCtx, p->pNewData, p->nNewData);
-
-    sha256_final(&changeCtx, changeHash);
-    sha256_update(&ctx, changeHash, HPPLITE_HASH_SIZE);
-  }
-
-  sha256_final(&ctx, pNewRoot);
-}
-
-/*
-** Serialize the current transaction changes to a buffer.
-*/
-unsigned char *hpplite_serialize_changes(HppliteCtx *pCtx, int *pnSize) {
-  sqlite3_str *pStr;
-  HppliteChange *p;
-
-  if (!pCtx || !pCtx->pChanges) {
-    if (pnSize) *pnSize = 0;
-    return NULL;
-  }
-
-  pStr = sqlite3_str_new(pCtx->db);
-
-  /* Simple JSON-like serialization */
-  sqlite3_str_appendf(pStr, "[");
-  for (p = pCtx->pChanges; p; p = p->pNext) {
-    if (p != pCtx->pChanges) sqlite3_str_appendf(pStr, ",");
-    sqlite3_str_appendf(pStr,
-      "{\"op\":%d,\"db\":\"%s\",\"table\":\"%s\",\"rowid\":%lld",
-      p->op, p->zDb ? p->zDb : "", p->zTable ? p->zTable : "", p->iRowid
-    );
-    if (p->pOldData) {
-      sqlite3_str_appendf(pStr, ",\"old\":\"%s\"", p->pOldData);
-    }
-    if (p->pNewData) {
-      sqlite3_str_appendf(pStr, ",\"new\":\"%s\"", p->pNewData);
-    }
-    sqlite3_str_appendf(pStr, "}");
-  }
-  sqlite3_str_appendf(pStr, "]");
-
-  if (pnSize) *pnSize = sqlite3_str_length(pStr);
-  return (unsigned char*)sqlite3_str_finish(pStr);
-}
-
-/*
 ** ============================================================================
 ** Block Builder Implementation
 ** ============================================================================
 */
 
-#include "batch.h"
-#include <time.h>
-
-/*
-** Free a pending SQL record
-*/
-static void freePendingSql(HpplitePendingSql *p) {
-  if (p) {
-    sqlite3_free(p->zSql);
-    sqlite3_free(p);
-  }
-}
-
-/*
-** Free all pending SQL in context
-*/
-static void freeAllPending(HppliteCtx *pCtx) {
-  HpplitePendingSql *p = pCtx->pPending;
-  while (p) {
-    HpplitePendingSql *pNext = p->pNext;
-    freePendingSql(p);
-    p = pNext;
-  }
-  pCtx->pPending = NULL;
-  pCtx->pPendingLast = NULL;
-  pCtx->nPending = 0;
-}
-
-/*
-** Add SQL to pending list
-*/
-static int addPendingSql(HppliteCtx *pCtx, const char *zSql, int nRows) {
-  HpplitePendingSql *p;
-
-  p = (HpplitePendingSql*)sqlite3_malloc(sizeof(HpplitePendingSql));
-  if (!p) return SQLITE_NOMEM;
-
-  memset(p, 0, sizeof(HpplitePendingSql));
-  p->zSql = sqlite3_mprintf("%s", zSql);
-  if (!p->zSql) {
-    sqlite3_free(p);
-    return SQLITE_NOMEM;
-  }
-  p->nRowsAffected = nRows;
-
-  /* Add to list */
-  p->pNext = NULL;
-  if (pCtx->pPendingLast) {
-    pCtx->pPendingLast->pNext = p;
-  } else {
-    pCtx->pPending = p;
-  }
-  pCtx->pPendingLast = p;
-  pCtx->nPending++;
-
-  return SQLITE_OK;
-}
-
-/*
-** Execute SQL and track it for the current block.
-*/
-int hpplite_exec(
-  HppliteCtx *pCtx,
-  const char *zSql,
-  char **pzErrMsg
-) {
+int hpplite_exec(HppliteCtx *pCtx, const char *zSql, char **pzErrMsg) {
   return hpplite_exec_cb(pCtx, zSql, NULL, NULL, pzErrMsg);
 }
 
-/*
-** Execute SQL with callback and track it.
-*/
 int hpplite_exec_cb(
   HppliteCtx *pCtx,
   const char *zSql,
@@ -632,121 +578,279 @@ int hpplite_exec_cb(
   void *pArg,
   char **pzErrMsg
 ) {
-  int rc;
-
   if (!pCtx || !zSql) return SQLITE_MISUSE;
+  /* The trace callback logs the statement; nothing else to do here */
+  return sqlite3_exec(pCtx->db, zSql, xCallback, pArg, pzErrMsg);
+}
 
-  /*
-  ** Execute the SQL.
-  ** The trace callback (hppliteTraceCallback) automatically tracks
-  ** write operations in the pending list for batching.
-  ** No need to call addPendingSql() here - trace callback handles it.
-  */
-  rc = sqlite3_exec(pCtx->db, zSql, xCallback, pArg, pzErrMsg);
-
-  return rc;
+void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHash, unsigned char *pOut) {
+  SHA256_CTX h;
+  int i;
+  sha256_init(&h);
+  hashU64(&h, pBatch->height);
+  sha256_update(&h, pPrevHash, HPPLITE_HASH_SIZE);
+  sha256_update(&h, pBatch->preStateRoot, HPPLITE_HASH_SIZE);
+  sha256_update(&h, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  for (i = 0; i < pBatch->nTxns; i++) {
+    hashText(&h, (const unsigned char*)pBatch->aTxns[i].zSql);
+  }
+  sha256_final(&h, pOut);
 }
 
 /*
-** Flush pending SQL into a batch (creates a block).
+** Bookkeeping transactions. With a dedicated bookkeeping connection these
+** never touch the application's transaction. On the shared (:memory:)
+** connection they are only possible while the application is in autocommit.
 */
-struct HppliteBatch *hpplite_flush_block(HppliteCtx *pCtx) {
-  HppliteBatch *pBatch;
-  HpplitePendingSql *p;
-  unsigned char blockHash[HPPLITE_HASH_SIZE];
-  SHA256_CTX hashCtx;
+static int bkBegin(HppliteCtx *pCtx, int bWrite) {
+  if (pCtx->bkDb == pCtx->db && !sqlite3_get_autocommit(pCtx->db)) {
+    return SQLITE_BUSY;
+  }
+  return internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
+}
 
-  if (!pCtx || pCtx->nPending == 0) {
-    return NULL;
+static int bkEnd(HppliteCtx *pCtx, int rc) {
+  if (rc == SQLITE_OK) {
+    rc = internalExec(pCtx, pCtx->bkDb, "COMMIT");
+  }
+  if (rc != SQLITE_OK) {
+    internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
+  }
+  return rc;
+}
+
+struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId) {
+  HppliteBatch *pBatch = NULL;
+  sqlite3_stmt *pStmt = NULL;
+  sqlite3_int64 maxId = 0, lastTxn = -1, txnRel = -1;
+  int rc;
+
+  if (!pCtx) return NULL;
+  if (bkBegin(pCtx, 0) != SQLITE_OK) return NULL;
+  pCtx->bInternal = 1;
+
+  rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "SELECT id, txn, sql FROM _hpplite_pending ORDER BY id", -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) {
+    while (sqlite3_step(pStmt) == SQLITE_ROW) {
+      sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
+      if (!pBatch) {
+        pBatch = hpplite_batch_new(pCtx->blockHeight);
+        if (!pBatch) break;
+        hpplite_batch_set_pre_state(pBatch, pCtx->stateRoot);
+      }
+      if (txn != lastTxn) { txnRel++; lastTxn = txn; }
+      hpplite_batch_add_stmt(pBatch, (const char*)sqlite3_column_text(pStmt, 2), -1, txnRel);
+      maxId = sqlite3_column_int64(pStmt, 0);
+    }
+    sqlite3_finalize(pStmt);
   }
 
-  /* Create new batch */
-  pBatch = hpplite_batch_new(pCtx->blockHeight);
-  if (!pBatch) return NULL;
-
-  /* Set pre-state (saved when first SQL was executed) */
-  hpplite_batch_set_pre_state(pBatch, pCtx->preStateRoot);
-
-  /* Set post-state (current state after all SQL executed) */
-  hpplite_batch_set_post_state(pBatch, pCtx->stateRoot);
-
-  /* Set timestamp */
-  pBatch->timestamp = (uint64_t)time(NULL);
-
-  /* Add all pending SQL to the batch */
-  for (p = pCtx->pPending; p; p = p->pNext) {
-    hpplite_batch_add_txn(pBatch, p->zSql, p->nRowsAffected);
+  if (pBatch) {
+    /* Post-state root is taken in the same snapshot as the pending rows */
+    unsigned char root[HPPLITE_HASH_SIZE];
+    if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
+      hpplite_batch_set_post_state(pBatch, root);
+      pBatch->timestamp = (uint64_t)time(NULL);
+    } else {
+      hpplite_batch_free(pBatch);
+      pBatch = NULL;
+    }
   }
+  pCtx->bInternal = 0;
+  bkEnd(pCtx, SQLITE_OK);
 
-  /* Compute block hash: hash(height || prev_hash || pre_state || post_state || txns...) */
-  sha256_init(&hashCtx);
-  sha256_update(&hashCtx, (uint8_t*)&pBatch->height, sizeof(pBatch->height));
-  sha256_update(&hashCtx, pCtx->prevBlockHash, HPPLITE_HASH_SIZE);
-  sha256_update(&hashCtx, pBatch->preStateRoot, HPPLITE_HASH_SIZE);
-  sha256_update(&hashCtx, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
-  for (p = pCtx->pPending; p; p = p->pNext) {
-    sha256_update(&hashCtx, (uint8_t*)p->zSql, strlen(p->zSql));
-  }
-  sha256_final(&hashCtx, blockHash);
-
-  /* Update context for next block */
-  memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
-  pCtx->blockHeight++;
-
-  /* Clear pending list */
-  freeAllPending(pCtx);
-
+  if (pMaxId) *pMaxId = maxId;
   return pBatch;
 }
 
 /*
-** Get number of pending transactions.
+** Advance _hpplite_meta past pBatch and optionally delete pending rows.
+** Caller holds a bookkeeping write transaction.
 */
-int hpplite_pending_count(HppliteCtx *pCtx) {
-  return pCtx ? pCtx->nPending : 0;
+static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
+  unsigned char blockHash[HPPLITE_HASH_SIZE];
+  sqlite3_stmt *pStmt;
+  int rc;
+
+  hpplite_block_hash(pBatch, pCtx->prevBlockHash, blockHash);
+
+  if (maxId > 0) {
+    rc = sqlite3_prepare_v2(pCtx->bkDb,
+      "DELETE FROM _hpplite_pending WHERE id <= ?1", -1, &pStmt, NULL);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(pStmt, 1, maxId);
+    rc = sqlite3_step(pStmt);
+    sqlite3_finalize(pStmt);
+    if (rc != SQLITE_DONE) return rc;
+  }
+
+  rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, state_root=?3 WHERE id=1",
+    -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(pBatch->height + 1));
+  sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  rc = sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+  if (rc != SQLITE_DONE) return rc;
+
+  pCtx->blockHeight = pBatch->height + 1;
+  memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  return SQLITE_OK;
 }
 
-/*
-** Get current block height.
-*/
+int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
+  int rc;
+  if (!pCtx || !pBatch) return SQLITE_MISUSE;
+  if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  rc = bkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  pCtx->bInternal = 1;
+  rc = advanceMeta(pCtx, pBatch, maxId);
+  pCtx->bInternal = 0;
+  return bkEnd(pCtx, rc);
+}
+
+struct HppliteBatch *hpplite_flush_block(HppliteCtx *pCtx) {
+  sqlite3_int64 maxId = 0;
+  HppliteBatch *pBatch = hpplite_build_batch(pCtx, &maxId);
+  if (!pBatch) return NULL;
+  if (hpplite_finalize_batch(pCtx, pBatch, maxId) != SQLITE_OK) {
+    hpplite_batch_free(pBatch);
+    return NULL;
+  }
+  return pBatch;
+}
+
+int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTxn) {
+  int savedEnabled, rc = SQLITE_OK, i, open = 0;
+  sqlite3_int64 lastTxn = -1;
+  unsigned char root[HPPLITE_HASH_SIZE];
+
+  if (!pCtx || !pBatch) return SQLITE_MISUSE;
+  if (pBatch->height < pCtx->blockHeight) return SQLITE_DONE;   /* already applied */
+  if (pBatch->height > pCtx->blockHeight) return SQLITE_MISMATCH; /* gap */
+
+  savedEnabled = pCtx->bEnabled;
+  pCtx->bEnabled = 0;
+  pCtx->bInternal = 1;
+  for (i = 0; i < pBatch->nTxns && rc == SQLITE_OK; i++) {
+    const char *zSql = pBatch->aTxns[i].zSql;
+    if (!zSql) continue;
+    if (useTxn && pBatch->aTxns[i].txn != lastTxn) {
+      if (open) rc = sqlite3_exec(pCtx->db, "COMMIT", NULL, NULL, NULL);
+      if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, "BEGIN", NULL, NULL, NULL);
+      open = (rc == SQLITE_OK);
+      lastTxn = pBatch->aTxns[i].txn;
+    }
+    if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, zSql, NULL, NULL, NULL);
+  }
+  if (open) {
+    if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, "COMMIT", NULL, NULL, NULL);
+    else sqlite3_exec(pCtx->db, "ROLLBACK", NULL, NULL, NULL);
+  }
+  pCtx->bInternal = 0;
+  pCtx->bEnabled = savedEnabled;
+  pCtx->bRootDirty = 1;
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "hpplite: replay of batch %llu failed: %s\n",
+            (unsigned long long)pBatch->height, sqlite3_errmsg(pCtx->db));
+    return rc;
+  }
+
+  rc = bkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  pCtx->bInternal = 1;
+  rc = advanceMeta(pCtx, pBatch, 0);
+  pCtx->bInternal = 0;
+  rc = bkEnd(pCtx, rc);
+  if (rc != SQLITE_OK) return rc;
+
+  /* The seed of `hpplite verify`: does the content match what was posted? */
+  hpplite_get_state_root(pCtx, root);
+  if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
+    fprintf(stderr, "hpplite: state root mismatch after replaying batch %llu\n",
+            (unsigned long long)pBatch->height);
+  }
+  return SQLITE_OK;
+}
+
+int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
+  sqlite3_stmt *pStmt;
+  sqlite3_int64 maxId = 0;
+  int rc, i = 0, ok = 1;
+
+  if (!pCtx || !pBatch) return SQLITE_MISUSE;
+  if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
+
+  pCtx->bInternal = 1;
+  rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "SELECT id, sql FROM _hpplite_pending ORDER BY id LIMIT ?1", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) { pCtx->bInternal = 0; return rc; }
+  sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
+  while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
+    const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
+    if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0) {
+      ok = 0;
+      break;
+    }
+    maxId = sqlite3_column_int64(pStmt, 0);
+    i++;
+  }
+  sqlite3_finalize(pStmt);
+  pCtx->bInternal = 0;
+  if (!ok || i != pBatch->nTxns) return SQLITE_MISMATCH;
+
+  return hpplite_finalize_batch(pCtx, pBatch, maxId);
+}
+
+int hpplite_pending_count(HppliteCtx *pCtx) {
+  sqlite3_stmt *pStmt;
+  int n = 0;
+  if (!pCtx) return 0;
+  pCtx->bInternal = 1;
+  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT count(*) FROM _hpplite_pending",
+                         -1, &pStmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int(pStmt, 0);
+    sqlite3_finalize(pStmt);
+  }
+  pCtx->bInternal = 0;
+  return n;
+}
+
 uint64_t hpplite_get_block_height(HppliteCtx *pCtx) {
   return pCtx ? pCtx->blockHeight : 0;
 }
 
-/*
-** Get previous block hash.
-*/
 void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut) {
   if (pCtx && pOut) {
     memcpy(pOut, pCtx->prevBlockHash, HPPLITE_HASH_SIZE);
   }
 }
 
-/*
-** Discard all pending transactions.
-*/
-void hpplite_discard_pending(HppliteCtx *pCtx) {
-  if (pCtx) {
-    freeAllPending(pCtx);
+int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRoot) {
+  sqlite3_stmt *pStmt;
+  int rc;
+  if (!pCtx || !pRoot) return SQLITE_MISUSE;
+  pCtx->bInternal = 1;
+  rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "UPDATE _hpplite_meta SET last_checkpoint_height=?1, last_checkpoint_root=?2 WHERE id=1",
+    -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height);
+    sqlite3_bind_blob(pStmt, 2, pRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    sqlite3_finalize(pStmt);
   }
-}
-
-/*
-** Finalize a verified batch (for observers).
-** Increments block height and clears pending SQL without creating a batch.
-** Used after successfully verifying a batch from the sequencer.
-*/
-void hpplite_finalize_verified_batch(HppliteCtx *pCtx) {
-  if (!pCtx) return;
-
-  /* Increment block height */
-  pCtx->blockHeight++;
-
-  /* Clear pending SQL (executed during verification) */
-  freeAllPending(pCtx);
-
-  /* Note: prevBlockHash would ideally be updated from the batch,
-   * but for verification purposes, only the state root matters */
+  pCtx->bInternal = 0;
+  if (rc == SQLITE_OK) {
+    pCtx->lastCheckpointHeight = height;
+    memcpy(pCtx->lastCheckpointRoot, pRoot, HPPLITE_HASH_SIZE);
+  }
+  return rc;
 }
 
 /*
@@ -1018,52 +1122,15 @@ static void hpplite_sync_func(
     sqlite3 *db = sqlite3_context_db_handle(ctx);
     HppliteNode *node = findNode(db);
 
-    if (!node) {
+    if (!node || !node->l1) {
         sqlite3_result_int(ctx, 0);
         return;
     }
 
-    if (!node->l1) {
-        /* No L1 connection, nothing to sync */
-        sqlite3_result_int(ctx, 0);
-        return;
-    }
-
-    /* Get current L1 state */
-    uint64_t lastBatch = 0, totalBatches = 0;
-    unsigned char latestHash[32];
-    if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) {
-        sqlite3_result_int(ctx, 0);
-        return;
-    }
-
-    /* Replay batches we haven't seen yet */
-    uint64_t currentHeight = node->ctx->blockHeight - 1;
-    int synced = 0;
-
-    for (uint64_t h = currentHeight + 1; h <= lastBatch; h++) {
-        size_t dataLen = 0;
-        uint8_t *data = hpplite_l1_get_batch(node->l1, h, &dataLen);
-        if (data && dataLen > 0) {
-            HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
-            if (batch) {
-                for (int i = 0; i < batch->nTxns; i++) {
-                    if (batch->aTxns[i].zSql) {
-                        sqlite3_exec(node->db, batch->aTxns[i].zSql, NULL, NULL, NULL);
-                    }
-                }
-                node->ctx->blockHeight = batch->height + 1;
-                node->lastCheckpointHeight = batch->height;
-                memcpy(node->lastCheckpointRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
-                memcpy(node->lastFlushedRoot, batch->postStateRoot, HPPLITE_HASH_SIZE);
-                hpplite_batch_free(batch);
-                synced++;
-            }
-            free(data);
-        }
-    }
-
-    sqlite3_result_int(ctx, synced);
+    /* Running inside a statement on this connection: replay without
+    ** wrapping each batch transaction in BEGIN/COMMIT. */
+    int synced = hpplite_node_sync_from_l1(node, 0);
+    sqlite3_result_int(ctx, synced < 0 ? 0 : synced);
 }
 
 /*

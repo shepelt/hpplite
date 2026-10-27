@@ -161,6 +161,13 @@ char *hpplite_l1_renew_lease(
 );
 
 /*
+** Give up our sequencer lease (graceful shutdown). The rollup owner's wallet
+** expires the lease immediately so the next instance can claim it without
+** waiting for LEASE_DURATION. Returns transaction hash on success, NULL on failure.
+*/
+char *hpplite_l1_release_lease(HppliteL1 *l1);
+
+/*
 ** Check if lease is active for the given instance.
 ** Returns 1 if active, 0 if expired/not held.
 */
@@ -353,6 +360,11 @@ uint64_t hpplite_l1_mock_get_timestamp(HppliteL1 *l1);
 ** Get mock current block
 */
 uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
+
+/*
+** Make hpplite_l1_submit_batch() fail (for testing retry behaviour)
+*/
+void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
 
 /*
 ** Get last checkpoint (for testing)
