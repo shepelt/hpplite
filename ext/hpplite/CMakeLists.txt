@@ -160,6 +160,10 @@ if(HPPLITE_BUILD_TESTS)
     if(NOT HPPLITE_USE_REAL_L1)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
+
+    # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
+    add_test(NAME docs_factory_address
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_docs.sh ${CMAKE_CURRENT_SOURCE_DIR})
     endif()
 endif()
 

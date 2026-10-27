@@ -10,8 +10,7 @@ HPPLite enables verifiable SQL with checkpoint finality on Ethereum-compatible L
 // Just use SQLite with a special URI - that's it!
 sqlite3 *db;
 sqlite3_open_v2(
-    "file:myapp.db?hpplite=on&rpc=https://sepolia.hpp.io"
-    "&factory=0x51cD96b8F0BE5bD920326709D39b62130291CaDe"
+    "file:myapp.db?hpplite=on&l1=hpp-sepolia"
     "&privkey=0xYOUR_PRIVATE_KEY",
     &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
 
@@ -23,7 +22,7 @@ sqlite3_exec(db, "INSERT INTO users VALUES(1, 'alice')", NULL, NULL, NULL);
 sqlite3_close(db);
 ```
 
-On first open, the factory auto-deploys your rollup contract (~3s). All writes are batched and submitted to L1 for data availability.
+`l1=hpp-sepolia` selects the RPC endpoint and factory contract for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). All writes are batched and submitted to L1 for data availability.
 
 ## Architecture
 
@@ -65,21 +64,26 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0x51cD96b8F0BE5bD920326709D39b62130291CaDe` | Creates rollups (one per wallet) |
-| HPPLiteDA | *(per-user)* | Your rollup contract |
+| HPPLiteFactory | `0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f` | Creates rollups (one per wallet); built into the `hpp-sepolia` alias |
+| HPPLite | *(per wallet)* | Your rollup's coordination contract: sequencer lease, checkpoints |
+| HPPLiteDA | *(per wallet)* | Your rollup's data-availability contract: batch data |
+
+The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`); `ctest` fails if this README disagrees with it.
 
 ## URI Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `hpplite` | Yes | Set to `on` to enable |
-| `rpc` | Yes | L1 RPC URL |
-| `factory` | Yes* | Factory contract address |
-| `contract` | Yes* | Direct rollup address (if known) |
-| `privkey` | Yes | Private key for signing |
+| `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory` |
+| `rpc` | Yes* | L1 RPC URL (if no `l1`) |
+| `factory` | Yes* | Factory contract address (if no `l1`) |
+| `contract` | No | Connect to an existing rollup instead of using the factory |
+| `privkey` | Yes | Private key for signing (or `keyfile=/path`) |
 | `datadir` | No | Local data directory |
+| `interval` | No | Batch flush interval, e.g. `5s` (default) |
 
-*Either `factory` or `contract` is required.
+*Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
 ## Building
 
