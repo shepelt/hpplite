@@ -199,24 +199,23 @@ sqlite3_open_v2("file:verify.db?hpplite=on&mode=verify&contract=0x...", &db, ...
 
 No need to run 24/7 nodes. The ability to verify is the security guarantee.
 
-## Roadmap
+## Versions
 
-### Completed
-- [x] Content-hash state roots (recomputable from the file by anyone)
-- [x] Crash-safe pending log inside the database file
-- [x] Batch creation and signing
-- [x] L1 checkpoint anchoring
-- [x] Factory-based deployment
-- [x] On-chain data availability
-- [x] Transparent SQLite API
-- [x] State reconstruction from L1
+Scope is tied to versions. The current branch is **v0.1 in progress**.
 
-### Planned
-- [ ] Verify CLI (`hpplite verify`)
-- [ ] Batch compression (reduce DA costs)
-- [ ] Challenge/fraud proof submission
-- [ ] Light client mode (Merkle proofs only)
-- [ ] Read replicas (opt-in stale reads for scale)
+| Version | Scope | Database size | DA |
+|---------|-------|---------------|----|
+| **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence | per-tenant / single-tenant, up to ~100 MB | L1 calldata |
+| v0.2 | `hpplite verify` CLI, per-table divergence reporting | same | same |
+| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, batch compression | GB range | S3 + L1 commitments |
+| v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
+
+Why the size bound in v0.1: the state root is a content hash, O(database size) per
+computation (~28 ms/MB); see [doc/architecture.md](doc/architecture.md#state-root).
+Beyond that, shard per tenant (the factory can create several rollups per wallet)
+until v0.3.
+
+Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
 
 ## Durability
 

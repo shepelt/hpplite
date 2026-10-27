@@ -95,30 +95,19 @@ Rebase, never merge, so `git log version-X..hpplite` always answers "what did we
 
 ---
 
-## M4: Verify CLI (Next)
+## Versions (GitHub milestones)
 
-One-click verification from L1 data:
-
-```bash
-hpplite verify 0xCONTRACT_ADDRESS --rpc https://sepolia.hpp.io
-```
-
-Implementation:
-- [ ] CLI argument parsing
-- [ ] Fetch all batches from L1
-- [ ] Replay SQL in order
-- [ ] Compute and compare state roots
-- [ ] Report verification result
-
-This is the "ability to verify" that provides security without running 24/7 nodes.
+- **v0.1 — Small databases, on-chain DA** (current): #10 root at checkpoint cadence, #13 run examples in the integration suite. Scope: databases up to ~100 MB, L1 calldata DA.
+- **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting.
+- **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #12 batch compression. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
+- **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
 
 ---
 
 ## Future
 
 ### Cost Optimization
-- [ ] Batch compression (gzip/zstd)
-- [ ] Off-chain DA options (IPFS, Arweave) with L1 commitment
+- [ ] Off-chain DA beyond S3 (IPFS, Arweave) with L1 commitment
 - [ ] Batch aggregation (multiple txs per batch)
 
 ### Security
@@ -127,7 +116,6 @@ This is the "ability to verify" that provides security without running 24/7 node
 - [ ] Fraud proof generation
 
 ### Light Clients
-- [ ] Incremental state root (per-table Merkle) instead of full content scan per flush
 - [ ] Merkle proofs for state queries
 - [ ] Verify specific rows without full replay
 - [ ] Mobile-friendly verification
