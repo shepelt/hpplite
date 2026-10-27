@@ -142,6 +142,14 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         }
     }
 
+    /* Factory */
+    val = getenv(HPPLITE_ENV_FACTORY);
+    if (val) {
+        if (hex_to_bytes(val, cfg->factory, 20) == 0) {
+            cfg->hasFactory = 1;
+        }
+    }
+
     /* Private key */
     val = getenv(HPPLITE_ENV_PRIVKEY);
     if (val) {
@@ -169,7 +177,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     }
 
     /* Batch interval */
-    val = getenv("HPPLITE_BATCH_INTERVAL");
+    val = getenv(HPPLITE_ENV_BATCH_INTERVAL);
     if (val) {
         int ms = parse_duration_ms(val);
         if (ms > 0) cfg->batchIntervalMs = ms;

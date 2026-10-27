@@ -230,7 +230,7 @@ int sqlite3_hpplite_init(
 **   privkey=0x...     Private key (or keyfile=/path)
 **
 ** Environment variables (lower priority than URI):
-**   HPPLITE_ROLE, HPPLITE_CHAIN_ID, HPPLITE_RPC_URL, etc.
+**   HPPLITE_PRIVATE_KEY, HPPLITE_L1_RPC, HPPLITE_FACTORY_ADDRESS, etc. (see config.h)
 */
 
 /* Forward declaration */

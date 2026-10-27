@@ -106,11 +106,11 @@ file:myapp.db?hpplite=on&l1=hpp-sepolia&privkey=0x...
 Configuration can also be set via environment (URI params take priority):
 
 ```bash
-export HPPLITE_RPC_URL=https://sepolia.hpp.io
-export HPPLITE_FACTORY=0x51cD96b8F0BE5bD920326709D39b62130291CaDe
+export HPPLITE_L1_RPC=https://sepolia.hpp.io
+export HPPLITE_FACTORY_ADDRESS=0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f
 export HPPLITE_PRIVATE_KEY=0x...
 export HPPLITE_DATA_DIR=/var/lib/hpplite
-export HPPLITE_BATCH_INTERVAL=60
+export HPPLITE_BATCH_INTERVAL=60s
 ```
 
 ## Network Info

@@ -7,15 +7,17 @@
 ** URI format:
 **   file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia&contract=0x...
 **
-** Environment variables:
-**   HPPLITE_ROLE        - sequencer|observer
-**   HPPLITE_CHAIN_ID    - Chain ID (e.g., 181228)
-**   HPPLITE_RPC_URL     - RPC endpoint
-**   HPPLITE_CONTRACT    - L1 contract address
-**   HPPLITE_PRIVKEY     - Private key (hex)
-**   HPPLITE_PRIVKEY_FILE - Path to private key file
-**   HPPLITE_DATA_DIR    - Data directory for batches
-**   HPPLITE_NODE_ID     - Node identifier
+** Environment variables (same names as .env / run_integration.sh):
+**   HPPLITE_PRIVATE_KEY       - Private key (0x + 64 hex)
+**   HPPLITE_PRIVATE_KEY_FILE  - Path to a file containing the private key
+**   HPPLITE_L1_RPC            - L1 RPC endpoint
+**   HPPLITE_L1_CHAIN_ID       - L1 chain ID (e.g., 181228)
+**   HPPLITE_FACTORY_ADDRESS   - Factory contract (auto-creates rollup per wallet)
+**   HPPLITE_CONTRACT_ADDRESS  - Existing rollup contract
+**   HPPLITE_DATA_DIR          - Local data directory
+**   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m)
+**   HPPLITE_ROLE              - sequencer|observer
+**   HPPLITE_NODE_ID           - Node identifier (status output only)
 */
 
 #ifndef HPPLITE_CONFIG_H
@@ -31,13 +33,15 @@ extern "C" {
 ** Environment variable names
 */
 #define HPPLITE_ENV_ROLE          "HPPLITE_ROLE"
-#define HPPLITE_ENV_CHAIN_ID      "HPPLITE_CHAIN_ID"
-#define HPPLITE_ENV_RPC_URL       "HPPLITE_RPC_URL"
-#define HPPLITE_ENV_CONTRACT      "HPPLITE_CONTRACT"
-#define HPPLITE_ENV_PRIVKEY       "HPPLITE_PRIVKEY"
-#define HPPLITE_ENV_PRIVKEY_FILE  "HPPLITE_PRIVKEY_FILE"
+#define HPPLITE_ENV_CHAIN_ID      "HPPLITE_L1_CHAIN_ID"
+#define HPPLITE_ENV_RPC_URL       "HPPLITE_L1_RPC"
+#define HPPLITE_ENV_CONTRACT      "HPPLITE_CONTRACT_ADDRESS"
+#define HPPLITE_ENV_FACTORY       "HPPLITE_FACTORY_ADDRESS"
+#define HPPLITE_ENV_PRIVKEY       "HPPLITE_PRIVATE_KEY"
+#define HPPLITE_ENV_PRIVKEY_FILE  "HPPLITE_PRIVATE_KEY_FILE"
 #define HPPLITE_ENV_DATA_DIR      "HPPLITE_DATA_DIR"
 #define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
+#define HPPLITE_ENV_BATCH_INTERVAL "HPPLITE_BATCH_INTERVAL"
 
 /*
 ** URI parameter names (same as env vars but lowercase, no prefix)

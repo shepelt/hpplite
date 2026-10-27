@@ -16,3 +16,17 @@ ext/hpplite/contracts/cache/
 *.swp
 *~
 *.dSYM/
+
+# HPPLite build trees (CMake out-of-source; run_integration.sh defaults to build_real/)
+ext/hpplite/build_*/
+
+# Foundry per-run broadcast logs (run-latest.json is kept as the deployment record)
+ext/hpplite/contracts/broadcast/**/run-[0-9]*.json
+
+# Integration-test state (per-deployer factory cache, generated env)
+ext/hpplite/tests/integration/.factory_address
+ext/hpplite/tests/integration/.env.test
+ext/hpplite/tests/.env
+
+# macOS
+.DS_Store
