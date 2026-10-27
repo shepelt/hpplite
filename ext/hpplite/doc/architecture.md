@@ -157,6 +157,15 @@ Flushing a batch:
    Not confirmed -> leave everything; retry next interval at the same height.
 ```
 
+The DA contract caps a batch at `batchSizeLimit` (128 KB by default, read
+from the contract's system config on connect). Pending SQL beyond that is
+submitted as a series of batches, each cut at a transaction boundary when
+possible and marked `"partial": 1` except the last. A partial batch carries
+the state root of the end of its series, so verification compares roots at
+non-partial batches only. The timer flushes early once pending SQL reaches
+half the limit, so series are the exception. A single statement that cannot
+fit on its own is left pending and reported (`hpplite_status.log_errors`).
+
 Bookkeeping (steps 1, 2, 4) runs on a second connection to the same file,
 so the background flush never touches the application's transaction state.
 File databases are switched to WAL and both connections get a 5 s busy

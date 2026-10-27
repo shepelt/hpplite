@@ -94,6 +94,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.hasContract = config->hasContract;
     node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
     node->config.batchIntervalMs = config->batchIntervalMs;
+    node->config.maxBatchBytes = config->maxBatchBytes ? config->maxBatchBytes : 128 * 1024;
 
     /* Generate unique instance ID */
     generate_instance_id(node->instanceId);
@@ -153,6 +154,8 @@ static int node_init_tracking(HppliteNode *node) {
     node->lastFlushTime = node_current_time_ms();
     return SQLITE_OK;
 }
+
+static void node_learn_batch_limit(HppliteNode *node);
 
 /*
 ** Auto-connect to L1 and sync state.
@@ -217,6 +220,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
 
     /* Catch up with whatever is already on L1 */
     if (node->l1) {
+        node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
         }
@@ -366,6 +370,19 @@ void hpplite_node_destroy(HppliteNode *node) {
 */
 
 /*
+** Take the DA size limit from the contract's system config, if it has one.
+*/
+static void node_learn_batch_limit(HppliteNode *node) {
+    HppliteSystemConfig *cfg;
+    if (!node || !node->l1) return;
+    cfg = hpplite_l1_get_system_config(node->l1);
+    if (cfg) {
+        if (cfg->batchSizeLimit > 0) node->config.maxBatchBytes = (size_t)cfg->batchSizeLimit;
+        hpplite_l1_system_config_free(cfg);
+    }
+}
+
+/*
 ** Fetch and parse the batch at `height` from L1. NULL if absent.
 */
 static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
@@ -408,24 +425,23 @@ static int node_adopt_existing(HppliteNode *node) {
     return -1;
 }
 
-static uint64_t node_flush_unlocked(HppliteNode *node) {
+/*
+** Build, submit and finalize one batch. *pMore is set when pending SQL
+** remains because the batch was cut at the size limit.
+** Returns the confirmed height, or 0.
+*/
+static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
     HppliteBatch *batch;
     sqlite3_int64 maxId = 0;
     uint64_t height;
     int confirmed = 0;
 
-    if (!ctx) return 0;
-    node->lastFlushTime = node_current_time_ms();
-
-    /* Finish anything a previous attempt left on L1 */
-    if (node->l1) {
-        while (node_adopt_existing(node) == 1) { }
-    }
-
-    batch = hpplite_build_batch(ctx, &maxId);
+    *pMore = 0;
+    batch = hpplite_build_batch_limited(ctx, node->config.maxBatchBytes, &maxId);
     if (!batch) return 0;
     height = batch->height;
+    *pMore = batch->partial;
 
     if (node->l1) {
         /* Ensure we have an active lease before submitting */
@@ -452,6 +468,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
             if (!confirmed) {
                 fprintf(stderr, "hpplite: batch %llu not confirmed on L1, kept pending\n",
                         (unsigned long long)height);
+                *pMore = 0;
             }
             hpplite_batch_free(batch);
             return confirmed ? height : 0;
@@ -468,6 +485,33 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     }
 
     hpplite_batch_free(batch);
+    return height;
+}
+
+static uint64_t node_flush_unlocked(HppliteNode *node) {
+    uint64_t height = 0, h;
+    int more;
+
+    if (!node->ctx) return 0;
+    node->lastFlushTime = node_current_time_ms();
+
+    /* Finish anything a previous attempt left on L1; if L1 holds history
+    ** that is not ours, refuse to write rather than fork the chain */
+    if (node->l1) {
+        int rc;
+        while ((rc = node_adopt_existing(node)) == 1) { }
+        if (rc < 0) {
+            node->state = HPPLITE_STATE_ERROR;
+            return 0;
+        }
+    }
+
+    /* One batch per call normally; several when the size limit splits them */
+    do {
+        h = node_flush_one(node, &more);
+        if (h == 0) break;
+        height = h;
+    } while (more);
     return height;
 }
 
@@ -543,11 +587,13 @@ static void *node_timer_thread_func(void *arg) {
 
         if (!node->timerRunning) break;
 
-        /* Check if time to flush */
+        /* Flush on the interval, or early once pending SQL nears the DA limit */
         int64_t now = node_current_time_ms();
         int64_t elapsed = now - node->lastFlushTime;
+        int sizeTrigger = node->config.maxBatchBytes > 0 &&
+            hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2);
 
-        if (elapsed >= intervalMs) {
+        if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
             if (mutex) {
                 pthread_mutex_lock(mutex);
@@ -751,6 +797,7 @@ void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1) {
     if (node->config.hasPrivkey) {
         hpplite_l1_set_privkey(l1, node->config.privkey);
     }
+    node_learn_batch_limit(node);
 }
 
 /*

@@ -128,7 +128,8 @@ cmake --build ext/hpplite/build_real
 
 ```bash
 # Unit tests (mock L1, fast, no network)
-ctest                    # Run all unit tests (~4s)
+ctest                    # 13 suites, ~6s: core, batch, node, open API,
+                         # durability (16 cases), loadable extension, docs check
 
 # Integration tests (real L1, requires funded wallet)
 export HPPLITE_PRIVATE_KEY=0x...

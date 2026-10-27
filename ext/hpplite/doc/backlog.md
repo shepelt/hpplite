@@ -34,6 +34,16 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Batch size limit and test coverage (issues #7, #8)
+- Batches are cut at the DA `batchSizeLimit` (`partial` series); early flush
+  at half the limit; oversized single statements reported, not retried blindly
+- `test_hpplite` / `test_batch` have real assertions (they always exited 0)
+- Durability suite: adopt after lost confirmation / after crash, divergence
+  refused, timer flush vs open transaction, checkpoint persistence, `:memory:`
+  node, `hpplite_sync()`, size-limit chunking + reconstruction
+- Mock L1 enforces sequential heights and the size limit like the contract
+- JSON parser decodes `\uXXXX` (control characters in SQL round-trip)
+
 ### Durability (issue #6)
 - Pending SQL in `_hpplite_pending`, written inside the user's transaction
 - `_hpplite_meta` for height / prev hash / root / checkpoint

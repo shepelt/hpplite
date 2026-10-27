@@ -367,6 +367,23 @@ uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
 
 /*
+** Store submitted batches but report failure, as if the RPC reply was lost
+** (for testing the adopt path)
+*/
+void hpplite_l1_mock_set_lose_confirmation(HppliteL1 *l1, int lose);
+
+/*
+** Make hpplite_l1_wait_for_tx() report the transaction as still pending
+** (-1), as on a slow or stalled chain
+*/
+void hpplite_l1_mock_set_tx_pending(HppliteL1 *l1, int pending);
+
+/*
+** Batch size limit enforced by the mock DA (default 128 KB)
+*/
+void hpplite_l1_mock_set_batch_size_limit(HppliteL1 *l1, size_t limit);
+
+/*
 ** Get last checkpoint (for testing)
 */
 const HppliteCheckpoint *hpplite_l1_mock_get_last_checkpoint(HppliteL1 *l1);

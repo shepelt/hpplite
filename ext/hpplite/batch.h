@@ -37,6 +37,7 @@ struct HppliteBatch {
   unsigned char postStateRoot[HPPLITE_HASH_SIZE]; /* State after batch */
   int nTxns;                                 /* Number of transactions */
   HppliteTxn *aTxns;                         /* Array of transactions */
+  int partial;                               /* More pending SQL follows in the next batch */
 };
 
 /*

@@ -58,6 +58,9 @@ struct HppliteL1 {
 
     /* Batch DA storage */
     int failSubmit;              /* Test hook: reject batch submissions */
+    int loseConfirmation;        /* Test hook: store but report failure */
+    int txPending;               /* Test hook: wait_for_tx never confirms */
+    size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
@@ -167,7 +170,7 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     config->version = 4;
     config->checkpointInterval = l1->checkpointInterval;
     config->leaseDuration = l1->leaseDuration;
-    config->batchSizeLimit = 128 * 1024;
+    config->batchSizeLimit = l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024;
 
     return config;
 }
@@ -409,10 +412,10 @@ int hpplite_l1_poll(HppliteL1 *l1) {
 }
 
 int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
-    (void)l1;
     (void)tx_hash;
     (void)timeout_secs;
-    /* Mock always succeeds immediately */
+    if (l1 && l1->txPending) return -1;   /* still pending after the timeout */
+    /* Mock succeeds immediately */
     return 1;
 }
 
@@ -420,6 +423,18 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
 
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
     if (l1) l1->failSubmit = fail;
+}
+
+void hpplite_l1_mock_set_lose_confirmation(HppliteL1 *l1, int lose) {
+    if (l1) l1->loseConfirmation = lose;
+}
+
+void hpplite_l1_mock_set_tx_pending(HppliteL1 *l1, int pending) {
+    if (l1) l1->txPending = pending;
+}
+
+void hpplite_l1_mock_set_batch_size_limit(HppliteL1 *l1, size_t limit) {
+    if (l1) l1->batchSizeLimit = limit;
 }
 
 void hpplite_l1_mock_set_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
@@ -546,6 +561,12 @@ char *hpplite_l1_submit_batch(
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
     if (l1->failSubmit) return NULL;
+    if (data_len > (l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024)) {
+        return NULL;  /* "Batch too large" */
+    }
+    if (height != l1->nBatches + 1) {
+        return NULL;  /* "Non-sequential batch" */
+    }
 
     /* Verify instanceId matches active lease */
     if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {
@@ -572,6 +593,7 @@ char *hpplite_l1_submit_batch(
         l1->nBatches = height;
     }
 
+    if (l1->loseConfirmation) return NULL;  /* stored, but the caller never hears */
     return sqlite3_mprintf("0x%016llx", (unsigned long long)height);
 }
 

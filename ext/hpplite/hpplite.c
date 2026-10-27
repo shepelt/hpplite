@@ -620,10 +620,26 @@ static int bkEnd(HppliteCtx *pCtx, int rc) {
 }
 
 struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId) {
+  return hpplite_build_batch_limited(pCtx, 0, pMaxId);
+}
+
+/*
+** Drop the last statement of a batch.
+*/
+static void batchPop(HppliteBatch *pBatch) {
+  if (pBatch->nTxns > 0) {
+    pBatch->nTxns--;
+    sqlite3_free(pBatch->aTxns[pBatch->nTxns].zSql);
+    pBatch->aTxns[pBatch->nTxns].zSql = NULL;
+  }
+}
+
+struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes, sqlite3_int64 *pMaxId) {
   HppliteBatch *pBatch = NULL;
   sqlite3_stmt *pStmt = NULL;
+  sqlite3_int64 *aId = NULL;
   sqlite3_int64 maxId = 0, lastTxn = -1, txnRel = -1;
-  int rc;
+  int rc, nAlloc = 0;
 
   if (!pCtx) return NULL;
   if (bkBegin(pCtx, 0) != SQLITE_OK) return NULL;
@@ -639,9 +655,16 @@ struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId
         if (!pBatch) break;
         hpplite_batch_set_pre_state(pBatch, pCtx->stateRoot);
       }
+      if (pBatch->nTxns >= nAlloc) {
+        sqlite3_int64 *aNew;
+        nAlloc = nAlloc ? nAlloc * 2 : 64;
+        aNew = sqlite3_realloc(aId, (int)(sizeof(sqlite3_int64) * nAlloc));
+        if (!aNew) break;
+        aId = aNew;
+      }
       if (txn != lastTxn) { txnRel++; lastTxn = txn; }
       hpplite_batch_add_stmt(pBatch, (const char*)sqlite3_column_text(pStmt, 2), -1, txnRel);
-      maxId = sqlite3_column_int64(pStmt, 0);
+      aId[pBatch->nTxns - 1] = sqlite3_column_int64(pStmt, 0);
     }
     sqlite3_finalize(pStmt);
   }
@@ -660,8 +683,56 @@ struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId
   pCtx->bInternal = 0;
   bkEnd(pCtx, SQLITE_OK);
 
+  /* Trim to the size limit: drop trailing statements until the JSON fits,
+  ** then back up to a transaction boundary when that leaves anything. */
+  if (pBatch && maxBytes > 0) {
+    int nFull = pBatch->nTxns;
+    for (;;) {
+      char *zJson = hpplite_batch_to_json(pBatch);
+      size_t n = zJson ? strlen(zJson) : 0;
+      sqlite3_free(zJson);
+      if (n <= maxBytes) break;
+      if (pBatch->nTxns <= 1) {
+        pCtx->nLogErrors++;
+        fprintf(stderr, "hpplite: statement of %zu bytes exceeds the batch size limit (%zu); left pending\n",
+                n, maxBytes);
+        hpplite_batch_free(pBatch);
+        pBatch = NULL;
+        break;
+      }
+      batchPop(pBatch);
+      pBatch->partial = 1;
+    }
+    if (pBatch && pBatch->partial && pBatch->nTxns < nFull) {
+      /* If the cut landed inside a transaction group that started in this
+      ** batch, move the whole group to the next batch */
+      int64_t cutTxn = pBatch->aTxns[pBatch->nTxns - 1].txn;
+      int i = pBatch->nTxns;
+      while (i > 0 && pBatch->aTxns[i - 1].txn == cutTxn) i--;
+      if (i > 0) {
+        while (pBatch->nTxns > i) batchPop(pBatch);
+      }
+    }
+  }
+
+  if (pBatch) maxId = aId[pBatch->nTxns - 1];
+  sqlite3_free(aId);
   if (pMaxId) *pMaxId = maxId;
   return pBatch;
+}
+
+sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
+  sqlite3_stmt *pStmt;
+  sqlite3_int64 n = 0;
+  if (!pCtx) return 0;
+  pCtx->bInternal = 1;
+  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending",
+                         -1, &pStmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int64(pStmt, 0);
+    sqlite3_finalize(pStmt);
+  }
+  pCtx->bInternal = 0;
+  return n;
 }
 
 /*
@@ -769,9 +840,11 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   rc = bkEnd(pCtx, rc);
   if (rc != SQLITE_OK) return rc;
 
-  /* The seed of `hpplite verify`: does the content match what was posted? */
+  /* The seed of `hpplite verify`: does the content match what was posted?
+  ** A partial batch carries the root of the end of its series, so only the
+  ** last batch of a series is checked. */
   hpplite_get_state_root(pCtx, root);
-  if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
+  if (!pBatch->partial && memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
     fprintf(stderr, "hpplite: state root mismatch after replaying batch %llu\n",
             (unsigned long long)pBatch->height);
   }

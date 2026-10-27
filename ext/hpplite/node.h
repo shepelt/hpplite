@@ -53,6 +53,7 @@ typedef struct HppliteNodeConfig {
     /* Sequencer Settings */
     int checkpointInterval;         /* Batches between L1 checkpoints */
     int batchIntervalMs;            /* Auto-flush interval (0 = disabled) */
+    size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
 } HppliteNodeConfig;
 
 /*

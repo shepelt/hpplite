@@ -335,6 +335,308 @@ static void test_stale_lease_after_crash(void) {
     PASS();
 }
 
+/* 9. Confirmation lost after a successful submit: next flush adopts the L1 batch */
+static void test_adopt_after_lost_confirmation(void) {
+    TEST("lost confirmation: batch on L1 is adopted, not resubmitted");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/adopt.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+
+    hpplite_l1_mock_set_lose_confirmation(l1, 1);
+    /* submit stores the batch on L1 but reports failure; flush must notice
+    ** the batch is there and finalize it instead of giving up */
+    if (hpplite_node_flush_batch(n) != 1) FAIL("flush should adopt the batch it just lost track of");
+    if (hpplite_node_pending_count(n) != 0) FAIL("pending should be empty after adoption");
+    if (hpplite_node_get_height(n) != 2) FAIL("height should be 2");
+    hpplite_l1_mock_set_lose_confirmation(l1, 0);
+
+    /* and the normal case afterwards continues at the right height */
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(n) != 2) FAIL("next batch should be height 2");
+    size_t len = 0;
+    uint8_t *data = hpplite_l1_get_batch(l1, 2, &len);
+    HppliteBatch *b = data ? hpplite_batch_from_json((const char *)data) : NULL;
+    free(data);
+    if (!b || b->nTxns != 1) FAIL("batch 2 should hold only the new INSERT");
+    hpplite_batch_free(b);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 10. Crash between submit and finalize, then reopen: adopted on open */
+static void test_adopt_on_reopen(void) {
+    TEST("crash after submit: reopen adopts the batch from L1");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/adopt2.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    /* put the batch on L1 "by hand" without finalizing locally */
+    sqlite3_int64 maxId = 0;
+    HppliteBatch *b = hpplite_build_batch(n->ctx, &maxId);
+    char *json = hpplite_batch_to_json(b);
+    char *tx = hpplite_l1_submit_batch(l1, n->instanceId, b->height, (const uint8_t *)json, strlen(json));
+    if (!tx) FAIL("manual submit");
+    sqlite3_free(tx); sqlite3_free(json); hpplite_batch_free(b);
+    /* crash: tear the node down without the flush destroy would do */
+    n->hasLease = 0;
+    n->l1 = NULL;
+    hpplite_node_stop_timer(n);
+    hpplite_unregister_node(n->db);
+    hpplite_shutdown(n->ctx); n->ctx = NULL;
+    if (n->bkDb) { sqlite3_close(n->bkDb); n->bkDb = NULL; }
+    sqlite3_close(n->db); n->db = NULL;
+    n->ownsDb = 0;
+    hpplite_node_destroy(n);
+
+    n = open_node(DIR "/adopt2.db", l1);
+    if (!n) FAIL("reopen");
+    if (hpplite_node_pending_count(n) != 0) FAIL("reopen should have adopted the L1 batch");
+    if (hpplite_node_get_height(n) != 2) FAIL("height should be 2 after adoption");
+    if (count_rows(n->db, "t") != 1) FAIL("local rows must be intact (no replay over them)");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 11. L1 holds a batch at our height that is not ours: refuse to fork */
+static void test_divergence_refused(void) {
+    TEST("pending SQL that does not match the L1 batch is refused, not forked");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/div_a.db", l1);
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(a, "INSERT INTO t VALUES('from a')", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("a batch 1");
+    hpplite_node_destroy(a);
+
+    /* b was started against an empty L1 and wrote its own history locally */
+    HppliteL1 *empty = hpplite_l1_create_mock();
+    HppliteNode *b = open_node(DIR "/div_b.db", empty);
+    if (!b) FAIL("open b");
+    hpplite_node_exec(b, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(b, "INSERT INTO t VALUES('from b')", NULL);
+    hpplite_node_set_l1(b, l1);                /* now points at a's L1 */
+    if (hpplite_node_sync_from_l1(b, 1) != -1) FAIL("sync should report divergence");
+    if (hpplite_node_pending_count(b) != 2) FAIL("local pending must be untouched");
+    if (hpplite_node_flush_batch(b) != 0) FAIL("flush must not succeed over diverged history");
+    if (count_rows(b->db, "t") != 1) FAIL("local content must not be replayed over");
+    b->l1 = NULL;                               /* don't let destroy keep trying */
+    hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    hpplite_l1_disconnect(empty);
+    PASS();
+}
+
+/* 12. Background flush while the application holds an open transaction */
+static void test_timer_vs_open_transaction(void) {
+    TEST("background flush never sees or disturbs an open transaction");
+    reset_dir();
+    sqlite3 *db = hpplite_open("file:" DIR "/timer.db?hpplite=on&interval=100ms&datadir=" DIR);
+    if (!db) FAIL("open");
+    HppliteCtx *ctx = hpplite_context(db);
+    char *err = NULL;
+    if (sqlite3_exec(db, "CREATE TABLE t(x)", NULL, NULL, &err) != SQLITE_OK) FAIL("create");
+    usleep(300000);                                  /* timer flushes the CREATE */
+    uint64_t h1 = hpplite_get_block_height(ctx);
+    if (h1 != 2) { printf("(h=%llu) ", (unsigned long long)h1); FAIL("CREATE should have been flushed by the timer"); }
+
+    if (sqlite3_exec(db, "BEGIN; INSERT INTO t VALUES(1); INSERT INTO t VALUES(2);", NULL, NULL, &err) != SQLITE_OK) FAIL("begin");
+    usleep(400000);                                  /* several timer ticks inside the txn */
+    if (hpplite_get_block_height(ctx) != 2) FAIL("timer must not flush uncommitted rows");
+    if (sqlite3_exec(db, "INSERT INTO t VALUES(3); COMMIT;", NULL, NULL, &err) != SQLITE_OK) {
+        printf("(%s) ", err ? err : "?"); sqlite3_free(err);
+        FAIL("COMMIT failed while the timer thread was active (SQLITE_BUSY?)");
+    }
+    usleep(300000);
+    if (hpplite_get_block_height(ctx) != 3) FAIL("committed transaction should be flushed as one batch");
+    if (hpplite_pending_count(ctx) != 0) FAIL("pending should be empty");
+    sqlite3_close(db);
+    PASS();
+}
+
+/* 13. Checkpoint progress survives reopen */
+static void test_checkpoint_persists(void) {
+    TEST("checkpoint progress persists across reopen");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "cp"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
+    config.dataDir = DIR; config.dbPath = DIR "/cp.db"; config.checkpointInterval = 2;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_set_l1(n, l1); hpplite_node_start(n);
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL); hpplite_node_flush_batch(n);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL); hpplite_node_flush_batch(n);
+    if (!hpplite_node_should_checkpoint(n)) FAIL("should checkpoint after 2 batches");
+    char *tx = hpplite_node_submit_checkpoint(n);
+    if (!tx) FAIL("checkpoint");
+    sqlite3_free(tx);
+    hpplite_node_destroy(n);
+
+    n = hpplite_node_create(&config);
+    if (!n) FAIL("reopen");
+    hpplite_node_set_l1(n, l1);
+    if (n->lastCheckpointHeight != 2) { printf("(cp=%llu) ", (unsigned long long)n->lastCheckpointHeight); FAIL("last checkpoint height not restored"); }
+    if (n->ctx->lastCheckpointHeight != 2) FAIL("ctx checkpoint height not restored");
+    const HppliteCheckpoint *cp = hpplite_l1_mock_get_last_checkpoint(l1);
+    if (!cp || memcmp(cp->postStateRoot, n->lastCheckpointRoot, 32) != 0) FAIL("checkpoint root not restored");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 14. :memory: database through the node (bookkeeping on the same connection) */
+static void test_memory_database(void) {
+    TEST(":memory: database works with bookkeeping on the same connection");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(":memory:", l1);
+    if (!n) FAIL("open");
+    if (n->bkDb != NULL) FAIL("no second connection expected for :memory:");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_pending_count(n) != 2) FAIL("pending");
+    if (hpplite_node_flush_batch(n) != 1) FAIL("flush");
+    if (hpplite_node_pending_count(n) != 0) FAIL("pending after flush");
+    /* flush inside an open transaction must refuse rather than read uncommitted rows */
+    hpplite_node_exec(n, "BEGIN; INSERT INTO t VALUES(2);", NULL);
+    if (hpplite_node_flush_batch(n) != 0) FAIL("flush inside an open transaction should do nothing");
+    hpplite_node_exec(n, "COMMIT", NULL);
+    if (hpplite_node_flush_batch(n) != 2) FAIL("flush after commit");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 15. hpplite_sync() SQL function pulls new batches from L1 */
+static void test_sync_function(void) {
+    TEST("SELECT hpplite_sync() replays new L1 batches into a reader");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *reader = open_node(DIR "/reader.db", l1);   /* opened against an empty L1 */
+    if (!reader) FAIL("open reader");
+    hpplite_node_release_lease(reader);                       /* a reader does not sequence */
+    HppliteNode *writer = open_node(DIR "/writer.db", l1);
+    if (!writer) FAIL("open writer");
+    hpplite_node_exec(writer, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(writer, "INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_exec(writer, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(writer) != 1) FAIL("writer batch");
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(reader->db, "SELECT hpplite_sync()", -1, &s, NULL) != SQLITE_OK) FAIL("prepare sync");
+    int synced = (sqlite3_step(s) == SQLITE_ROW) ? sqlite3_column_int(s, 0) : -1;
+    sqlite3_finalize(s);
+    if (synced != 1) { printf("(synced=%d) ", synced); FAIL("expected 1 batch synced"); }
+    if (count_rows(reader->db, "t") != 2) FAIL("rows not replayed");
+    if (hpplite_node_pending_count(reader) != 0) FAIL("replayed SQL must not be pending");
+    if (hpplite_node_get_height(reader) != 2) FAIL("reader height");
+    reader->l1 = NULL;   /* reader never held the lease; nothing to release */
+    hpplite_node_destroy(reader);
+    hpplite_node_destroy(writer);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 16. Pending SQL beyond the DA size limit is submitted as several batches */
+static void test_batch_size_limit(void) {
+    TEST("pending SQL over the DA limit is split into batches that each fit");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_batch_size_limit(l1, 3000);
+    HppliteNode *n = open_node(DIR "/big.db", l1);
+    if (!n) FAIL("open");
+    if (n->config.maxBatchBytes != 3000) FAIL("limit not learned from L1 system config");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL);
+    char sql[512], pad[301];
+    memset(pad, 'x', 300); pad[300] = 0;
+    for (int i = 1; i <= 30; i++) {
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d,'%s')", i, pad);
+        hpplite_node_exec(n, sql, NULL);
+    }
+    hpplite_node_exec(n, "BEGIN; INSERT INTO t VALUES(31,'a'); INSERT INTO t VALUES(32,'b'); COMMIT;", NULL);
+
+    uint64_t last = hpplite_node_flush_batch(n);
+    if (last < 3) { printf("(last=%llu) ", (unsigned long long)last); FAIL("expected several batches"); }
+    if (hpplite_node_pending_count(n) != 0) FAIL("everything should have been flushed");
+    if (hpplite_node_get_height(n) != last + 1) FAIL("height");
+
+    unsigned char rootA[32];
+    hpplite_node_get_state_root(n, rootA);
+    int stmts = 0;
+    for (uint64_t h = 1; h <= last; h++) {
+        size_t len = 0;
+        uint8_t *data = hpplite_l1_get_batch(l1, h, &len);
+        if (!data) FAIL("batch missing on L1");
+        if (len > 3000) FAIL("a batch exceeds the limit");
+        HppliteBatch *b = hpplite_batch_from_json((const char *)data);
+        free(data);
+        if (!b) FAIL("parse");
+        if (h < last && !b->partial) FAIL("intermediate batch should be marked partial");
+        if (h == last && b->partial) FAIL("last batch must not be partial");
+        if (memcmp(b->postStateRoot, rootA, 32) != 0) FAIL("chunks must carry the series' final root");
+        /* the explicit 2-statement transaction must not be split */
+        for (int i = 0; i < b->nTxns; i++) {
+            if (strstr(b->aTxns[i].zSql, "VALUES(31,'a')") &&
+                (i + 1 >= b->nTxns || !strstr(b->aTxns[i + 1].zSql, "VALUES(32,'b')")))
+                FAIL("transaction split across batches");
+        }
+        stmts += b->nTxns;
+        hpplite_batch_free(b);
+    }
+    if (stmts != 33) { printf("(stmts=%d) ", stmts); FAIL("statement count across batches"); }
+
+    /* a fresh node rebuilt from the chunked history ends with the same content */
+    HppliteNode *r = open_node(DIR "/big_r.db", l1);
+    if (!r) FAIL("open reader");
+    unsigned char rootB[32];
+    hpplite_node_get_state_root(r, rootB);
+    if (count_rows(r->db, "t") != 32 || memcmp(rootA, rootB, 32) != 0) FAIL("reconstruction from chunks differs");
+    r->l1 = NULL;
+    hpplite_node_destroy(r);
+
+    /* a single statement that cannot fit is reported and left pending */
+    char huge[3600];
+    memset(huge, 'y', 3500); huge[3500] = 0;
+    char *big = sqlite3_mprintf("INSERT INTO t VALUES(99,'%s')", huge);
+    hpplite_node_exec(n, big, NULL);
+    sqlite3_free(big);
+    if (hpplite_node_flush_batch(n) != 0) FAIL("oversized statement should not flush");
+    if (hpplite_node_pending_count(n) != 1) FAIL("oversized statement should stay pending");
+    if (n->ctx->nLogErrors == 0) FAIL("oversized statement should be reported");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 17. Transaction stays pending past the wait: adopted once it lands */
+static void test_slow_confirmation(void) {
+    TEST("submit whose transaction is still pending after the wait is adopted later");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/slow.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+
+    /* the mock stores the batch at submit time, so "pending" here means the
+    ** reply timed out but the transaction did land: adoption finds it */
+    hpplite_l1_mock_set_tx_pending(l1, 1);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("landed-but-unconfirmed batch should be adopted");
+    hpplite_l1_mock_set_tx_pending(l1, 0);
+    if (hpplite_node_pending_count(n) != 0) FAIL("pending");
+    if (hpplite_node_get_height(n) != 2) FAIL("height");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -345,6 +647,15 @@ int main(void) {
     test_log_atomic_with_txn();
     test_state_root_is_content();
     test_stale_lease_after_crash();
+    test_adopt_after_lost_confirmation();
+    test_adopt_on_reopen();
+    test_divergence_refused();
+    test_timer_vs_open_transaction();
+    test_checkpoint_persists();
+    test_memory_database();
+    test_sync_function();
+    test_batch_size_limit();
+    test_slow_confirmation();
     system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

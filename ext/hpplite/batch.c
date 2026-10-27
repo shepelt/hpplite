@@ -167,6 +167,9 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
 
   hpplite_to_hex(pBatch->postStateRoot, HPPLITE_HASH_SIZE, hexBuf);
   sqlite3_str_appendf(pStr, "  \"post_state_root\": \"%s\",\n", hexBuf);
+  if (pBatch->partial) {
+    sqlite3_str_appendf(pStr, "  \"partial\": 1,\n");
+  }
 
   sqlite3_str_appendf(pStr, "  \"transactions\": [\n");
 
@@ -223,6 +226,35 @@ static char *json_parse_string(const char **pp) {
         case 'n': sqlite3_str_appendchar(pStr, 1, '\n'); break;
         case 'r': sqlite3_str_appendchar(pStr, 1, '\r'); break;
         case 't': sqlite3_str_appendchar(pStr, 1, '\t'); break;
+        case 'u': {
+          /* \uXXXX: decode the code point to UTF-8 (BMP only, no surrogates) */
+          unsigned int cp = 0;
+          int k;
+          for (k = 1; k <= 4 && p[k]; k++) {
+            char c = p[k];
+            cp <<= 4;
+            if (c >= '0' && c <= '9') cp |= (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') cp |= (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
+            else break;
+          }
+          if (k == 5) {
+            p += 4;
+            if (cp < 0x80) {
+              sqlite3_str_appendchar(pStr, 1, (char)cp);
+            } else if (cp < 0x800) {
+              sqlite3_str_appendchar(pStr, 1, (char)(0xC0 | (cp >> 6)));
+              sqlite3_str_appendchar(pStr, 1, (char)(0x80 | (cp & 0x3F)));
+            } else {
+              sqlite3_str_appendchar(pStr, 1, (char)(0xE0 | (cp >> 12)));
+              sqlite3_str_appendchar(pStr, 1, (char)(0x80 | ((cp >> 6) & 0x3F)));
+              sqlite3_str_appendchar(pStr, 1, (char)(0x80 | (cp & 0x3F)));
+            }
+          } else {
+            sqlite3_str_appendchar(pStr, 1, 'u');
+          }
+          break;
+        }
         default: sqlite3_str_appendchar(pStr, 1, *p);
       }
     } else {
@@ -293,6 +325,8 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
       pBatch->height = (uint64_t)json_parse_number(&p);
     } else if (strcmp(zKey, "timestamp") == 0) {
       pBatch->timestamp = (uint64_t)json_parse_number(&p);
+    } else if (strcmp(zKey, "partial") == 0) {
+      pBatch->partial = json_parse_number(&p) != 0;
     } else if (strcmp(zKey, "pre_state_root") == 0) {
       zVal = json_parse_string(&p);
       if (zVal) {

@@ -156,6 +156,21 @@ int hpplite_exec_cb(
 struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId);
 
 /*
+** Like hpplite_build_batch() but keeps the serialized batch within maxBytes
+** (0 = unlimited), cutting at a transaction boundary when possible. When
+** pending SQL remains after the cut the batch is marked partial; its
+** post-state root is then the root after all pending SQL, i.e. the root the
+** last batch of the series will also carry. A single statement that cannot
+** fit on its own is left pending and reported (returns NULL, nLogErrors++).
+*/
+struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes, sqlite3_int64 *pMaxId);
+
+/*
+** Total bytes of pending SQL text (cheap size estimate for early flushing).
+*/
+sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx);
+
+/*
 ** Mark a batch confirmed: delete its pending rows (id <= maxId) and advance
 ** height / previous block hash / state root in _hpplite_meta, atomically.
 */
