@@ -34,6 +34,13 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### v0.1 wrap-up (issues #10, #13)
+- State root at checkpoint cadence: only the interval-closing batch carries
+  `state_root`; the flush loop submits the checkpoint automatically (before,
+  nothing in production ever called `submit_checkpoint`)
+- Examples run in the integration suite; found and fixed `l1=` alias not
+  applying the factory on the `sqlite3_open_v2` path (the README quick-start)
+
 ### Batch size limit and test coverage (issues #7, #8)
 - Batches are cut at the DA `batchSizeLimit` (`partial` series); early flush
   at half the limit; oversized single statements reported, not retried blindly
@@ -97,7 +104,7 @@ Rebase, never merge, so `git log version-X..hpplite` always answers "what did we
 
 ## Versions (GitHub milestones)
 
-- **v0.1 — Small databases, on-chain DA** (current): #10 root at checkpoint cadence, #13 run examples in the integration suite. Scope: databases up to ~100 MB, L1 calldata DA.
+- **v0.1 — Small databases, on-chain DA** (current, complete): scope: databases up to ~100 MB, L1 calldata DA.
 - **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting.
 - **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #12 batch compression. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.

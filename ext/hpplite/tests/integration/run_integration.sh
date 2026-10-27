@@ -178,6 +178,24 @@ if [ $TEST_RESULT -eq 0 ]; then
     TEST_RESULT=$?
 fi
 
+# Examples: each must run to completion. They create their own funded wallet
+# from the master key (HPPLITE_PRIVATE_KEY, loaded from .env above).
+if [ $TEST_RESULT -eq 0 ]; then
+    for ex in da_uri_demo l1_config factory_demo basic_sequencer; do
+        if [ -x "./$ex" ]; then
+            echo ""
+            echo "Running example $ex..."
+            HPPLITE_PRIVATE_KEY="$HPPLITE_PRIVATE_KEY" "./$ex"
+            rc=$?
+            if [ $rc -ne 0 ]; then
+                echo "Example $ex failed (exit $rc)"
+                TEST_RESULT=$rc
+                break
+            fi
+        fi
+    done
+fi
+
 # Cleanup
 rm -f .env "$TEST_ENV"
 

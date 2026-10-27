@@ -211,7 +211,8 @@ Scope is tied to versions. The current branch is **v0.1 in progress**.
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
-computation (~28 ms/MB); see [doc/architecture.md](doc/architecture.md#state-root).
+computation (~28 ms/MB), computed once per checkpoint interval (default 100 batches);
+see [doc/architecture.md](doc/architecture.md#state-root).
 Beyond that, shard per tenant (the factory can create several rollups per wallet)
 until v0.3.
 

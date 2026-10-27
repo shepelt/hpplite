@@ -475,10 +475,7 @@ static void test_checkpoint_persists(void) {
     hpplite_node_set_l1(n, l1); hpplite_node_start(n);
     hpplite_node_exec(n, "CREATE TABLE t(x)", NULL); hpplite_node_flush_batch(n);
     hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL); hpplite_node_flush_batch(n);
-    if (!hpplite_node_should_checkpoint(n)) FAIL("should checkpoint after 2 batches");
-    char *tx = hpplite_node_submit_checkpoint(n);
-    if (!tx) FAIL("checkpoint");
-    sqlite3_free(tx);
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("flush should have submitted the checkpoint");
     hpplite_node_destroy(n);
 
     n = hpplite_node_create(&config);
@@ -554,6 +551,7 @@ static void test_batch_size_limit(void) {
     HppliteNode *n = open_node(DIR "/big.db", l1);
     if (!n) FAIL("open");
     if (n->config.maxBatchBytes != 3000) FAIL("limit not learned from L1 system config");
+    n->config.checkpointInterval = 1;   /* the series must end with a root + checkpoint */
     hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL);
     char sql[512], pad[301];
     memset(pad, 'x', 300); pad[300] = 0;
@@ -581,7 +579,9 @@ static void test_batch_size_limit(void) {
         if (!b) FAIL("parse");
         if (h < last && !b->partial) FAIL("intermediate batch should be marked partial");
         if (h == last && b->partial) FAIL("last batch must not be partial");
-        if (memcmp(b->postStateRoot, rootA, 32) != 0) FAIL("chunks must carry the series' final root");
+        if (b->partial && b->hasRoot) FAIL("a partial batch must not carry a root");
+        if (h == last && (!b->hasRoot || memcmp(b->postStateRoot, rootA, 32) != 0))
+            FAIL("the series' last batch must carry the content root");
         /* the explicit 2-statement transaction must not be split */
         for (int i = 0; i < b->nTxns; i++) {
             if (strstr(b->aTxns[i].zSql, "VALUES(31,'a')") &&
@@ -592,6 +592,8 @@ static void test_batch_size_limit(void) {
         hpplite_batch_free(b);
     }
     if (stmts != 33) { printf("(stmts=%d) ", stmts); FAIL("statement count across batches"); }
+    if (hpplite_l1_mock_get_checkpoint_count(l1) < 1) FAIL("checkpoint should follow the series");
+    if (memcmp(hpplite_l1_mock_get_last_checkpoint(l1)->postStateRoot, rootA, 32) != 0) FAIL("checkpoint root");
 
     /* a fresh node rebuilt from the chunked history ends with the same content */
     HppliteNode *r = open_node(DIR "/big_r.db", l1);

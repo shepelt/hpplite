@@ -438,7 +438,10 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     int confirmed = 0;
 
     *pMore = 0;
-    batch = hpplite_build_batch_limited(ctx, node->config.maxBatchBytes, &maxId);
+    /* The root is O(database size): compute it only on the batch that
+    ** closes a checkpoint interval (the checkpoint is submitted from it) */
+    int withRoot = node->batchesSinceCheckpoint + 1 >= node->config.checkpointInterval;
+    batch = hpplite_build_batch_limited(ctx, node->config.maxBatchBytes, withRoot, &maxId);
     if (!batch) return 0;
     height = batch->height;
     *pMore = batch->partial;
@@ -512,6 +515,17 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
         if (h == 0) break;
         height = h;
     } while (more);
+
+    /* Anchor the state root on L1 once an interval of batches is complete */
+    if (height && node->l1 && hpplite_node_should_checkpoint(node)) {
+        char *txHash = hpplite_node_submit_checkpoint(node);
+        if (txHash) {
+            sqlite3_free(txHash);
+        } else {
+            fprintf(stderr, "hpplite: checkpoint after batch %llu not submitted; will retry\n",
+                    (unsigned long long)height);
+        }
+    }
     return height;
 }
 

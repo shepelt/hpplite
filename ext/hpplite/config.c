@@ -395,6 +395,15 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
                 cfg->rpcUrl = strdup(rpc);
                 cfg->rpcUrlSource = 2;
             }
+
+            /* Also set factory from alias (explicit factory= below overrides) */
+            if (!cfg->hasFactory) {
+                const HppliteNetworkAlias *network = hpplite_da_lookup_network(val);
+                if (network && network->factory
+                    && hex_to_bytes(network->factory, cfg->factory, 20) == 0) {
+                    cfg->hasFactory = 1;
+                }
+            }
         }
     }
 

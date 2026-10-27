@@ -120,8 +120,7 @@ int main(void) {
         "file:" DATA_DIR2 "/reconstructed.db"
         "?hpplite=on"
         "&l1=hpp-sepolia"
-        "&privkey=%s"
-        "&role=replica",  /* replica mode - sync from L1 */
+        "&privkey=%s",   /* same wallet, same rollup: history is replayed on open */
         privkey
     );
 
@@ -133,13 +132,24 @@ int main(void) {
         return 1;
     }
 
-    printf("Opened fresh database, syncing from L1...\n");
-    sleep(2);  /* Wait for sync */
+    printf("Opened fresh database, history replayed from L1.\n");
 
     printf("\nReconstructed data:\n");
     query_users(db2);
 
+    int rows = 0;
+    {
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(db2, "SELECT count(*) FROM users", -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) rows = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+    }
     sqlite3_close(db2);
+    if (rows != 3) {
+        printf("\nERROR: expected 3 users after reconstruction, got %d\n", rows);
+        return 1;
+    }
 
     printf("\nSuccess! Data reconstructed from L1.\n");
 

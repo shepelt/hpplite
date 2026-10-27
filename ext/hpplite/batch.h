@@ -38,6 +38,7 @@ struct HppliteBatch {
   int nTxns;                                 /* Number of transactions */
   HppliteTxn *aTxns;                         /* Array of transactions */
   int partial;                               /* More pending SQL follows in the next batch */
+  int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */
 };
 
 /*

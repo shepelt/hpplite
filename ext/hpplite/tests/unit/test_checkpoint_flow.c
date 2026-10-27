@@ -1,333 +1,164 @@
 /*
-** Test Checkpoint Flow - Singleton Sequencer Model
+** Checkpoint flow (singleton sequencer)
 **
-** Tests the checkpoint submission flow for the simplified model.
-** No witnesses - sequencer submits checkpoints directly to L1.
+** The state root is computed only on the batch that closes a checkpoint
+** interval, and the flush loop submits the checkpoint right after it.
 */
 
 #include "node.h"
-#include "l1_interface.h"
-#include "batch.h"
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
-/* Test counters */
-static int tests_run = 0;
-static int tests_passed = 0;
+static int tests_run = 0, tests_passed = 0;
+#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
+#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
-#define TEST(name) do { \
-    printf("  Testing: %s... ", name); \
-    tests_run++; \
-} while(0)
-
-#define PASS() do { \
-    printf("PASS\n"); \
-    tests_passed++; \
-} while(0)
-
-#define FAIL(msg) do { \
-    printf("FAIL: %s\n", msg); \
-} while(0)
-
-/* Test private key */
 static const unsigned char SEQ_PRIVKEY[32] = {
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+    0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+    0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20
 };
 
-/* Helpers */
-static void ensure_test_dir(const char *path) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "mkdir -p %s", path);
-    system(cmd);
-}
+#define DIR "/tmp/hpplite_test_checkpoint"
 
-static void cleanup_test_files(const char *dir) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
-    system(cmd);
-}
-
-/*
-** Test 1: Basic checkpoint creation and submission
-*/
-static void test_checkpoint_basic(void) {
+static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
     HppliteNodeConfig config;
     HppliteNode *node;
-    HppliteL1 *l1;
-    char *txHash;
-
-    TEST("checkpoint_basic");
-
-    ensure_test_dir("/tmp/hpplite_test_cp1");
-
-    /* Create L1 mock */
-    l1 = hpplite_l1_create_mock();
-    if (!l1) {
-        FAIL("Failed to create L1 mock");
-        return;
-    }
-
-    /* Create node */
+    system("rm -rf " DIR " && mkdir -p " DIR);
     memset(&config, 0, sizeof(config));
     config.nodeId = "test-seq";
     memcpy(config.privkey, SEQ_PRIVKEY, 32);
     config.hasPrivkey = 1;
-    config.dataDir = "/tmp/hpplite_test_cp1";
-    config.dbPath = "/tmp/hpplite_test_cp1/test.db";
-    config.checkpointInterval = 3;
-
+    config.dataDir = DIR;
+    config.dbPath = DIR "/test.db";
+    config.checkpointInterval = checkpointInterval;
     node = hpplite_node_create(&config);
-    if (!node) {
-        FAIL("Failed to create node");
-        hpplite_l1_disconnect(l1);
-        return;
+    if (node) {
+        hpplite_node_set_l1(node, l1);
+        hpplite_node_start(node);
     }
+    return node;
+}
 
-    /* Set L1 */
-    hpplite_node_set_l1(node, l1);
+static HppliteBatch *l1_batch(HppliteL1 *l1, uint64_t h) {
+    size_t len = 0;
+    uint8_t *data = hpplite_l1_get_batch(l1, h, &len);
+    HppliteBatch *b = data ? hpplite_batch_from_json((const char *)data) : NULL;
+    free(data);
+    return b;
+}
 
-    /* Produce some batches */
+/* Roots appear only on interval-closing batches; the checkpoint follows automatically */
+static void test_checkpoint_auto(void) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *node = open_node(l1, 3);
+    unsigned char root[32];
+    TEST("root on every 3rd batch, checkpoint submitted automatically");
+    if (!node) FAIL("open");
     for (int i = 0; i < 3; i++) {
         char sql[64];
         snprintf(sql, sizeof(sql), "CREATE TABLE t%d (x INTEGER)", i);
         hpplite_node_exec(node, sql, NULL);
-        hpplite_node_flush_batch(node);
+        if (hpplite_node_flush_batch(node) != (uint64_t)(i + 1)) FAIL("flush");
+        if (i < 2 && hpplite_l1_mock_get_checkpoint_count(l1) != 0) FAIL("checkpoint too early");
     }
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("checkpoint should have been submitted after batch 3");
+    if (hpplite_node_should_checkpoint(node)) FAIL("interval should have been reset");
+    if (hpplite_node_submit_checkpoint(node) != NULL) FAIL("nothing to checkpoint manually");
 
-    /* Should be ready for checkpoint */
-    if (!hpplite_node_should_checkpoint(node)) {
-        FAIL("Should checkpoint after 3 batches");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp1");
-        return;
+    for (uint64_t h = 1; h <= 3; h++) {
+        HppliteBatch *b = l1_batch(l1, h);
+        if (!b) FAIL("batch missing");
+        if (h < 3 && b->hasRoot) FAIL("non-closing batch must not carry a root");
+        if (h == 3 && !b->hasRoot) FAIL("closing batch must carry the root");
+        if (h == 3) {
+            hpplite_node_get_state_root(node, root);
+            if (memcmp(b->postStateRoot, root, 32) != 0) FAIL("batch root != content root");
+        }
+        hpplite_batch_free(b);
     }
-
-    /* Submit checkpoint */
-    txHash = hpplite_node_submit_checkpoint(node);
-    if (!txHash) {
-        FAIL("Failed to submit checkpoint");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp1");
-        return;
-    }
-    sqlite3_free(txHash);
-
-    /* Verify checkpoint was stored on L1 */
-    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) {
-        FAIL("Checkpoint not stored on L1");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp1");
-        return;
-    }
-
-    /* Should not need checkpoint now */
-    if (hpplite_node_should_checkpoint(node)) {
-        FAIL("Should not need checkpoint after submitting");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp1");
-        return;
-    }
-
+    const HppliteCheckpoint *cp = hpplite_l1_mock_get_last_checkpoint(l1);
+    if (!cp || cp->fromHeight != 1 || cp->toHeight != 3) FAIL("checkpoint range");
+    if (memcmp(cp->postStateRoot, root, 32) != 0) FAIL("checkpoint root != content root");
     hpplite_node_destroy(node);
     hpplite_l1_disconnect(l1);
-    cleanup_test_files("/tmp/hpplite_test_cp1");
-
     PASS();
 }
 
-/*
-** Test 2: Multiple checkpoints
-*/
-static void test_checkpoint_multiple(void) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    HppliteL1 *l1;
-    char *txHash;
+/* Consecutive intervals chain: pre root of the second = post root of the first */
+static void test_checkpoint_chain(void) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *node = open_node(l1, 2);
+    unsigned char first[32];
+    TEST("consecutive checkpoints chain their roots");
+    if (!node) FAIL("open");
+    hpplite_node_exec(node, "CREATE TABLE t1 (x)", NULL); hpplite_node_flush_batch(node);
+    hpplite_node_exec(node, "INSERT INTO t1 VALUES (1)", NULL); hpplite_node_flush_batch(node);
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("first checkpoint");
+    memcpy(first, hpplite_l1_mock_get_last_checkpoint(l1)->postStateRoot, 32);
 
-    TEST("checkpoint_multiple");
-
-    ensure_test_dir("/tmp/hpplite_test_cp2");
-
-    l1 = hpplite_l1_create_mock();
-    if (!l1) {
-        FAIL("Failed to create L1 mock");
-        return;
-    }
-
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "test-seq";
-    memcpy(config.privkey, SEQ_PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = "/tmp/hpplite_test_cp2";
-    config.dbPath = "/tmp/hpplite_test_cp2/test.db";
-    config.checkpointInterval = 2;
-
-    node = hpplite_node_create(&config);
-    if (!node) {
-        FAIL("Failed to create node");
-        hpplite_l1_disconnect(l1);
-        return;
-    }
-
-    hpplite_node_set_l1(node, l1);
-
-    /* First checkpoint interval */
-    hpplite_node_exec(node, "CREATE TABLE t1 (x)", NULL);
-    hpplite_node_flush_batch(node);
-    hpplite_node_exec(node, "INSERT INTO t1 VALUES (1)", NULL);
-    hpplite_node_flush_batch(node);
-
-    txHash = hpplite_node_submit_checkpoint(node);
-    if (!txHash) {
-        FAIL("First checkpoint failed");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp2");
-        return;
-    }
-    sqlite3_free(txHash);
-
-    /* Second checkpoint interval */
-    hpplite_node_exec(node, "INSERT INTO t1 VALUES (2)", NULL);
-    hpplite_node_flush_batch(node);
-    hpplite_node_exec(node, "INSERT INTO t1 VALUES (3)", NULL);
-    hpplite_node_flush_batch(node);
-
-    txHash = hpplite_node_submit_checkpoint(node);
-    if (!txHash) {
-        FAIL("Second checkpoint failed");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp2");
-        return;
-    }
-    sqlite3_free(txHash);
-
-    /* Verify both checkpoints */
-    if (hpplite_l1_mock_get_checkpoint_count(l1) != 2) {
-        FAIL("Should have 2 checkpoints");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp2");
-        return;
-    }
-
+    hpplite_node_exec(node, "INSERT INTO t1 VALUES (2)", NULL); hpplite_node_flush_batch(node);
+    hpplite_node_exec(node, "INSERT INTO t1 VALUES (3)", NULL); hpplite_node_flush_batch(node);
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 2) FAIL("second checkpoint");
+    const HppliteCheckpoint *cp = hpplite_l1_mock_get_last_checkpoint(l1);
+    if (cp->fromHeight != 3 || cp->toHeight != 4) FAIL("second checkpoint range");
+    if (memcmp(cp->preStateRoot, first, 32) != 0) FAIL("second checkpoint must start from the first's root");
+    if (memcmp(cp->preStateRoot, cp->postStateRoot, 32) == 0) FAIL("roots should differ");
+    if (node->lastCheckpointHeight != 4) FAIL("lastCheckpointHeight");
     hpplite_node_destroy(node);
     hpplite_l1_disconnect(l1);
-    cleanup_test_files("/tmp/hpplite_test_cp2");
-
     PASS();
 }
 
-/*
-** Test 3: State root progression in checkpoints
-*/
-static void test_checkpoint_state_roots(void) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    HppliteL1 *l1;
-    unsigned char root1[32], root2[32];
-    char *txHash;
-
-    TEST("checkpoint_state_roots");
-
-    ensure_test_dir("/tmp/hpplite_test_cp3");
-
-    l1 = hpplite_l1_create_mock();
-    if (!l1) {
-        FAIL("Failed to create L1 mock");
-        return;
-    }
-
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "test-seq";
-    memcpy(config.privkey, SEQ_PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = "/tmp/hpplite_test_cp3";
-    config.dbPath = "/tmp/hpplite_test_cp3/test.db";
-    config.checkpointInterval = 1;  /* Checkpoint every batch */
-
-    node = hpplite_node_create(&config);
-    if (!node) {
-        FAIL("Failed to create node");
-        hpplite_l1_disconnect(l1);
-        return;
-    }
-
-    hpplite_node_set_l1(node, l1);
-
-    /* First batch and checkpoint */
+/* Interval of 1: every batch carries a root that matches the content */
+static void test_checkpoint_every_batch(void) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *node = open_node(l1, 1);
+    unsigned char r1[32], r2[32];
+    TEST("interval 1: each batch is a checkpoint with the content root");
+    if (!node) FAIL("open");
     hpplite_node_exec(node, "CREATE TABLE t (x INTEGER)", NULL);
     hpplite_node_flush_batch(node);
-    hpplite_node_get_state_root(node, root1);
-
-    txHash = hpplite_node_submit_checkpoint(node);
-    if (!txHash) {
-        FAIL("First checkpoint failed");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp3");
-        return;
-    }
-    sqlite3_free(txHash);
-
-    /* Second batch and checkpoint */
+    hpplite_node_get_state_root(node, r1);
+    if (memcmp(hpplite_l1_mock_get_last_checkpoint(l1)->postStateRoot, r1, 32) != 0) FAIL("cp1 root");
     hpplite_node_exec(node, "INSERT INTO t VALUES (42)", NULL);
     hpplite_node_flush_batch(node);
-    hpplite_node_get_state_root(node, root2);
-
-    txHash = hpplite_node_submit_checkpoint(node);
-    if (!txHash) {
-        FAIL("Second checkpoint failed");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp3");
-        return;
-    }
-    sqlite3_free(txHash);
-
-    /* State roots should be different */
-    if (memcmp(root1, root2, 32) == 0) {
-        FAIL("State roots should differ after INSERT");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp3");
-        return;
-    }
-
-    /* Verify checkpoint state roots match */
-    const HppliteCheckpoint *cp2 = hpplite_l1_mock_get_last_checkpoint(l1);
-    if (!cp2 || memcmp(cp2->postStateRoot, root2, 32) != 0) {
-        FAIL("Checkpoint state root mismatch");
-        hpplite_node_destroy(node);
-        hpplite_l1_disconnect(l1);
-        cleanup_test_files("/tmp/hpplite_test_cp3");
-        return;
-    }
-
+    hpplite_node_get_state_root(node, r2);
+    if (memcmp(r1, r2, 32) == 0) FAIL("roots should differ after INSERT");
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 2) FAIL("two checkpoints");
+    if (memcmp(hpplite_l1_mock_get_last_checkpoint(l1)->postStateRoot, r2, 32) != 0) FAIL("cp2 root");
     hpplite_node_destroy(node);
     hpplite_l1_disconnect(l1);
-    cleanup_test_files("/tmp/hpplite_test_cp3");
+    PASS();
+}
 
+/* No L1: the interval is tracked, nothing is submitted, roots still land on closing batches */
+static void test_checkpoint_without_l1(void) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    TEST("without L1 the interval is tracked and manual checkpoint is a no-op");
+    system("rm -rf " DIR " && mkdir -p " DIR);
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "local"; memcpy(config.privkey, SEQ_PRIVKEY, 32); config.hasPrivkey = 1;
+    config.dataDir = DIR; config.dbPath = DIR "/local.db"; config.checkpointInterval = 2;
+    node = hpplite_node_create(&config);
+    if (!node) FAIL("open");
+    hpplite_node_exec(node, "CREATE TABLE t (x)", NULL); hpplite_node_flush_batch(node);
+    hpplite_node_exec(node, "INSERT INTO t VALUES (1)", NULL); hpplite_node_flush_batch(node);
+    if (!hpplite_node_should_checkpoint(node)) FAIL("should want a checkpoint");
+    if (hpplite_node_submit_checkpoint(node) != NULL) FAIL("no L1, nothing to submit");
+    hpplite_node_destroy(node);
     PASS();
 }
 
 int main(void) {
-    printf("\n=== Checkpoint Flow Tests (Singleton Model) ===\n\n");
-
-    test_checkpoint_basic();
-    test_checkpoint_multiple();
-    test_checkpoint_state_roots();
-
-    printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
-
-    return (tests_passed == tests_run) ? 0 : 1;
+    printf("=== Checkpoint Flow Tests ===\n");
+    test_checkpoint_auto();
+    test_checkpoint_chain();
+    test_checkpoint_every_batch();
+    test_checkpoint_without_l1();
+    system("rm -rf " DIR);
+    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
+    return tests_passed == tests_run ? 0 : 1;
 }

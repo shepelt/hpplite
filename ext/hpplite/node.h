@@ -175,9 +175,12 @@ void hpplite_node_stop(HppliteNode *node);
 int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg);
 
 /*
-** Flush pending SQL to create a batch and post to L1.
-** Returns the batch height, or 0 if nothing was pending or the batch could
-** not be confirmed on L1 (pending rows are kept and retried later).
+** Flush pending SQL to create a batch and post to L1. Several batches are
+** produced when the DA size limit splits the pending SQL. When the batch
+** closes a checkpoint interval it carries the state root and the checkpoint
+** is submitted right after it.
+** Returns the last confirmed height, or 0 if nothing was pending or the
+** batch could not be confirmed on L1 (pending rows are kept and retried).
 */
 uint64_t hpplite_node_flush_batch(HppliteNode *node);
 

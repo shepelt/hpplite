@@ -15,12 +15,11 @@ static int tests_run = 0, tests_passed = 0;
 static void test_roundtrip(void) {
     HppliteBatch *b, *p;
     char *json;
-    unsigned char pre[32] = {0}, post[32] = {0xa1, 0xb2, 0xc3, 0xd4};
+    unsigned char post[32] = {0xa1, 0xb2, 0xc3, 0xd4};
     TEST("JSON round trip preserves every field");
     b = hpplite_batch_new(7);
     if (!b) FAIL("new");
     b->timestamp = 1700000000;
-    hpplite_batch_set_pre_state(b, pre);
     hpplite_batch_set_post_state(b, post);
     hpplite_batch_add_stmt(b, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", 0, 0);
     hpplite_batch_add_stmt(b, "INSERT INTO users (name) VALUES ('Alice')", 1, 1);
@@ -29,11 +28,12 @@ static void test_roundtrip(void) {
     if (!json) FAIL("to_json");
     if (!strstr(json, "\"height\": 7")) FAIL("height missing");
     if (!strstr(json, "\"txn\": 1")) FAIL("txn group missing");
+    if (!strstr(json, "\"state_root\": \"a1b2c3d4")) FAIL("state_root missing");
     if (strstr(json, "\"partial\"")) FAIL("partial must be absent for a full batch");
     p = hpplite_batch_from_json(json);
     if (!p) FAIL("from_json");
     if (p->height != 7 || p->timestamp != 1700000000) FAIL("height/timestamp");
-    if (memcmp(p->preStateRoot, pre, 32) || memcmp(p->postStateRoot, post, 32)) FAIL("roots");
+    if (!p->hasRoot || memcmp(p->postStateRoot, post, 32)) FAIL("root");
     if (p->nTxns != 3) FAIL("statement count");
     if (strcmp(p->aTxns[0].zSql, b->aTxns[0].zSql)) FAIL("sql 0");
     if (p->aTxns[1].nRowsAffected != 1 || p->aTxns[2].nRowsAffected != -1) FAIL("rows_affected");
@@ -75,7 +75,9 @@ static void test_legacy_and_partial(void) {
     HppliteBatch *p, *b;
     char *json;
     const char *legacy =
-        "{\"height\": 3, \"timestamp\": 1, \"pre_state_root\": \"00\", \"post_state_root\": \"00\","
+        "{\"height\": 3, \"timestamp\": 1,"
+        " \"pre_state_root\": \"0000000000000000000000000000000000000000000000000000000000000000\","
+        " \"post_state_root\": \"a1b2c3d400000000000000000000000000000000000000000000000000000000\","
         " \"transactions\": [{\"sql\": \"A\"}, {\"sql\": \"B\", \"rows_affected\": 2}, {\"sql\": \"C\"}]}";
     TEST("batches without txn/partial fields parse as one group per statement");
     p = hpplite_batch_from_json(legacy);
@@ -83,6 +85,18 @@ static void test_legacy_and_partial(void) {
     if (p->aTxns[0].txn != 0 || p->aTxns[1].txn != 1 || p->aTxns[2].txn != 2) FAIL("legacy groups");
     if (p->aTxns[1].nRowsAffected != 2) FAIL("legacy rows_affected");
     if (p->partial) FAIL("legacy partial");
+    if (!p->hasRoot) FAIL("legacy post_state_root should count as a root");
+    hpplite_batch_free(p);
+
+    /* a batch without a root serializes without the key and parses back as such */
+    b = hpplite_batch_new(5);
+    hpplite_batch_add_txn(b, "Y", -1);
+    json = hpplite_batch_to_json(b);
+    if (!json || strstr(json, "state_root")) FAIL("rootless batch must not emit state_root");
+    p = hpplite_batch_from_json(json);
+    if (!p || p->hasRoot) FAIL("rootless batch parsed with a root");
+    sqlite3_free(json);
+    hpplite_batch_free(b);
     hpplite_batch_free(p);
 
     b = hpplite_batch_new(4);

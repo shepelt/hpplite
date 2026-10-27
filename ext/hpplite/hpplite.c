@@ -589,8 +589,9 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
   sha256_init(&h);
   hashU64(&h, pBatch->height);
   sha256_update(&h, pPrevHash, HPPLITE_HASH_SIZE);
-  sha256_update(&h, pBatch->preStateRoot, HPPLITE_HASH_SIZE);
-  sha256_update(&h, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  if (pBatch->hasRoot) {
+    sha256_update(&h, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  }
   for (i = 0; i < pBatch->nTxns; i++) {
     hashText(&h, (const unsigned char*)pBatch->aTxns[i].zSql);
   }
@@ -620,7 +621,7 @@ static int bkEnd(HppliteCtx *pCtx, int rc) {
 }
 
 struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId) {
-  return hpplite_build_batch_limited(pCtx, 0, pMaxId);
+  return hpplite_build_batch_limited(pCtx, 0, 1, pMaxId);
 }
 
 /*
@@ -634,7 +635,8 @@ static void batchPop(HppliteBatch *pBatch) {
   }
 }
 
-struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes, sqlite3_int64 *pMaxId) {
+struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes,
+                                                 int withRoot, sqlite3_int64 *pMaxId) {
   HppliteBatch *pBatch = NULL;
   sqlite3_stmt *pStmt = NULL;
   sqlite3_int64 *aId = NULL;
@@ -653,7 +655,6 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       if (!pBatch) {
         pBatch = hpplite_batch_new(pCtx->blockHeight);
         if (!pBatch) break;
-        hpplite_batch_set_pre_state(pBatch, pCtx->stateRoot);
       }
       if (pBatch->nTxns >= nAlloc) {
         sqlite3_int64 *aNew;
@@ -670,14 +671,16 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   }
 
   if (pBatch) {
-    /* Post-state root is taken in the same snapshot as the pending rows */
-    unsigned char root[HPPLITE_HASH_SIZE];
-    if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
-      hpplite_batch_set_post_state(pBatch, root);
-      pBatch->timestamp = (uint64_t)time(NULL);
-    } else {
-      hpplite_batch_free(pBatch);
-      pBatch = NULL;
+    pBatch->timestamp = (uint64_t)time(NULL);
+    if (withRoot) {
+      /* State root is taken in the same snapshot as the pending rows */
+      unsigned char root[HPPLITE_HASH_SIZE];
+      if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
+        hpplite_batch_set_post_state(pBatch, root);
+      } else {
+        hpplite_batch_free(pBatch);
+        pBatch = NULL;
+      }
     }
   }
   pCtx->bInternal = 0;
@@ -702,6 +705,12 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       }
       batchPop(pBatch);
       pBatch->partial = 1;
+    }
+    if (pBatch && pBatch->partial) {
+      /* The root describes the content after ALL pending SQL; a cut batch
+      ** does not end there, so it carries none - the last of the series does */
+      pBatch->hasRoot = 0;
+      memset(pBatch->postStateRoot, 0, HPPLITE_HASH_SIZE);
     }
     if (pBatch && pBatch->partial && pBatch->nTxns < nFull) {
       /* If the cut landed inside a transaction group that started in this
@@ -757,19 +766,25 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
   }
 
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, state_root=?3 WHERE id=1",
+    pBatch->hasRoot
+      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, state_root=?3 WHERE id=1"
+      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2 WHERE id=1",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) return rc;
   sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(pBatch->height + 1));
   sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
-  sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  if (pBatch->hasRoot) {
+    sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  }
   rc = sqlite3_step(pStmt);
   sqlite3_finalize(pStmt);
   if (rc != SQLITE_DONE) return rc;
 
   pCtx->blockHeight = pBatch->height + 1;
   memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
-  memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  if (pBatch->hasRoot) {
+    memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  }
   return SQLITE_OK;
 }
 
@@ -841,10 +856,10 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (rc != SQLITE_OK) return rc;
 
   /* The seed of `hpplite verify`: does the content match what was posted?
-  ** A partial batch carries the root of the end of its series, so only the
-  ** last batch of a series is checked. */
+  ** Only batches that carry a root (checkpoint boundaries) can be checked. */
+  if (!pBatch->hasRoot) return SQLITE_OK;
   hpplite_get_state_root(pCtx, root);
-  if (!pBatch->partial && memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
+  if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
     fprintf(stderr, "hpplite: state root mismatch after replaying batch %llu\n",
             (unsigned long long)pBatch->height);
   }

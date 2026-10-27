@@ -24,7 +24,7 @@
 #include <string.h>
 
 /* HPPLiteDA v2 on HPP Sepolia */
-#define CONTRACT "0x2Cd27d02C3b36c8926B849Bc53745Fab661572Dc"
+#include "test_util.h"
 #define DATA_DIR "/tmp/hpplite_l1"
 
 static void print_hex(const unsigned char *data, int len) {
@@ -47,19 +47,26 @@ int main(void) {
      *
      * You can also use explicit chainid= and rpc= parameters.
      */
+    /* A fresh funded wallet; the factory creates its rollup on first open */
+    char privkey[128], address[64];
+    if (!test_util_has_cast()) {
+        printf("ERROR: 'cast' not found. Install foundry: https://getfoundry.sh\n");
+        return 1;
+    }
+    if (test_util_create_funded_wallet(privkey, sizeof(privkey), address, sizeof(address),
+                                        HPPLITE_DEFAULT_RPC, "0.01ether") != 0) {
+        return 1;
+    }
+    printf("Wallet: %s\n", address);
+
     printf("Opening database with L1 configuration...\n");
+    char uri[1024];
+    snprintf(uri, sizeof(uri),
+        "file:" DATA_DIR "/state.db?hpplite=on&l1=hpp-sepolia&privkey=%s&datadir=" DATA_DIR,
+        privkey);
     sqlite3 *db;
-    int rc = sqlite3_open_v2(
-        "file:" DATA_DIR "/state.db"
-        "?hpplite=on"
-        "&l1=hpp-sepolia"
-        "&contract=" CONTRACT
-        "&role=sequencer"
-        "&datadir=" DATA_DIR,
-        &db,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
-        NULL
-    );
+    int rc = sqlite3_open_v2(uri, &db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc != SQLITE_OK) {
         printf("ERROR: Failed to open database: %s\n", sqlite3_errmsg(db));
         return 1;
@@ -95,6 +102,10 @@ int main(void) {
     /* Get L1 connection (auto-connected from URI params) */
     printf("\nL1 Connection (auto-connected from URI)...\n");
     HppliteL1 *l1 = hpplite_get_l1(db);
+    if (!l1) {
+        printf("ERROR: L1 not connected\n");
+        return 1;
+    }
     if (l1) {
         printf("  L1 connected successfully!\n");
 

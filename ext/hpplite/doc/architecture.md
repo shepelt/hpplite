@@ -151,10 +151,14 @@ Flushing a batch:
 1. If L1 already holds a batch at our next height, it was produced from our
    pending rows by an earlier attempt (crash after submit, lost RPC reply):
    adopt it - delete those rows, advance meta.
-2. Read pending rows and compute the post-state root in one snapshot.
+2. Read pending rows in one snapshot; if this batch closes a checkpoint
+   interval, compute the state root in the same snapshot.
 3. Submit to L1 and wait for the transaction.
-4. Confirmed  -> delete the rows, advance height / prev hash / root (one txn).
+4. Confirmed  -> delete the rows, advance height / prev hash (and the root,
+   when the batch carries one) in one transaction.
    Not confirmed -> leave everything; retry next interval at the same height.
+5. If an interval of batches is now complete, submit the checkpoint
+   (previous root -> this root) to the coordinator contract.
 ```
 
 The DA contract caps a batch at `batchSizeLimit` (128 KB by default, read
@@ -198,8 +202,17 @@ excluded; a database with no user schema has the zero root.
 It is a function of the file, not of the history that produced it. Two
 databases with the same content have the same root whatever statements
 built them, and anyone holding a reconstructed database can recompute it
-(`hpplite_db_hash()`) and compare with what the sequencer posted. Batches
-carry the root before and after; checkpoints anchor it on L1.
+(`hpplite_db_hash()`) and compare with what the sequencer posted.
+
+Computing it is O(database size) (~28 ms/MB), so it is computed at
+**checkpoint cadence**, not per batch: only the batch that closes a
+checkpoint interval (`checkpointInterval`, default 100) carries
+`"state_root"`, and the checkpoint submitted right after it anchors that
+root on L1. Other batches are data only. This is the same split every L2
+makes - data is posted often, state is committed rarely - and it does not
+touch durability (every COMMIT is durable locally, every batch is on L1);
+it only sets how finely a verifier can localize a divergence. Deployments
+that want finer auditing lower `checkpointInterval` and pay proportionally.
 
 ### L1 Contract
 

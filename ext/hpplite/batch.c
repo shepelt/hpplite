@@ -115,6 +115,7 @@ void hpplite_batch_set_pre_state(HppliteBatch *pBatch, const unsigned char *pRoo
 */
 void hpplite_batch_set_post_state(HppliteBatch *pBatch, const unsigned char *pRoot) {
   memcpy(pBatch->postStateRoot, pRoot, HPPLITE_HASH_SIZE);
+  pBatch->hasRoot = 1;
 }
 
 /*
@@ -162,11 +163,12 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
   sqlite3_str_appendf(pStr, "  \"height\": %llu,\n", (unsigned long long)pBatch->height);
   sqlite3_str_appendf(pStr, "  \"timestamp\": %llu,\n", (unsigned long long)pBatch->timestamp);
 
-  hpplite_to_hex(pBatch->preStateRoot, HPPLITE_HASH_SIZE, hexBuf);
-  sqlite3_str_appendf(pStr, "  \"pre_state_root\": \"%s\",\n", hexBuf);
-
-  hpplite_to_hex(pBatch->postStateRoot, HPPLITE_HASH_SIZE, hexBuf);
-  sqlite3_str_appendf(pStr, "  \"post_state_root\": \"%s\",\n", hexBuf);
+  if (pBatch->hasRoot) {
+    /* Content hash after this batch; present only on batches that close a
+    ** checkpoint interval (computing it is O(database size)) */
+    hpplite_to_hex(pBatch->postStateRoot, HPPLITE_HASH_SIZE, hexBuf);
+    sqlite3_str_appendf(pStr, "  \"state_root\": \"%s\",\n", hexBuf);
+  }
   if (pBatch->partial) {
     sqlite3_str_appendf(pStr, "  \"partial\": 1,\n");
   }
@@ -333,10 +335,13 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         hpplite_from_hex(zVal, pBatch->preStateRoot, HPPLITE_HASH_SIZE);
         sqlite3_free(zVal);
       }
-    } else if (strcmp(zKey, "post_state_root") == 0) {
+    } else if (strcmp(zKey, "state_root") == 0 || strcmp(zKey, "post_state_root") == 0) {
+      /* post_state_root: batches written before roots moved to checkpoint cadence */
       zVal = json_parse_string(&p);
       if (zVal) {
-        hpplite_from_hex(zVal, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+        if (hpplite_from_hex(zVal, pBatch->postStateRoot, HPPLITE_HASH_SIZE) == 0) {
+          pBatch->hasRoot = 1;
+        }
         sqlite3_free(zVal);
       }
     } else if (strcmp(zKey, "transactions") == 0) {

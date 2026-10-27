@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include "hpplite.h"
 #include "config.h"
+#include "da_uri.h"
+#include "batch.h"
 
 #define TEST(name) printf("  %-50s ", name)
 #define PASS() printf("✓\n")
@@ -324,6 +326,45 @@ int main(void) {
         if (rc != SQLITE_OK) FAIL("sqlite3_close failed");
 
         /* If we got here without crash, close hook worked */
+        PASS();
+        passed++;
+    }
+
+    /* Test 12: l1= alias supplies the factory on both open paths */
+    tests++;
+    TEST("l1 alias sets the factory via hpplite_open and sqlite3_open_v2");
+    {
+        unsigned char expect[20];
+        const HppliteNetworkAlias *net = hpplite_da_lookup_network("hpp-sepolia");
+        if (!net || !net->factory) FAIL("alias has no factory");
+        if (hpplite_from_hex(net->factory + 2, expect, 20) != 0) FAIL("alias factory hex");
+
+        unlink("/tmp/test_simple_open.db");
+        sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&l1=hpp-sepolia&datadir=/tmp/hpplite_test_simple");
+        if (!db) FAIL("hpplite_open failed");
+        HppliteConfig *cfg = hpplite_get_config(db);
+        if (!cfg || !cfg->hasFactory || memcmp(cfg->factory, expect, 20) != 0) FAIL("hpplite_open: factory not set from alias");
+        hpplite_close(db);
+
+        unlink("/tmp/test_simple_open.db");
+        int rc = sqlite3_open_v2(
+            "file:/tmp/test_simple_open.db?hpplite=on&l1=hpp-sepolia&datadir=/tmp/hpplite_test_simple",
+            &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+        if (rc != SQLITE_OK) FAIL("sqlite3_open_v2 failed");
+        cfg = hpplite_get_config(db);
+        if (!cfg || !cfg->hasFactory || memcmp(cfg->factory, expect, 20) != 0) FAIL("sqlite3_open_v2: factory not set from alias");
+        if (!cfg->rpcUrl || strcmp(cfg->rpcUrl, net->rpcUrl) != 0) FAIL("rpc not set from alias");
+        sqlite3_close(db);
+
+        /* explicit factory= wins over the alias */
+        unlink("/tmp/test_simple_open.db");
+        rc = sqlite3_open_v2(
+            "file:/tmp/test_simple_open.db?hpplite=on&l1=hpp-sepolia&factory=0x1111111111111111111111111111111111111111&datadir=/tmp/hpplite_test_simple",
+            &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+        if (rc != SQLITE_OK) FAIL("sqlite3_open_v2 failed");
+        cfg = hpplite_get_config(db);
+        if (!cfg || !cfg->hasFactory || cfg->factory[0] != 0x11) FAIL("explicit factory should override the alias");
+        sqlite3_close(db);
         PASS();
         passed++;
     }

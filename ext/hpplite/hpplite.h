@@ -149,21 +149,25 @@ int hpplite_exec_cb(
 );
 
 /*
-** Build a batch from the committed pending SQL. Has no side effects: the
-** pending rows stay until hpplite_finalize_batch(). *pMaxId receives the id of
-** the last pending row included. Returns NULL if nothing is pending.
+** Build a batch from the committed pending SQL, with the content-hash state
+** root. Has no side effects: the pending rows stay until
+** hpplite_finalize_batch(). *pMaxId receives the id of the last pending row
+** included. Returns NULL if nothing is pending.
 */
 struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId);
 
 /*
 ** Like hpplite_build_batch() but keeps the serialized batch within maxBytes
-** (0 = unlimited), cutting at a transaction boundary when possible. When
-** pending SQL remains after the cut the batch is marked partial; its
-** post-state root is then the root after all pending SQL, i.e. the root the
-** last batch of the series will also carry. A single statement that cannot
-** fit on its own is left pending and reported (returns NULL, nLogErrors++).
+** (0 = unlimited), cutting at a transaction boundary when possible, and
+** computes the state root only when withRoot is set. Computing the root is
+** O(database size), so the node asks for it only on the batch that closes a
+** checkpoint interval. When pending SQL remains after the cut the batch is
+** marked partial and carries no root (the last batch of the series does). A
+** single statement that cannot fit on its own is left pending and reported
+** (returns NULL, nLogErrors++).
 */
-struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes, sqlite3_int64 *pMaxId);
+struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes,
+                                                 int withRoot, sqlite3_int64 *pMaxId);
 
 /*
 ** Total bytes of pending SQL text (cheap size estimate for early flushing).
@@ -172,7 +176,8 @@ sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx);
 
 /*
 ** Mark a batch confirmed: delete its pending rows (id <= maxId) and advance
-** height / previous block hash / state root in _hpplite_meta, atomically.
+** height / previous block hash in _hpplite_meta, atomically. The recorded
+** state root advances only when the batch carries one.
 */
 int hpplite_finalize_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch, sqlite3_int64 maxId);
 
@@ -215,7 +220,7 @@ uint64_t hpplite_get_block_height(HppliteCtx *pCtx);
 void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut);
 
 /*
-** Block hash: sha256(height || prevHash || preRoot || postRoot || sql...)
+** Block hash: sha256(height || prevHash || [stateRoot] || sql...)
 */
 void hpplite_block_hash(const struct HppliteBatch *pBatch, const unsigned char *pPrevHash, unsigned char *pOut);
 
