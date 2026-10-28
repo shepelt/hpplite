@@ -148,6 +148,21 @@ static void test_no_key_never_posts(void) {
     sqlite3_finalize(s);
     n->l1 = NULL;
     hpplite_node_destroy(n);
+
+    /* the documented URI form: an L1 is named but (no key) cannot be reached.
+    ** The flush must keep everything pending rather than finalize locally and
+    ** advance the height past batches L1 never saw */
+    sqlite3 *db = open_v2("file:" DIR "/nokey_uri.db?hpplite=on&l1=hpp-sepolia&datadir=" DIR);
+    if (!db) FAIL("open with l1= and no key");
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1); SELECT hpplite_flush();", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db, "SELECT height, pending FROM hpplite_status", -1, &s, NULL);
+    if (sqlite3_step(s) != SQLITE_ROW || sqlite3_column_int(s, 0) != 1 || sqlite3_column_int(s, 1) != 2) {
+        printf("(height=%d pending=%d) ", sqlite3_column_int(s, 0), sqlite3_column_int(s, 1));
+        sqlite3_finalize(s); sqlite3_close(db);
+        FAIL("with l1= configured and no connection, nothing may be finalized locally");
+    }
+    sqlite3_finalize(s);
+    sqlite3_close(db);
     hpplite_l1_disconnect(l1);
     PASS();
 }

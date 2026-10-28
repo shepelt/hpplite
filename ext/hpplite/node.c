@@ -36,9 +36,10 @@ static char *node_strdup(const char *s) {
 ** Helper: get current time in milliseconds
 */
 static int64_t node_current_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    /* Monotonic: a wall-clock step must not delay or double a flush */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /*
@@ -101,6 +102,16 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
 
     /* Generate unique instance ID */
     generate_instance_id(node->instanceId);
+    node->leaseDuration = 300;
+
+    /* One flush at a time, timer or not (two hpplite_flush() calls from two
+    ** threads used to run concurrently on a timer-less node) */
+    {
+        pthread_mutex_t *mutex = sqlite3_malloc(sizeof(pthread_mutex_t));
+        if (!mutex) return -1;
+        pthread_mutex_init(mutex, NULL);
+        node->flushMutex = mutex;
+    }
 
     /* Initialize state */
     node->state = HPPLITE_STATE_INIT;
@@ -133,6 +144,21 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
 ** never block the application's writes (and vice versa), and both connections
 ** get a busy timeout so the brief bookkeeping writes wait instead of failing.
 */
+/* Tell the capture path how long a statement may be: what fits in one DA
+** batch after the envelope and the JSON framing. */
+static void node_set_stmt_limit(HppliteNode *node) {
+    size_t limit = node->config.maxBatchBytes;
+    if (!node->ctx) return;
+    if (limit > 0) {
+        size_t overhead = hpplite_batch_json_overhead() + 64;
+        if (node->cipher) overhead += hpplite_envelope_overhead(node->cipher);
+        /* JSON escaping can double a statement full of quotes/backslashes;
+        ** the capture-time check is on the raw text, so be conservative */
+        limit = limit > overhead ? (limit - overhead) : 1;
+    }
+    node->ctx->maxStmtBytes = limit;
+}
+
 static int node_init_tracking(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     int rc;
@@ -158,7 +184,13 @@ static int node_init_tracking(HppliteNode *node) {
 
     node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
     memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
+    /* Batches confirmed since the last checkpoint are in _hpplite_meta
+    ** (heights), so the cadence survives a restart: a process that opens,
+    ** writes a few batches and exits still reaches a checkpoint eventually */
+    if (node->ctx->blockHeight > node->lastCheckpointHeight + 1)
+        node->batchesSinceCheckpoint = (int)(node->ctx->blockHeight - 1 - node->lastCheckpointHeight);
     node->lastFlushTime = node_current_time_ms();
+    node_set_stmt_limit(node);
     return SQLITE_OK;
 }
 
@@ -170,6 +202,7 @@ static void node_learn_batch_limit(HppliteNode *node);
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (!config->rpcUrl) return;
     if (!config->hasContract && !config->hasFactory) return;
+    node->wantsL1 = 1;
 
     if (config->hasFactory && config->hasPrivkey) {
         /* Use factory to find/create rollup */
@@ -366,6 +399,14 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.dataDir);
     sqlite3_free(node->config.dbPath);
     sqlite3_free(node->config.rpcUrl);
+    if (node->flushMutex) {
+        pthread_mutex_destroy((pthread_mutex_t *)node->flushMutex);
+        sqlite3_free(node->flushMutex);
+        node->flushMutex = NULL;
+    }
+    /* Key material does not outlive the node */
+    memset(node->config.privkey, 0, sizeof(node->config.privkey));
+    memset(node->encKey, 0, sizeof(node->encKey));
 
     sqlite3_free(node);
 }
@@ -385,6 +426,8 @@ static void node_learn_batch_limit(HppliteNode *node) {
     cfg = hpplite_l1_get_system_config(node->l1);
     if (cfg) {
         if (cfg->batchSizeLimit > 0) node->config.maxBatchBytes = (size_t)cfg->batchSizeLimit;
+        if (cfg->leaseDuration > 0) node->leaseDuration = cfg->leaseDuration;
+        node_set_stmt_limit(node);
         hpplite_l1_system_config_free(cfg);
     }
 }
@@ -414,6 +457,10 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         free(plain);
     } else {
         batch = hpplite_batch_from_json((const char *)data);
+    }
+    if (!batch) {
+        fprintf(stderr, "hpplite: batch %llu on L1 is not a batch this version can decode (%zu bytes)\n",
+                (unsigned long long)height, dataLen);
     }
     return batch;
 }
@@ -467,6 +514,67 @@ static int node_adopt_existing(HppliteNode *node) {
 ** remains because the batch was cut at the size limit.
 ** Returns the confirmed height, or 0.
 */
+/*
+** Make sure this instance holds the sequencer lease before it posts.
+**
+** The contract lets anyone claim an expired lease, so "a lease is active"
+** is not "our lease is active": a batch submitted under a foreign lease
+** reverts (and costs gas every interval). The lease is read from L1, renewed
+** when ours is past half its life, claimed when free, and left alone when
+** someone else holds it. Returns 1 when posting is allowed.
+*/
+static int node_ensure_lease(HppliteNode *node) {
+    int64_t now = node_current_time_ms();
+    HppliteL1State *st;
+    uint64_t chainNow, remaining;
+    int ours;
+
+    if (now < node->leaseRecheckAt) return node->hasLease;
+
+    st = hpplite_l1_get_state(node->l1);
+    if (!st) {
+        fprintf(stderr, "hpplite: cannot read the sequencer lease from L1; not posting\n");
+        node->leaseRecheckAt = now + 5000;
+        return 0;
+    }
+    chainNow = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
+    remaining = st->leaseExpiry > chainNow ? st->leaseExpiry - chainNow : 0;
+    ours = remaining > 0 && memcmp(st->sequencerInstance, node->instanceId, 32) == 0;
+    if (st->leaseDuration > 0) node->leaseDuration = st->leaseDuration;
+    hpplite_l1_state_free(st);
+
+    if (remaining > 0 && !ours) {
+        if (!node->warnedForeignLease) {
+            fprintf(stderr, "hpplite: another sequencer instance holds the lease (%llu s left); "
+                            "batches are kept pending until it expires\n", (unsigned long long)remaining);
+            node->warnedForeignLease = 1;
+        }
+        node->hasLease = 0;
+        node->leaseRecheckAt = now + (int64_t)(remaining < 30 ? remaining : 30) * 1000;
+        return 0;
+    }
+    node->warnedForeignLease = 0;
+
+    if (ours && remaining * 2 < node->leaseDuration) {
+        if (hpplite_node_renew_lease(node) == 0) remaining = node->leaseDuration;
+    } else if (!ours) {
+        if (hpplite_node_claim_lease(node) != 0) {
+            node->leaseRecheckAt = now + 5000;
+            return 0;
+        }
+        remaining = node->leaseDuration;
+    }
+    node->hasLease = 1;
+    /* Look again well before the renewal point, never later than a minute */
+    {
+        uint64_t s = remaining / 4;
+        if (s < 1) s = 1;
+        if (s > 60) s = 60;
+        node->leaseRecheckAt = now + (int64_t)s * 1000;
+    }
+    return 1;
+}
+
 static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
     HppliteBatch *batch;
@@ -484,6 +592,18 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         size_t overhead = hpplite_envelope_overhead(node->cipher);
         maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;
     }
+    if (!node->l1 && node->wantsL1) {
+        /* l1=/contract=/factory= was given but no connection came of it
+        ** (no key, bad RPC, ...): finalizing locally would advance the
+        ** height past batches L1 never saw. Keep everything pending. */
+        if (!node->warnedNoL1) {
+            fprintf(stderr, "hpplite: L1 was configured but is not connected; batches are kept pending "
+                            "(check the key and the RPC endpoint)\n");
+            node->warnedNoL1 = 1;
+        }
+        return 0;
+    }
+
     batch = hpplite_build_batch_limited(ctx, maxBytes, withRoot, &maxId);
     if (!batch) return 0;
     height = batch->height;
@@ -503,9 +623,11 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             return 0;
         }
 
-        /* Ensure we have an active lease before submitting */
-        if (!hpplite_l1_is_lease_active(node->l1)) {
-            hpplite_node_claim_lease(node);
+        /* Only the lease holder may post; never submit into someone else's lease */
+        if (!node_ensure_lease(node)) {
+            hpplite_batch_free(batch);
+            *pMore = 0;
+            return 0;
         }
 
         char *json = hpplite_batch_to_json(batch);
@@ -536,8 +658,14 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             /* The transaction may have landed despite the error */
             confirmed = (node_adopt_existing(node) == 1);
             if (!confirmed) {
-                fprintf(stderr, "hpplite: batch %llu not confirmed on L1, kept pending\n",
-                        (unsigned long long)height);
+                int64_t wait = (int64_t)node->config.batchIntervalMs;
+                if (wait <= 0) wait = 5000;
+                if (node->failStreak < 6) node->failStreak++;
+                wait <<= node->failStreak;                 /* 2x per failure */
+                if (wait > 300000) wait = 300000;          /* ... up to the lease length */
+                node->retryAt = node_current_time_ms() + wait;
+                fprintf(stderr, "hpplite: batch %llu not confirmed on L1, kept pending (retry in %llds)\n",
+                        (unsigned long long)height, (long long)(wait / 1000));
                 *pMore = 0;
             }
             hpplite_batch_free(batch);
@@ -552,6 +680,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     } else {
         node->batchesProduced++;
         node->batchesSinceCheckpoint++;
+        node->failStreak = 0;
+        node->retryAt = 0;
     }
 
     hpplite_batch_free(batch);
@@ -606,6 +736,9 @@ uint64_t hpplite_node_flush_batch(HppliteNode *node) {
     if (!node) return 0;
     mutex = (pthread_mutex_t *)node->flushMutex;
     if (mutex) pthread_mutex_lock(mutex);
+    /* An explicit flush reads the lease afresh; only the timer uses the cache */
+    node->leaseRecheckAt = 0;
+    node->retryAt = 0;
     height = node_flush_unlocked(node);
     if (mutex) pthread_mutex_unlock(mutex);
     return height;
@@ -625,7 +758,12 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     while (node->ctx->blockHeight <= lastBatch) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
         int rc;
-        if (!batch) break;
+        if (!batch) {
+            fprintf(stderr, "hpplite: sync stopped at height %llu of %llu on L1\n",
+                    (unsigned long long)node->ctx->blockHeight, (unsigned long long)lastBatch);
+            node->state = HPPLITE_STATE_ERROR;
+            return synced ? synced : -1;
+        }
         if (hpplite_pending_count(node->ctx) > 0) {
             /* Local writes exist: the L1 batch must be ours */
             rc = hpplite_adopt_batch(node->ctx, batch);
@@ -674,6 +812,7 @@ static void *node_timer_thread_func(void *arg) {
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
             hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2);
 
+        if (now < node->retryAt) continue;           /* backing off after L1 failures */
         if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
             if (mutex) {
@@ -696,21 +835,17 @@ void hpplite_node_start_timer(HppliteNode *node) {
     if (!node) return;
     if (node->config.batchIntervalMs <= 0) return;
     if (node->timerRunning) return;
-
-    /* Allocate mutex */
-    pthread_mutex_t *mutex = sqlite3_malloc(sizeof(pthread_mutex_t));
-    if (!mutex) return;
-    pthread_mutex_init(mutex, NULL);
-    node->flushMutex = mutex;
+    if (!node->bkDb) {
+        /* In-memory databases have no bookkeeping connection: a timer would
+        ** run BEGIN/COMMIT on the application's connection from another
+        ** thread, inside its transactions. Flush on close or hpplite_flush(). */
+        return;
+    }
+    if (!node->flushMutex) return;
 
     /* Start thread */
     pthread_t *thread = sqlite3_malloc(sizeof(pthread_t));
-    if (!thread) {
-        pthread_mutex_destroy(mutex);
-        sqlite3_free(mutex);
-        node->flushMutex = NULL;
-        return;
-    }
+    if (!thread) return;
 
     node->timerRunning = 1;
     pthread_create(thread, NULL, node_timer_thread_func, node);
@@ -734,13 +869,6 @@ void hpplite_node_stop_timer(HppliteNode *node) {
         node->timerThread = NULL;
     }
 
-    /* Destroy mutex */
-    pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
-    if (mutex) {
-        pthread_mutex_destroy(mutex);
-        sqlite3_free(mutex);
-        node->flushMutex = NULL;
-    }
 }
 
 /*
@@ -763,6 +891,7 @@ int hpplite_node_claim_lease(HppliteNode *node) {
     }
     sqlite3_free(txHash);
     node->hasLease = 1;
+    node->leaseRecheckAt = 0;
     return 0;
 }
 
@@ -780,6 +909,7 @@ int hpplite_node_release_lease(HppliteNode *node) {
     hpplite_l1_wait_for_tx(node->l1, txHash, 30);
     sqlite3_free(txHash);
     node->hasLease = 0;
+    node->leaseRecheckAt = 0;
     return 0;
 }
 
@@ -888,12 +1018,7 @@ char *hpplite_node_submit_checkpoint(HppliteNode *node) {
     if (!node || !node->l1) return NULL;
     if (node->batchesSinceCheckpoint == 0) return NULL;
 
-    /* Ensure we have an active lease */
-    if (!hpplite_l1_is_lease_active(node->l1)) {
-        if (hpplite_node_claim_lease(node) != 0) {
-            return NULL;  /* Could not claim lease */
-        }
-    }
+    if (!node_ensure_lease(node)) return NULL;
 
     /* Current state: root after the last confirmed batch */
     uint64_t currentHeight = hpplite_get_block_height(node->ctx) - 1;

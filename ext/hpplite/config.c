@@ -70,6 +70,8 @@ static int parse_duration_ms(const char *str) {
         return value;
     } else if (*p == 'm' || *p == 'M') {
         return value * 60 * 1000;
+    } else if (*p == 'h' || *p == 'H') {
+        return value * 60 * 60 * 1000;
     } else if (*p == '\0') {
         /* No unit = seconds */
         return value * 1000;
@@ -110,6 +112,7 @@ HppliteConfig *hpplite_config_create(void) {
 
 void hpplite_config_free(HppliteConfig *cfg) {
     if (!cfg) return;
+    memset(cfg->privkey, 0, sizeof(cfg->privkey));   /* key material does not outlive the config */
     if (cfg->nodeId) free(cfg->nodeId);
     if (cfg->rpcUrl) free(cfg->rpcUrl);
     if (cfg->dataDir) free(cfg->dataDir);
@@ -526,23 +529,30 @@ int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path) {
 
     if (!cfg || !path) return -1;
 
-    /* Like ssh: a key file readable by anyone else is not a key file */
-    if (stat(path, &st) != 0) {
+    /* Like ssh: a key file readable by anyone else is not a key file.
+    ** Checked on the open descriptor so the file cannot be swapped between
+    ** the check and the read. */
+    f = fopen(path, "r");
+    if (!f) {
         fprintf(stderr, "hpplite: key file %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (fstat(fileno(f), &st) != 0) {
+        fprintf(stderr, "hpplite: key file %s: %s\n", path, strerror(errno));
+        fclose(f);
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
         fprintf(stderr, "hpplite: key file %s is not a regular file\n", path);
+        fclose(f);
         return -1;
     }
     if (st.st_mode & (S_IRWXG | S_IRWXO)) {
         fprintf(stderr, "hpplite: key file %s is accessible by others (mode %03o); refusing to use it\n",
                 path, (unsigned)(st.st_mode & 0777));
+        fclose(f);
         return -1;
     }
-
-    f = fopen(path, "r");
-    if (!f) return -1;
     n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[n] = '\0';

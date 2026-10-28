@@ -133,8 +133,29 @@ static cJSON *rpc_call(EthClient *client, const char *method, cJSON *params) {
     return json;
 }
 
+/*
+** Process-wide one-time setup. curl_global_init() is not thread-safe and
+** curl_easy_init() would call it implicitly from whichever thread comes
+** first; the static secp256k1 contexts used for address derivation were
+** created lazily without a lock.
+*/
+#include <pthread.h>
+static pthread_once_t g_eth_once = PTHREAD_ONCE_INIT;
+static secp256k1_context *g_addr_ctx = NULL;   /* VERIFY: pubkey -> address */
+static secp256k1_context *g_sign_ctx = NULL;   /* SIGN: privkey -> pubkey */
+static void eth_global_init(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    g_addr_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    g_sign_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+}
+void eth_client_global_init(void) {
+    pthread_once(&g_eth_once, eth_global_init);
+}
+
 EthClient *eth_client_create(const char *rpc_url, uint64_t chain_id) {
-    EthClient *client = calloc(1, sizeof(EthClient));
+    EthClient *client;
+    eth_client_global_init();
+    client = calloc(1, sizeof(EthClient));
     if (!client) return NULL;
     
     client->rpc_url = strdup(rpc_url);
@@ -430,15 +451,9 @@ int eth_client_get_receipt(EthClient *client,
     return 1; /* mined */
 }
 
-/* Static context for address derivation (lazy init) */
-static secp256k1_context *g_addr_ctx = NULL;
-
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]) {
-    /* Lazy init secp256k1 context */
-    if (!g_addr_ctx) {
-        g_addr_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
-        if (!g_addr_ctx) return -1;
-    }
+    eth_client_global_init();
+    if (!g_addr_ctx) return -1;
 
     /* Parse compressed pubkey */
     secp256k1_pubkey pk;
@@ -460,12 +475,10 @@ int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address
 }
 
 int eth_address_from_privkey(const uint8_t privkey[32], uint8_t address[20]) {
-    /* Lazy init secp256k1 context (need SIGN for pubkey creation) */
-    static secp256k1_context *sign_ctx = NULL;
-    if (!sign_ctx) {
-        sign_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-        if (!sign_ctx) return -1;
-    }
+    secp256k1_context *sign_ctx;
+    eth_client_global_init();
+    sign_ctx = g_sign_ctx;
+    if (!sign_ctx) return -1;
 
     /* Derive public key from private key */
     secp256k1_pubkey pk;

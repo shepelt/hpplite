@@ -56,6 +56,14 @@ static void test_load_and_use(void) {
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 1 || !ok) FAIL("height should be 1 after load");
     PASS();
 
+    TEST("loading HPPLite twice into one connection is refused (it would silence the first)");
+    rc = sqlite3_load_extension(db, HPPLITE_EXT_PATH, NULL, &err);
+    if (rc == SQLITE_OK) FAIL("second load should fail");
+    if (!err || !strstr(err, "already loaded")) { printf("(%s) ", err ? err : "?"); sqlite3_free(err); FAIL("error text"); }
+    sqlite3_free(err); err = NULL;
+    if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 1 || !ok) FAIL("first instance must stay intact");
+    PASS();
+
     TEST("writes are captured and flushed through the extension");
     rc = sqlite3_exec(db,
         "CREATE TABLE t(id INTEGER PRIMARY KEY, v);"

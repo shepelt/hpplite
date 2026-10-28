@@ -306,11 +306,28 @@ static void hashValue(SHA256_CTX *pH, sqlite3_stmt *pStmt, int i) {
 /*
 ** Hash every row of one table in a deterministic order.
 */
+/* "WITHOUT ROWID" in any case, with any whitespace, anywhere after the column list */
+static int isWithoutRowid(const char *zSql) {
+  const char *z = zSql;
+  if (!z) return 0;
+  while ((z = strpbrk(z, "wW")) != NULL) {
+    if (sqlite3_strnicmp(z, "without", 7) == 0) {
+      const char *p = z + 7;
+      if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (sqlite3_strnicmp(p, "rowid", 5) == 0) return 1;
+      }
+    }
+    z++;
+  }
+  return 0;
+}
+
 static int hashTableRows(sqlite3 *db, SHA256_CTX *pH, const char *zName, const char *zSql) {
   sqlite3_stmt *pStmt;
   char *zQuery;
   int rc, nCol, i;
-  int withoutRowid = (zSql && strstr(zSql, "WITHOUT ROWID") != NULL);
+  int withoutRowid = isWithoutRowid(zSql);
 
   if (withoutRowid) {
     /* No rowid: order by every column (the primary key is among them) */
@@ -509,13 +526,47 @@ static int isNondeterministicSql(const char *z) {
   return 0;
 }
 
-static void lowercaseCopy(const char *z, char *out, size_t n) {
-  size_t i;
-  for (i = 0; i + 1 < n && z[i]; i++) {
+static char *lowercaseDup(const char *z) {
+  size_t n = strlen(z), i;
+  char *out = sqlite3_malloc64(n + 1);
+  if (!out) return NULL;
+  for (i = 0; i < n; i++) {
     char c = z[i];
     out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
   }
-  out[i] = 0;
+  out[n] = 0;
+  return out;
+}
+
+/*
+** Does the statement reference one of our own tables? String literals do
+** not count: 'see _hpplite_pending' is user data and must be captured.
+*/
+static int mentionsHppliteTable(const char *z) {
+  while (*z) {
+    if (*z == '\'' || *z == '"') {
+      char q = *z++;
+      while (*z && !(*z == q && z[1] != q)) z += (*z == q) ? 2 : 1;
+      if (*z) z++;
+    } else if (strncmp(z, "_hpplite_", 9) == 0) {
+      return 1;
+    } else {
+      z++;
+    }
+  }
+  return 0;
+}
+
+/*
+** Capture failed: the statement must not run either, or the log and the
+** database disagree forever. sqlite3_interrupt() makes the statement that
+** is about to execute fail with SQLITE_INTERRUPT (inside an explicit
+** transaction SQLite rolls the transaction back, as a disk-full would).
+*/
+static void refuseStatement(HppliteCtx *pCtx, const char *zWhy, const char *zSql) {
+  pCtx->nLogErrors++;
+  fprintf(stderr, "hpplite: %s; statement refused (SQLITE_INTERRUPT): %.80s\n", zWhy, zSql);
+  sqlite3_interrupt(pCtx->db);
 }
 
 /*
@@ -540,21 +591,33 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
   if (!isTrackedSql(zSql)) return 0;
-  if (strstr(zSql, "_hpplite_")) return 0;  /* never log our own tables */
+  if (mentionsHppliteTable(zSql)) return 0;  /* never log our own tables */
   {
-    char lower[512];
-    lowercaseCopy(zSql, lower, sizeof(lower));
-    if (isNondeterministicSql(lower)) {
+    char *lower = lowercaseDup(zSql);
+    if (lower && isNondeterministicSql(lower)) {
       if (pCtx->nNondeterministic == 0) {
         fprintf(stderr, "hpplite: statement uses a non-deterministic function; replay cannot "
                         "reproduce it and verification will report a mismatch: %.80s\n", zSql);
       }
       pCtx->nNondeterministic++;
     }
+    sqlite3_free(lower);
   }
 
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
+  if (!zExpanded) {
+    refuseStatement(pCtx, "cannot expand bound parameters (out of memory?)", zSql);
+    return 0;
+  }
+  if (pCtx->maxStmtBytes > 0 && strlen(zExpanded) > pCtx->maxStmtBytes) {
+    char why[128];
+    snprintf(why, sizeof(why), "statement of %zu bytes exceeds what one DA batch can carry (%zu)",
+             strlen(zExpanded), pCtx->maxStmtBytes);
+    refuseStatement(pCtx, why, zSql);
+    sqlite3_free(zExpanded);
+    return 0;
+  }
 
   pCtx->bInternal = 1;
   if (!pCtx->pLogStmt) {
@@ -565,7 +628,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (pCtx->pLogStmt) {
     sqlite3_bind_int64(pCtx->pLogStmt, 1, (sqlite3_int64)pCtx->txnSeq);
-    sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded ? zExpanded : zSql, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(pCtx->pLogStmt);
     if (rc == SQLITE_DONE) {
       pCtx->pLastLogged = pS;
@@ -578,11 +641,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   } else {
     rc = SQLITE_ERROR;
   }
-  if (rc != SQLITE_DONE) {
-    pCtx->nLogErrors++;
-    fprintf(stderr, "hpplite: could not log statement: %s\n", sqlite3_errmsg(pCtx->db));
-  }
   pCtx->bInternal = 0;
+  if (rc != SQLITE_DONE) {
+    char why[160];
+    snprintf(why, sizeof(why), "could not log statement (%s)", sqlite3_errmsg(pCtx->db));
+    refuseStatement(pCtx, why, zSql);
+  }
   sqlite3_free(zExpanded);
   return 0;
 }
@@ -825,6 +889,9 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
         hpplite_batch_set_post_state(pBatch, root);
       } else {
+        pCtx->nLogErrors++;
+        fprintf(stderr, "hpplite: cannot hash the database for the state root (%s); batch %llu not built\n",
+                sqlite3_errmsg(pCtx->bkDb), (unsigned long long)pBatch->height);
         hpplite_batch_free(pBatch);
         pBatch = NULL;
       }
@@ -1132,7 +1199,13 @@ struct NodeEntry {
 
 static NodeEntry *g_nodeRegistry = NULL;
 
-static NodeEntry *findEntry(sqlite3 *db) {
+/* Connections open and close on any thread; the list is read from SQL
+** functions and the status table. One static SQLite mutex guards it. */
+static sqlite3_mutex *regMutex(void) {
+    return sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP1);
+}
+
+static NodeEntry *findEntryLocked(sqlite3 *db) {
     NodeEntry *e = g_nodeRegistry;
     while (e) {
         if (e->db == db) return e;
@@ -1141,23 +1214,38 @@ static NodeEntry *findEntry(sqlite3 *db) {
     return NULL;
 }
 
+static NodeEntry *findEntry(sqlite3 *db) {
+    sqlite3_mutex *m = regMutex();
+    NodeEntry *e;
+    sqlite3_mutex_enter(m);
+    e = findEntryLocked(db);
+    sqlite3_mutex_leave(m);
+    return e;
+}
+
 static HppliteNode *findNode(sqlite3 *db) {
     NodeEntry *e = findEntry(db);
     return e ? e->node : NULL;
 }
 
 static void removeNode(sqlite3 *db) {
-    NodeEntry **pp = &g_nodeRegistry;
+    sqlite3_mutex *m = regMutex();
+    NodeEntry **pp, *e = NULL;
+    sqlite3_mutex_enter(m);
+    pp = &g_nodeRegistry;
     while (*pp) {
         if ((*pp)->db == db) {
-            NodeEntry *e = *pp;
+            e = *pp;
             *pp = e->next;
-            /* Note: node is destroyed separately via hpplite_node_destroy() */
-            if (e->config) hpplite_config_free(e->config);
-            free(e);
-            return;
+            break;
         }
         pp = &(*pp)->next;
+    }
+    sqlite3_mutex_leave(m);
+    /* Note: node is destroyed separately via hpplite_node_destroy() */
+    if (e) {
+        if (e->config) hpplite_config_free(e->config);
+        free(e);
     }
 }
 
@@ -1354,18 +1442,24 @@ static sqlite3_module hpplite_status_module = {
 void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
     if (!db || !node) return;
 
-    /* Check if already registered */
-    if (findEntry(db)) return;
-
-    /* Add to registry */
+    /* Add to registry (once per connection) */
     NodeEntry *entry = calloc(1, sizeof(NodeEntry));
     if (!entry) return;
-
     entry->db = db;
     entry->node = node;
     entry->config = NULL;  /* Filled in by hpplite_open() / auto-init */
-    entry->next = g_nodeRegistry;
-    g_nodeRegistry = entry;
+    {
+        sqlite3_mutex *m = regMutex();
+        sqlite3_mutex_enter(m);
+        if (findEntryLocked(db)) {
+            sqlite3_mutex_leave(m);
+            free(entry);
+            return;
+        }
+        entry->next = g_nodeRegistry;
+        g_nodeRegistry = entry;
+        sqlite3_mutex_leave(m);
+    }
 
     /* Register SQL functions */
     sqlite3_create_function(db, "hpplite_sync", 0, SQLITE_UTF8, NULL,
@@ -1633,8 +1727,12 @@ static int hpplite_auto_init(
     free_node_config(&nodeConfig);
 
     if (!node) {
+        /* hpplite=on was asked for and cannot be honoured: fail the open
+        ** rather than hand back a connection that silently captures nothing */
         hpplite_config_free(config);
-        return SQLITE_OK;  /* Don't fail the open, just skip HPPLite */
+        if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s (bad key, unreadable key file, "
+                                                  "or bookkeeping tables could not be created)", filename);
+        return SQLITE_ERROR;
     }
 
     /* Node creation registered the connection; keep the config with it */
@@ -1732,6 +1830,22 @@ int sqlite3_hpplite_init(
   const sqlite3_api_routines *pApi
 ) {
   SQLITE_EXTENSION_INIT2(pApi);
+  /* A second copy of HPPLite (the static library plus this module, or the
+  ** module loaded twice) would replace the first one's hpplite_status
+  ** module and tear its hooks down: nothing would be captured. */
+  {
+    sqlite3_stmt *pStmt = NULL;
+    int dup = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_module_list WHERE name='hpplite_status'",
+                           -1, &pStmt, NULL) == SQLITE_OK) {
+      dup = (sqlite3_step(pStmt) == SQLITE_ROW);
+      sqlite3_finalize(pStmt);
+    }
+    if (dup) {
+      if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite is already loaded in this connection");
+      return SQLITE_ERROR;
+    }
+  }
   hpplite_pin_in_memory();
   sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
   return hpplite_auto_init(db, pzErrMsg, pApi);

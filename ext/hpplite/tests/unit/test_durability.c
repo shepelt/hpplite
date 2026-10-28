@@ -24,6 +24,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
+#define PRIVKEY_HEX "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 static const unsigned char PRIVKEY[32] = {
     0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20
@@ -319,6 +320,26 @@ static void test_stale_lease_after_crash(void) {
     hpplite_l1_mock_advance_time(l1, 10 * 60);   /* lease expires */
     if (hpplite_node_flush_batch(b) != 2) FAIL("submit should succeed after expiry");
     if (hpplite_node_pending_count(b) != 0) FAIL("pending should be empty");
+    if (!b->hasLease) FAIL("b should hold the lease now");
+
+    /* issue #21: the holder renews once the lease is past half its life,
+    ** so a busy sequencer never lets its own lease lapse */
+    hpplite_l1_mock_advance_time(l1, 200);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(b) != 3) FAIL("submit near expiry");
+    if (hpplite_l1_get_lease_time_remaining(l1) != 300) { printf("(left=%llu) ", (unsigned long long)hpplite_l1_get_lease_time_remaining(l1)); FAIL("lease should have been renewed"); }
+
+    /* and a failing L1 makes the timer back off instead of retrying every interval */
+    hpplite_l1_mock_set_fail_submit(l1, 1);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(3)", NULL);
+    if (hpplite_node_flush_batch(b) != 0) FAIL("submit should fail");
+    if (b->failStreak != 1 || b->retryAt == 0) FAIL("failure should schedule a delayed retry");
+    hpplite_node_exec(b, "INSERT INTO t VALUES(4)", NULL);
+    hpplite_node_flush_batch(b);
+    if (b->failStreak != 2) FAIL("second failure doubles the backoff");
+    hpplite_l1_mock_set_fail_submit(l1, 0);
+    if (hpplite_node_flush_batch(b) != 4) FAIL("explicit flush retries at once");
+    if (b->failStreak != 0 || b->retryAt != 0) FAIL("success clears the backoff");
     hpplite_node_destroy(b);
     hpplite_l1_disconnect(l1);
     PASS();
@@ -471,6 +492,17 @@ static void test_checkpoint_persists(void) {
     if (n->ctx->lastCheckpointHeight != 2) FAIL("ctx checkpoint height not restored");
     const HppliteCheckpoint *cp = hpplite_l1_mock_get_last_checkpoint(l1);
     if (!cp || memcmp(cp->postStateRoot, n->lastCheckpointRoot, 32) != 0) FAIL("checkpoint root not restored");
+    /* issue #22: a process that writes one batch and exits, repeatedly, must
+    ** still reach the next checkpoint - the count is derived from heights */
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL); hpplite_node_flush_batch(n);
+    hpplite_node_destroy(n);
+    n = hpplite_node_create(&config);
+    if (!n) FAIL("reopen 2");
+    hpplite_node_set_l1(n, l1);
+    if (n->batchesSinceCheckpoint != 1) { printf("(since=%d) ", n->batchesSinceCheckpoint); FAIL("batches since checkpoint not derived on reopen"); }
+    hpplite_node_exec(n, "INSERT INTO t VALUES(3)", NULL); hpplite_node_flush_batch(n);
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 2) FAIL("second checkpoint should follow across restarts");
+    if (n->lastCheckpointHeight != 4) FAIL("second checkpoint height");
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
     PASS();
@@ -591,15 +623,28 @@ static void test_batch_size_limit(void) {
     r->l1 = NULL;
     hpplite_node_destroy(r);
 
-    /* a single statement that cannot fit is reported and left pending */
+    /* a single statement that cannot fit is refused when it runs (the app
+    ** sees SQLITE_INTERRUPT) instead of stalling every later batch forever */
     char huge[3600];
     memset(huge, 'y', 3500); huge[3500] = 0;
     char *big = sqlite3_mprintf("INSERT INTO t VALUES(99,'%s')", huge);
-    hpplite_node_exec(n, big, NULL);
+    int rc = sqlite3_exec(n->db, big, NULL, NULL, NULL);
     sqlite3_free(big);
-    if (hpplite_node_flush_batch(n) != 0) FAIL("oversized statement should not flush");
-    if (hpplite_node_pending_count(n) != 1) FAIL("oversized statement should stay pending");
+    if (rc != SQLITE_INTERRUPT) { printf("(rc=%d) ", rc); FAIL("oversized statement should fail with SQLITE_INTERRUPT"); }
+    if (count_rows(n->db, "t") != 32) FAIL("refused statement must not be applied");
+    if (hpplite_node_pending_count(n) != 0) FAIL("refused statement must not be logged");
     if (n->ctx->nLogErrors == 0) FAIL("oversized statement should be reported");
+    /* the same inside an explicit transaction: the transaction is gone, the app knows */
+    sqlite3_exec(n->db, "BEGIN; INSERT INTO t VALUES(100,'ok')", NULL, NULL, NULL);
+    big = sqlite3_mprintf("INSERT INTO t VALUES(101,'%s')", huge);
+    rc = sqlite3_exec(n->db, big, NULL, NULL, NULL);
+    sqlite3_free(big);
+    if (rc != SQLITE_INTERRUPT) FAIL("oversized statement in a transaction should fail");
+    if (!sqlite3_get_autocommit(n->db)) sqlite3_exec(n->db, "ROLLBACK", NULL, NULL, NULL);
+    if (count_rows(n->db, "t") != 32 || hpplite_node_pending_count(n) != 0) FAIL("nothing from the aborted transaction survives");
+    /* later writes flow normally */
+    hpplite_node_exec(n, "INSERT INTO t VALUES(102,'after')", NULL);
+    if (hpplite_node_flush_batch(n) == 0) FAIL("writes after a refused statement must still flush");
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
     PASS();
@@ -699,7 +744,8 @@ static void test_encryption_default(void) {
     HppliteNode *x = hpplite_node_create(&config);
     if (!x) FAIL("open stranger");
     hpplite_node_set_l1(x, l1);
-    if (hpplite_node_sync_from_l1(x, 1) != 0) FAIL("stranger should sync nothing");
+    if (hpplite_node_sync_from_l1(x, 1) >= 0) FAIL("stranger should sync nothing and be told (issue #29)");
+    if (x->state != HPPLITE_STATE_ERROR) FAIL("a node that cannot read L1 history is in error state");
     if (hpplite_node_get_height(x) != 1) FAIL("stranger height must not advance");
     if (hpplite_node_fetch_batch(x, 1) != NULL) FAIL("stranger opened the batch");
     x->l1 = NULL; hpplite_node_destroy(x);
@@ -792,6 +838,103 @@ static void test_flush_thread_never_loses_captures(void) {
     PASS();
 }
 
+/* 22. Capture fidelity corner cases found by review */
+static void test_capture_corner_cases(void) {
+    TEST("_hpplite_ in a string literal, lowercase 'without rowid', long statements");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "corner"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
+    config.dataDir = DIR; config.dbPath = DIR "/corner.db"; config.checkpointInterval = 1;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_set_l1(n, l1); hpplite_node_start(n);
+
+    /* our table name inside user data is user data */
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1,'see _hpplite_pending for details')", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2,\"_hpplite_meta\")", NULL);
+    if (hpplite_node_pending_count(n) != 3) { printf("(pending=%d) ", hpplite_node_pending_count(n)); FAIL("literal containing _hpplite_ must be captured"); }
+    /* a real reference to our tables is still not captured */
+    sqlite3_exec(n->db, "SELECT count(*) FROM _hpplite_pending", NULL, NULL, NULL);
+    if (hpplite_node_pending_count(n) != 3) FAIL("bookkeeping reads must not be captured");
+
+    /* WITHOUT ROWID spelled any way still hashes (lowercase broke every checkpoint before) */
+    hpplite_node_exec(n, "CREATE TABLE kv(k TEXT PRIMARY KEY, v) without   rowid", NULL);
+    hpplite_node_exec(n, "INSERT INTO kv VALUES('b',2),('a',1)", NULL);
+    uint64_t errs = n->ctx->nLogErrors;
+    if (hpplite_node_flush_batch(n) == 0) FAIL("flush with a lowercase without-rowid table");
+    if (n->ctx->nLogErrors != errs) FAIL("hash error reported");
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("checkpoint with a without-rowid table");
+
+    /* non-determinism is detected anywhere in the statement, not only in the first 512 bytes */
+    char pad[700]; memset(pad, 'p', 650); pad[650] = 0;
+    char *sql = sqlite3_mprintf("UPDATE t SET v = '%s' || random() WHERE id = -1", pad);
+    uint64_t nd = n->ctx->nNondeterministic;
+    hpplite_node_exec(n, sql, NULL);   /* touches no row: detected, then unlogged by effect */
+    sqlite3_free(sql);
+    if (n->ctx->nNondeterministic != nd + 1) FAIL("random() past byte 512 not detected");
+
+    /* the reconstruction matches, including the without-rowid table */
+    hpplite_node_flush_batch(n);
+    unsigned char rootA[32], rootB[32];
+    hpplite_node_get_state_root(n, rootA);
+    hpplite_node_destroy(n);
+    HppliteNode *r = open_node(DIR "/corner_r.db", l1);
+    if (!r) FAIL("open reader");
+    hpplite_node_get_state_root(r, rootB);
+    if (count_rows(r->db, "t") != 2 || count_rows(r->db, "kv") != 2) FAIL("reconstructed rows");
+    if (memcmp(rootA, rootB, 32) != 0) FAIL("reconstruction root differs");
+    r->l1 = NULL;
+    hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 23. hpplite=on that cannot be honoured fails the open instead of capturing nothing */
+static void test_open_failure_is_loud(void) {
+    TEST("sqlite3_open_v2 with hpplite=on and a bad key fails instead of silently skipping HPPLite");
+    reset_dir();
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("file:" DIR "/loud.db?hpplite=on&privkey=0x0000000000000000000000000000000000000000000000000000000000000000",
+                             &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    if (rc == SQLITE_OK) { sqlite3_close(db); FAIL("open should fail"); }
+    if (!strstr(sqlite3_errmsg(db), "hpplite")) { printf("(%s) ", sqlite3_errmsg(db)); FAIL("error should name hpplite"); }
+    sqlite3_close(db);
+    /* and a good key opens */
+    rc = sqlite3_open_v2("file:" DIR "/loud.db?hpplite=on&privkey=0x" PRIVKEY_HEX,
+                         &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    if (rc != SQLITE_OK) FAIL("open with a valid key");
+    if (!hpplite_context(db)) FAIL("hpplite active");
+    sqlite3_close(db);
+    PASS();
+}
+
+/* 24. :memory: never gets a timer thread (it would run inside the app's transactions) */
+static void test_memory_no_timer(void) {
+    TEST(":memory: with an interval: no timer, transactions never see a foreign BEGIN");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "mem"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
+    config.dataDir = DIR; config.dbPath = ":memory:"; config.batchIntervalMs = 1;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_set_l1(n, l1);
+    hpplite_node_start(n);
+    if (n->timerRunning) FAIL("timer must not start for a shared bookkeeping connection");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    for (int i = 0; i < 300; i++) {
+        if (sqlite3_exec(n->db, "BEGIN; INSERT INTO t VALUES(1); COMMIT", NULL, NULL, NULL) != SQLITE_OK)
+            FAIL("transaction failed");
+    }
+    if (hpplite_node_flush_batch(n) == 0) FAIL("explicit flush");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -815,6 +958,9 @@ int main(void) {
     test_encryption_default();
     test_encryption_off_and_legacy();
     test_flush_thread_never_loses_captures();
+    test_capture_corner_cases();
+    test_open_failure_is_loud();
+    test_memory_no_timer();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

@@ -71,6 +71,11 @@ typedef struct HppliteNode {
     /* Instance ID for lease (unique per process) */
     unsigned char instanceId[32];
     int hasLease;                   /* We claimed the lease and have not released it */
+    int64_t leaseRecheckAt;         /* Next time to read the lease from L1 (ms, monotonic) */
+    uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
+    int warnedForeignLease;         /* "someone else holds the lease" said once */
+    int failStreak;                 /* Consecutive flushes that did not reach L1 */
+    int64_t retryAt;                /* Timer does not retry before this (ms, monotonic) */
 
     /* Database and context */
     sqlite3 *db;
@@ -89,6 +94,8 @@ typedef struct HppliteNode {
     unsigned char encKey[HPPLITE_CIPHER_KEY_SIZE];
     int hasEncKey;
     int warnedNoKey;                /* "no key, not posting" said once */
+    int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
+    int warnedNoL1;                 /* "L1 requested but not connected" said once */
 
     /* Checkpoint tracking */
     uint64_t lastCheckpointHeight;

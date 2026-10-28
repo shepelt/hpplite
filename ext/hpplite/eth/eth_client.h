@@ -13,6 +13,8 @@
 typedef struct EthClient EthClient;
 
 /* Create client connected to RPC endpoint */
+/* Process-wide curl/secp256k1 setup; called by eth_client_create(), safe to call early from any thread */
+void eth_client_global_init(void);
 EthClient *eth_client_create(const char *rpc_url, uint64_t chain_id);
 
 /* Destroy client */
