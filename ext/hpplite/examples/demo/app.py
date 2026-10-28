@@ -69,6 +69,25 @@ def add_entry(name, body, ip, kind="human"):
         cur = db.execute("INSERT INTO entries(name, body, posted_at, ip_hash, kind) VALUES(?,?,?,?,?)", (name, body, int(time.time()), h, kind))
         return cur.lastrowid
 
+def schema():
+    """Every table in the file - the app's and HPPLite's own bookkeeping - with a short preview."""
+    out = []
+    with lock:
+        for name, sql in db.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name LIKE '\\_hpplite\\_%' ESCAPE '\\', name"):
+            cols = [r[1] for r in db.execute(f'PRAGMA table_info("{name}")')]
+            n = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+            shown = [c for c in cols if c != "ip_hash"]
+            rows = db.execute(f'SELECT {",".join(chr(34)+c+chr(34) for c in shown)} FROM "{name}" ORDER BY rowid DESC LIMIT 3').fetchall()
+            def cell(v):
+                if isinstance(v, bytes): return "0x" + v.hex()[:16] + "…" if len(v) > 8 else "0x" + v.hex()
+                s = str(v) if v is not None else "NULL"
+                return s if len(s) <= 60 else s[:57] + "…"
+            out.append(dict(name=name, sql=sql, columns=shown, rows=n,
+                            note={"_hpplite_pending": "the write log: SQL text captured inside your transaction, waiting for the next batch",
+                                  "_hpplite_meta": "next batch height, previous block hash, state root and checkpoint - the only HPPLite state there is"}.get(name, ""),
+                            preview=[[cell(v) for v in r] for r in rows]))
+    return out
+
 def chain_batch(height):
     """What HPP Sepolia holds for one batch: eth_call HPPLiteDA.getBatch(height)."""
     s = status()
@@ -121,6 +140,7 @@ class H(BaseHTTPRequestHandler):
             elif u.path == "/api/status": self.send_json(status())
             elif u.path == "/api/entries": self.send_json(entries(int(q.get("after", ["0"])[0])))
             elif u.path == "/api/batch": self.send_json(chain_batch(int(q.get("h", ["0"])[0])))
+            elif u.path == "/api/schema": self.send_json(schema())
             else: self.send_json({"error": "not found"}, 404)
         except Exception as e:
             self.send_json({"error": str(e)}, 500)

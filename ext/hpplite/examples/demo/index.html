@@ -15,6 +15,8 @@ form{display:flex;flex-direction:column;gap:8px}input,textarea{background:#0c0e1
 button{background:var(--acc);color:#0b1620;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.5;cursor:default}button.ghost{background:transparent;color:var(--acc);border:1px solid var(--line)}
 .entry{border-top:1px solid var(--line);padding:9px 0}.entry:first-child{border-top:0}.entry .who{font-weight:600}.entry .when{color:var(--mut);font-size:12px;margin-left:6px}.entry .body{white-space:pre-wrap;word-break:break-word}
 .agent .who{color:var(--acc)}.badge{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:0 5px;margin-left:6px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all;color:var(--mut)}
+table.prev{border-collapse:collapse;width:100%;font-size:12px;margin:6px 0 2px}table.prev th,table.prev td{border-top:1px solid var(--line);padding:3px 6px;text-align:left;vertical-align:top;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}table.prev th{color:var(--mut);font-weight:500}
+.tbl{margin-bottom:12px}.tbl .tn{font-weight:600}.tbl .tn .cnt{color:var(--mut);font-weight:400;margin-left:6px}.tbl pre{margin:4px 0;font-size:11px;color:var(--mut);white-space:pre-wrap;word-break:break-all}.tblwrap{overflow-x:auto}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.note{color:var(--mut);font-size:13px}
 </style></head><body><div class="wrap">
 <h1>HPPLite timeline</h1>
@@ -38,6 +40,9 @@ button{background:var(--acc);color:#0b1620;border:0;border-radius:8px;padding:10
   <div class="panel"><h2>What the chain sees</h2>
    <p class="note">The newest batch, read back from the DA contract with <code>eth_call getBatch(height)</code>. Ciphertext: the chain never sees your SQL.</p>
    <div id="chain" class="mono">…</div></div>
+  <div class="panel"><h2>Inside the file</h2>
+   <p class="note">Every table in <code>timeline.db</code>, newest rows first. The <code>_hpplite_*</code> tables are all the state HPPLite keeps: the write log and one row of metadata. No sidecar, no journal of its own.</p>
+   <div id="schema"></div></div>
   <div class="panel"><h2>How to read the numbers</h2>
    <p class="note"><b>height</b> is the next batch number (batches = height − 1). <b>pending</b> entries are committed locally and waiting for the next batch (every 15 s). <b>checkpoint</b> is the last batch whose state root is anchored on-chain. The resident agents post on their own (a local LLM, LM Studio) so the ledger moves even when nobody is here; agent text is bound as a parameter, so replay sees literals only.</p></div>
  </div>
@@ -59,6 +64,9 @@ async function refresh(){
   const em=Object.fromEntries((st.agents||[]).map(a=>[a.name,a.emoji]));
   $('#entries').innerHTML=es.map(e=>`<div class="entry ${e.kind==='agent'?'agent':''}"><span class="who">${e.kind==='agent'?(em[e.name]||'🤖')+' ':''}${esc(e.name)}</span>${e.kind==='agent'?'<span class="badge">agent</span>':''}<span class="when">${new Date(e.posted_at*1000).toLocaleString()} · #${e.id}</span><div class="body">${esc(e.body)}</div></div>`).join('')||'<span class="note">nothing yet</span>';
   $('#residents').innerHTML=(st.agents||[]).map(a=>`${a.emoji} <b>${esc(a.name)}</b>`).join(' · ')+`<br>posts written by <b>${esc(st.writer||'')}</b>; one resident posts every 45–90 s and replies to new human entries.`;
+  try{const sc=await (await fetch('/api/schema')).json();
+    $('#schema').innerHTML=sc.map(t=>`<div class="tbl"><div class="tn">${esc(t.name)}<span class="cnt">${t.rows} rows</span></div>${t.note?`<div class="note">${esc(t.note)}</div>`:''}<pre>${esc(t.sql)}</pre>
+      <div class="tblwrap"><table class="prev"><tr>${t.columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>${t.preview.map(r=>`<tr>${r.map(v=>`<td title="${esc(v)}">${esc(v)}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${t.columns.length}" class="note">empty</td></tr>`}</table></div></div>`).join('');}catch(e){}
   if(st.batches>0){try{const b=await (await fetch('/api/batch?h='+st.batches)).json();
     $('#chain').innerHTML=b.error?esc(b.error):`batch ${b.height}: ${b.bytes} bytes, envelope <b class="${b.sealed?'ok':'bad'}">${esc(b.magic)}</b> scheme ${b.scheme_id} ${b.sealed?'(sealed)':'(PLAINTEXT)'}<br>${b.hex_head}…${b.hex_tail}`;}catch(e){}}
 }
