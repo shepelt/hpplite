@@ -124,7 +124,7 @@ compile options**, any amalgamation from 3.24 on. Two ways to use it.
 SQLite you already have:
 
 ```bash
-brew install libsecp256k1 curl pkg-config  # macOS
+brew install secp256k1 curl pkg-config  # macOS
 # apt install libsecp256k1-dev libcurl4-openssl-dev  # Linux
 
 cmake -S ext/hpplite -B build -DHPPLITE_USE_REAL_L1=ON \

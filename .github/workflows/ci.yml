@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: dependencies
-        run: brew install libsecp256k1 curl pkg-config tcl-tk
+        run: brew install secp256k1 curl pkg-config tcl-tk
       - name: SQLite amalgamation
         run: |
           mkdir -p build && cd build
