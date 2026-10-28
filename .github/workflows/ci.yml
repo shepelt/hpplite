@@ -58,6 +58,29 @@ jobs:
             -DHPPLITE_USE_REAL_L1=ON -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
           cmake --build ext/hpplite/build_real -j"$(nproc)"
 
+  anvil:
+    name: real contracts on anvil
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl \
+            libsecp256k1-dev libcurl4-openssl-dev
+      - name: SQLite amalgamation
+        run: mkdir -p build && cd build && ../configure >/dev/null && make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: build (real L1)
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_SQLITE_SRC=$PWD/build -DHPPLITE_USE_REAL_L1=ON \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
+          cmake --build ext/hpplite/build_real -j"$(nproc)"
+      - name: forge tests (contracts)
+        run: cd ext/hpplite/contracts && forge test -q
+      - name: anvil harness
+        run: cd ext/hpplite/build_real && ctest -R "test_anvil|test_tx_encoding" --output-on-failure
+
   macos:
     name: macos
     runs-on: macos-14

@@ -363,6 +363,10 @@ void hpplite_l1_state_free(HppliteL1State *state) {
 /*
 ** Check if lease is currently active
 */
+static uint64_t g_defaultChainId = 181228;
+void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultChainId = chainId; }
+uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
+
 int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
     (void)l1;
     contractHex[0] = daHex[0] = 0;

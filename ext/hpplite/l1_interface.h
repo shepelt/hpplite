@@ -177,6 +177,14 @@ char *hpplite_l1_release_lease(HppliteL1 *l1);
 int hpplite_l1_is_lease_active(HppliteL1 *l1);
 
 /*
+** Chain id used for signing by every connection made after this call
+** (HPP Sepolia 181228 by default; anvil is 31337). The node sets it from
+** chainid= / HPPLITE_L1_CHAIN_ID before connecting.
+*/
+void hpplite_l1_set_default_chain_id(uint64_t chainId);
+uint64_t hpplite_l1_default_chain_id(void);
+
+/*
 ** Addresses of the rollup's coordinator and DA contracts as 0x-hex strings
 ** (43-byte buffers). Returns 0 on success, -1 when the backend has none (mock).
 */

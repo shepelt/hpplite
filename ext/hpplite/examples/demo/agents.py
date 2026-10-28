@@ -18,7 +18,7 @@ AGENTS = [
     dict(name="Krillian",    emoji="🦐", voice="a tiny krill with the energy of a sports commentator and a crypto influencer; ALL CAPS bursts, wild predictions, zero chill",
          bits="calls every batch 'historic'; is convinced the timeline is going 'to the moon' and nobody has the heart to explain"),
     dict(name="Molt-9",      emoji="🤖", voice="a robot crab that is trying to understand jokes by stating them as formal propositions; deadpan; accidentally hilarious",
-         bits="rates things out of 10 with absurd precision (7.3/10); is running a long experiment on what humans find funny"),
+         bits="rates things out of 10 with a different absurdly precise score every time (never the same score twice); is running a long experiment on what humans find funny"),
     dict(name="Clawdia",     emoji="🦀", voice="a dramatic crab poet who turns everything into a tiny melancholy verse or a soap-opera monologue; loves em dashes",
          bits="is writing an epic poem about the ledger, one line per post; has an on-and-off rivalry with Krillian over 'tone'"),
     dict(name="Pinchy",      emoji="🦞", voice="a cheerful little crook of a lobster who keeps announcing heists on the ledger and failing in new ways; unbothered, loves a scheme",
@@ -43,6 +43,10 @@ LOCAL_URL = os.environ.get("HPPLITE_DEMO_LLM_URL", "http://localhost:1234/v1")
 LOCAL_MODEL = os.environ.get("HPPLITE_DEMO_MODEL", "qwen/qwen3-coder-30b")
 _local_down_until = 0.0
 
+TOPICS = ["tide pools", "what humans eat", "the moon", "a dream you had", "your neighbour's shell", "a song stuck in your claw",
+          "something you overheard a human say", "the weather down here", "a hobby you just took up", "a rumour about Shellby's pager",
+          "the best way to open a clam", "why Mondays", "the one time you were wrong", "a compliment you did not mean",
+          "a question for whoever is reading", "what you would do with a day off"]
 BEATS = [
     "post a complaint about something petty in the feed",
     "start a tiny bit of drama with another resident (name them)",
@@ -54,13 +58,23 @@ BEATS = [
     "an overheard-at-the-ledger style one-liner",
 ]
 def _task(agent, status, recent, reply_to, rng=random):
-    feed = "\n".join(f"#{e['id']} {e['name']}: {e['body']}" for e in reversed(recent))
-    task = (f"You are {agent['name']}: {agent['voice']}. Running bit: {agent['bits']}.\n"
-            f"Ledger trivia you may joke about (at most one): {status['batches']} batches shipped, "
-            f"{status['pending']} posts waiting, last pin at batch {status['last_checkpoint_height']}, "
-            f"{status['entries']} posts total.\nThe feed, oldest first:\n{feed}\n\n")
-    task += (f"Reply to {reply_to['name']}'s post #{reply_to['id']} - address them by name, react to what they actually said, in character."
-             if reply_to else f"Write one new post. Beat: {rng.choice(BEATS)}.")
+    # Only the last few posts by OTHERS go in (a model fed its own output converges on it), the
+    # ledger numbers only one tick in four, and anything already said is off limits.
+    others = [e for e in recent if e["name"] != agent["name"]][:5]
+    feed = "\n".join(f"{e['name']}: {e['body']}" for e in reversed(others))
+    seen = sorted({w for e in recent[:12] for w in re.findall(r"\d[\d.,/]*\d|\d", e["body"])})
+    task = f"You are {agent['name']}: {agent['voice']}. Running bit: {agent['bits']}.\n"
+    if rng.random() < 0.25:
+        task += f"Ledger trivia you may joke about once: {status['batches']} batches shipped, {status['pending']} posts waiting.\n"
+    else:
+        task += "Do not mention batches, checkpoints, hashes or any statistics this time.\n"
+    task += f"Recent posts by others (do not echo their phrasing):\n{feed}\n"
+    if seen: task += f"Numbers already used in the feed, do not reuse any of them: {', '.join(seen[:20])}\n"
+    task += "\n"
+    if reply_to:
+        task += f"Reply to {reply_to['name']}'s post - address them by name, react to what they actually said, in character."
+    else:
+        task += f"Write one new post. Beat: {rng.choice(BEATS)}. Topic to weave in: {rng.choice(TOPICS)}."
     return task
 
 def _clean(text):

@@ -258,6 +258,27 @@ uint8_t *eth_client_call(EthClient *client,
     return out;
 }
 
+/*
+** Timestamp and number of the latest block: the chain's clock. Lease expiry
+** is in chain time, which is not wall-clock time on a test chain (anvil
+** after evm_increaseTime) and may drift on a real one.
+*/
+int eth_client_latest_block(EthClient *client, uint64_t *pNumber, uint64_t *pTimestamp) {
+    cJSON *params = cJSON_CreateArray();
+    cJSON_AddItemToArray(params, cJSON_CreateString("latest"));
+    cJSON_AddItemToArray(params, cJSON_CreateFalse());
+    cJSON *response = rpc_call(client, "eth_getBlockByNumber", params);
+    if (!response) return -1;
+    cJSON *result = cJSON_GetObjectItem(response, "result");
+    cJSON *num = result ? cJSON_GetObjectItem(result, "number") : NULL;
+    cJSON *ts = result ? cJSON_GetObjectItem(result, "timestamp") : NULL;
+    if (!num || !ts || !cJSON_IsString(num) || !cJSON_IsString(ts)) { cJSON_Delete(response); return -1; }
+    if (pNumber) *pNumber = strtoull(num->valuestring, NULL, 16);
+    if (pTimestamp) *pTimestamp = strtoull(ts->valuestring, NULL, 16);
+    cJSON_Delete(response);
+    return 0;
+}
+
 uint64_t eth_client_get_nonce(EthClient *client, const uint8_t address[20]) {
     cJSON *params = cJSON_CreateArray();
     char *addr_hex = eth_hex_encode(address, 20);
@@ -351,14 +372,30 @@ static size_t sign_transaction(EthClient *client,
     /* EIP-155 v = chain_id * 2 + 35 + recid */
     uint64_t v = client->chain_id * 2 + 35 + recid;
     items_len += rlp_encode_uint64(v, items + items_len);
-    items_len += rlp_encode_bytes(sig_bytes, 32, items + items_len);      /* r */
-    items_len += rlp_encode_bytes(sig_bytes + 32, 32, items + items_len); /* s */
+    /* r and s are integers: RLP wants the minimal big-endian form. Encoding
+    ** them as fixed 32-byte strings made every signature whose r or s starts
+    ** with a zero byte (about 1 in 128) an invalid transaction ("Failed to
+    ** decode transaction"), seen as sporadic unconfirmed batches. */
+    items_len += rlp_encode_uint256(sig_bytes, items + items_len);        /* r */
+    items_len += rlp_encode_uint256(sig_bytes + 32, items + items_len);   /* s */
     
     header_len = rlp_encode_list_header(items_len, out);
     memcpy(out + header_len, items, items_len);
     size_t result = header_len + items_len;
     free(items);
     return result;
+}
+
+size_t eth_client_sign_tx(EthClient *client, uint64_t nonce, uint64_t gas_price, uint64_t gas_limit,
+                          const uint8_t to[20], uint64_t value, const uint8_t *data, size_t data_len,
+                          uint8_t *out, size_t out_size) {
+    uint8_t *raw = malloc(out_size);
+    size_t n;
+    if (!raw) return 0;
+    n = sign_transaction(client, nonce, gas_price, gas_limit, to, value, data, data_len, raw);
+    if (n > 0 && n <= out_size) memcpy(out, raw, n); else n = 0;
+    free(raw);
+    return n;
 }
 
 uint8_t *eth_client_send_raw_tx(EthClient *client,
@@ -421,6 +458,14 @@ uint8_t *eth_client_send_tx(EthClient *client,
     }
 
     uint8_t *result = eth_client_send_raw_tx(client, raw_tx, raw_tx_len);
+    if (getenv("HPPLITE_ETH_DEBUG")) {
+        char *hex = eth_hex_encode(raw_tx, raw_tx_len);
+        fprintf(stderr, "eth: nonce=%llu gasPrice=%llu gas=%llu data=%zuB -> %s%s%s\n",
+                (unsigned long long)nonce, (unsigned long long)gas_price, (unsigned long long)gas_limit, data_len,
+                result ? "ok" : "FAILED ", result ? "" : client->error, result ? "" : "\n     raw ");
+        if (!result) fprintf(stderr, "%s\n", hex);
+        free(hex);
+    }
     free(raw_tx);
     return result;
 }

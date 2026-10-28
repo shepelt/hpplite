@@ -54,6 +54,7 @@ typedef struct HppliteNodeConfig {
     /* Sequencer Settings */
     int checkpointInterval;         /* Batches between L1 checkpoints */
     int batchIntervalMs;            /* Auto-flush interval (0 = disabled) */
+    uint64_t chainId;               /* L1 chain id for signing (0 = library default, HPP Sepolia) */
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
     int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
 } HppliteNodeConfig;

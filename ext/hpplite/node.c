@@ -222,6 +222,7 @@ static void node_learn_batch_limit(HppliteNode *node);
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (node->follower) return;
     if (!config->rpcUrl) return;
+    if (config->chainId) hpplite_l1_set_default_chain_id(config->chainId);
     if (!config->hasContract && !config->hasFactory) return;
     node->wantsL1 = 1;
 
@@ -933,15 +934,37 @@ void hpplite_node_stop_timer(HppliteNode *node) {
 ** Claim sequencer lease on L1.
 ** Returns 0 on success, -1 if lease unavailable.
 */
+/* Does the chain say the lease is held by this instance right now? */
+static int node_lease_is_ours(HppliteNode *node) {
+    HppliteL1State *st = hpplite_l1_get_state(node->l1);
+    int ours;
+    if (!st) return -1;
+    {
+        uint64_t now = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
+        ours = st->leaseExpiry > now && memcmp(st->sequencerInstance, node->instanceId, 32) == 0;
+    }
+    hpplite_l1_state_free(st);
+    return ours;
+}
+
 int hpplite_node_claim_lease(HppliteNode *node) {
     if (!node || !node->l1) return -1;
 
-    /* Claim sequencer lease with our instance ID */
+    /* A claim is a transaction: it can be mined and still have reverted
+    ** (another instance holds the lease). Believing the hash alone made a
+    ** second instance of the same wallet think it held the lease and then
+    ** expire the live sequencer's on close (issue #40). Wait for it and
+    ** ask the chain who holds the lease. */
     char *txHash = hpplite_l1_claim_sequencer(node->l1, node->instanceId);
     if (!txHash) {
         return -1;  /* Lease not available */
     }
+    hpplite_l1_wait_for_tx(node->l1, txHash, 30);
     sqlite3_free(txHash);
+    if (node_lease_is_ours(node) != 1) {
+        node->hasLease = 0;
+        return -1;
+    }
     node->hasLease = 1;
     node->leaseRecheckAt = 0;
     return 0;
@@ -953,12 +976,26 @@ int hpplite_node_claim_lease(HppliteNode *node) {
 int hpplite_node_release_lease(HppliteNode *node) {
     if (!node || !node->l1 || !node->hasLease) return -1;
 
+    /* Never expire a lease that is not ours: forceExpireLease is owner-only
+    ** and the owner wallet may be running the real sequencer elsewhere */
+    {
+        int ours = node_lease_is_ours(node);
+        if (ours != 1) {
+            fprintf(stderr, "hpplite: not releasing the lease: %s\n",
+                    ours < 0 ? "cannot read the lease from L1" : "it is held by another instance");
+            node->hasLease = 0;
+            return -1;
+        }
+    }
     char *txHash = hpplite_l1_release_lease(node->l1);
     if (!txHash) {
+        fprintf(stderr, "hpplite: lease release transaction could not be sent\n");
         return -1;
     }
     /* Wait so the next instance (possibly this process restarting) can claim */
-    hpplite_l1_wait_for_tx(node->l1, txHash, 30);
+    if (hpplite_l1_wait_for_tx(node->l1, txHash, 30) != 1) {
+        fprintf(stderr, "hpplite: lease release %s not confirmed\n", txHash);
+    }
     sqlite3_free(txHash);
     node->hasLease = 0;
     node->leaseRecheckAt = 0;
@@ -997,11 +1034,12 @@ int hpplite_node_start(HppliteNode *node) {
     if (!node) return -1;
     if (node->state == HPPLITE_STATE_RUNNING) return 0;
 
-    /* Try to claim sequencer lease */
+    /* Take the lease if it is free or ours; a foreign holder (another
+    ** instance of this wallet, or a stranger) is left alone - we capture
+    ** and keep pending until it expires. Starting is not a failure then. */
     if (node->l1 && !node->follower) {
-        if (hpplite_node_claim_lease(node) != 0) {
-            return -1;  /* Failed to claim lease */
-        }
+        node->leaseRecheckAt = 0;
+        node_ensure_lease(node);
     }
 
     node->state = HPPLITE_STATE_RUNNING;

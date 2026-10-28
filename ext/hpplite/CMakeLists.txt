@@ -200,6 +200,8 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_keccak eth/test_keccak.c eth/keccak256.c)
     add_executable(test_rlp eth/test_rlp.c eth/rlp.c)
     add_executable(test_abi eth/test_abi.c eth/abi.c eth/keccak256.c)
+    add_executable(test_tx_encoding eth/test_tx_encoding.c)
+    target_link_libraries(test_tx_encoding hpplite)
 
     # === Integration Tests (require real L1 + network + HPPLITE_PRIVATE_KEY) ===
     if(HPPLITE_USE_REAL_L1)
@@ -211,6 +213,13 @@ if(HPPLITE_BUILD_TESTS)
 
         add_executable(test_single_node tests/integration/test_single_node.c)
         target_link_libraries(test_single_node hpplite)
+
+        # Real contracts on a local anvil chain (issue #47): free, deterministic, in ctest
+        add_executable(test_anvil tests/l1/test_anvil.c)
+        target_link_libraries(test_anvil hpplite)
+        target_include_directories(test_anvil PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME test_anvil COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/anvil_test.sh $<TARGET_FILE:test_anvil>)
+        set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
 
     # === CTest Registration ===
@@ -225,6 +234,7 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
+    add_test(NAME test_tx_encoding COMMAND test_tx_encoding)
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)
         # Python's sqlite3 module and the sqlite3 shell driving the module (issue #27)

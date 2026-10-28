@@ -62,6 +62,13 @@ static int selectors_initialized = 0;
 /* Default factory address on HPP Sepolia (update after deployment) */
 static const char *DEFAULT_FACTORY_ADDRESS = "0x0000000000000000000000000000000000000000";
 
+/* Chain id for signing: was hard-coded to HPP Sepolia in three places, so
+** chainid= never reached the client and no other chain (anvil, 31337)
+** could be used. Found by the anvil harness (#47). */
+static uint64_t g_defaultChainId = 181228;
+void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultChainId = chainId; }
+uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
+
 static void init_selectors(void) {
     if (selectors_initialized) return;
 
@@ -103,8 +110,7 @@ HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress)
         return NULL;
     }
 
-    /* Default to HPP Sepolia if chain ID not specified */
-    l1->chainId = 181228;
+    l1->chainId = g_defaultChainId;
     l1->rpcUrl = strdup(endpoint);
 
     l1->eth = eth_client_create(endpoint, l1->chainId);
@@ -230,6 +236,9 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
 
     /* lastCheckpointTime */
     state->lastCheckpointTime = abi_decode_uint64(p);
+
+    /* The chain's own clock, for lease arithmetic (never wall-clock time) */
+    eth_client_latest_block(l1->eth, &state->currentBlock, &state->currentTimestamp);
 
     free(result);
     return state;
@@ -412,7 +421,10 @@ char *hpplite_l1_release_lease(HppliteL1 *l1) {
     memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
 
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
-    if (!tx_hash) return NULL;
+    if (!tx_hash) {
+        fprintf(stderr, "hpplite: forceExpireLease: %s\n", eth_client_error(l1->eth));
+        return NULL;
+    }
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -524,7 +536,7 @@ int hpplite_l1_factory_get_rollup(
     }
 
     /* Create temporary eth client */
-    EthClient *eth = eth_client_create(rpc_url, 181228);  /* HPP Sepolia */
+    EthClient *eth = eth_client_create(rpc_url, g_defaultChainId);
     if (!eth) return -1;
 
     /* Build calldata: getRollup(address) */
@@ -582,7 +594,7 @@ char *hpplite_l1_factory_get_or_create_rollup(
     }
 
     /* Create eth client with private key */
-    EthClient *eth = eth_client_create(rpc_url, 181228);
+    EthClient *eth = eth_client_create(rpc_url, g_defaultChainId);
     if (!eth) return NULL;
 
     if (eth_client_set_privkey(eth, privkey) != 0) {

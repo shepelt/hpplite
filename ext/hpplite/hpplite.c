@@ -1641,6 +1641,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->hasFactory = cfg->hasFactory;
     memcpy(nc->contract, cfg->contract, 20);
     nc->hasContract = cfg->hasContract;
+    nc->chainId = cfg->chainId;
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
     nc->checkpointInterval = cfg->checkpointInterval;

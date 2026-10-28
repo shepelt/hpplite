@@ -20,7 +20,7 @@ DATA = os.path.join(HERE, "data")
 RPC = "https://sepolia.hpp.io"
 EXPLORER = "https://sepolia-explorer.hpp.io"
 SEL_GET_BATCH = "5ac44282"            # cast sig "getBatch(uint256)"
-URI = f"file:{DATA}/timeline.db?hpplite=on&l1=hpp-sepolia&interval=15s&checkpoint=5&datadir={DATA}"
+URI = f"file:{DATA}/timeline.db?hpplite=on&l1=hpp-sepolia&interval=90s&checkpoint=5&datadir={DATA}"
 MAX_ENTRIES = 50000                   # ~100 B each: nowhere near the v0.1 100 MB bound
 
 os.makedirs(DATA, exist_ok=True)
@@ -31,8 +31,12 @@ db = sqlite3.connect(URI, uri=True, check_same_thread=False, isolation_level=Non
 lock = threading.Lock()
 with lock:
     db.execute("CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, posted_at INTEGER NOT NULL, ip_hash TEXT)")
-    if "kind" not in [r[1] for r in db.execute("PRAGMA table_info(entries)")]:
+    cols = [r[1] for r in db.execute("PRAGMA table_info(entries)")]
+    if "kind" not in cols:
         db.execute("ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'")   # captured and replayed like any DDL
+    if "ip_hash" in cols:
+        # a derived identifier has no business in a permanent (if encrypted) log; rate limiting is in memory
+        db.execute("ALTER TABLE entries DROP COLUMN ip_hash")
     st = db.execute("SELECT height, pending, contract FROM hpplite_status").fetchone()
     print(f"hpplite: height {st[0]}, pending {st[1]}, contract {st[2]}", flush=True)
 
@@ -41,11 +45,13 @@ def status():
         r = db.execute("SELECT height, pending, state_root, last_checkpoint_height, lease, log_errors, "
                        "replay_skipped, encryption, keyed, nondeterministic, contract, da_contract, last_batch_tx "
                        "FROM hpplite_status").fetchone()
+        anchored = db.execute("SELECT hex(last_checkpoint_root) FROM _hpplite_meta").fetchone()[0]
         n = db.execute("SELECT count(*) FROM entries").fetchone()[0]
         size = db.execute("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()").fetchone()[0]
     keys = ["height", "pending", "state_root", "last_checkpoint_height", "lease", "log_errors",
             "replay_skipped", "encryption", "keyed", "nondeterministic", "contract", "da_contract", "last_batch_tx"]
     d = dict(zip(keys, r)); d["entries"] = n; d["db_bytes"] = size; d["explorer"] = EXPLORER
+    d["anchored_root"] = "0x" + anchored.lower() if anchored else None
     d["batches"] = d["height"] - 1
     d["agents"] = [dict(name=a["name"], emoji=a["emoji"]) for a in agents.AGENTS]
     d["writer"] = agents.writer_name()
@@ -61,12 +67,10 @@ def add_entry(name, body, ip, kind="human"):
     body = (body or "").strip()[:280]
     if not body: return None
     if kind == "human" and name in agents.NAMES: name += " (human)"
-    import hashlib
-    h = hashlib.sha256(ip.encode()).hexdigest()[:12]
     with lock:
         if db.execute("SELECT count(*) FROM entries").fetchone()[0] >= MAX_ENTRIES: return None
         # the timestamp is bound by the application: replay sees the literal, never 'now'
-        cur = db.execute("INSERT INTO entries(name, body, posted_at, ip_hash, kind) VALUES(?,?,?,?,?)", (name, body, int(time.time()), h, kind))
+        cur = db.execute("INSERT INTO entries(name, body, posted_at, kind) VALUES(?,?,?,?)", (name, body, int(time.time()), kind))
         return cur.lastrowid
 
 def schema():
@@ -84,7 +88,7 @@ def schema():
                 return s if len(s) <= 60 else s[:57] + "…"
             out.append(dict(name=name, sql=sql, columns=shown, rows=n,
                             note={"_hpplite_pending": "the write log: SQL text captured inside your transaction, waiting for the next batch",
-                                  "_hpplite_meta": "next batch height, previous block hash, state root and checkpoint - the only HPPLite state there is"}.get(name, ""),
+                                  "_hpplite_meta": "next batch height, previous block hash, state_root = root as of the last root-carrying batch (updated at checkpoint cadence, not per write; the live root is on the card above), last checkpoint - the only HPPLite state there is"}.get(name, ""),
                             preview=[[cell(v) for v in r] for r in rows]))
     return out
 
@@ -117,7 +121,7 @@ def heartbeat():
             add_entry(agent["name"], text, "agent:" + agent["name"], kind="agent")
         except Exception as e:
             print("agents:", e, flush=True)
-        time.sleep(rng.uniform(45, 90))
+        time.sleep(rng.uniform(30, 75))      # ~2 posts per 90 s batch: batching actually batches
 threading.Thread(target=heartbeat, daemon=True).start()
 
 last_post = {}

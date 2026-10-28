@@ -171,6 +171,13 @@ ctest                    # 15 suites, ~5s: core, batch, node, open API, cipher, 
                          # durability (26 cases), loadable extension, crash harness,
                          # Python/CLI smoke, docs check
 
+# Real contracts on a local chain (foundry: anvil + forge + cast; no network, no funds).
+# Lease claim/renew/release transactions, a second instance of the same wallet, a
+# stranger claiming after expiry, sleeping for days (evm_increaseTime). Built with
+# the real-L1 backend; skipped when foundry is missing.
+cmake -S ext/hpplite -B build_real -DHPPLITE_USE_REAL_L1=ON -DHPPLITE_SQLITE_SRC=... && cmake --build build_real
+(cd build_real && ctest -R test_anvil --output-on-failure)
+
 # The same on Linux, in a container (Docker or Podman; needs nothing else installed)
 ext/hpplite/tools/linux_test.sh          # Ubuntu 24.04, Release, ctest
 ext/hpplite/tools/linux_test.sh asan     # AddressSanitizer + UBSan
