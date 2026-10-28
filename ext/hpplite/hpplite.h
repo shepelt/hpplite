@@ -77,6 +77,9 @@ struct HppliteCtx {
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
+  uint64_t nHooksReplaced;    /* Times our trace/commit/rollback hook was found replaced and re-armed */
+  uint64_t nRootsCompared;    /* Posted roots compared with our content hash during replay */
+  uint64_t nRootMismatches;   /* ... of which differed */
   uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */
 
   /* Callbacks for external integration */
@@ -252,6 +255,15 @@ int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned cha
 ** raw bytes, which keeps the chain of hashes deterministic for all of them.
 */
 int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash);
+
+/*
+** sqlite3_trace_v2 / commit_hook / rollback_hook are one slot per connection:
+** an app, ORM or debugger that installs its own silently ends capture. This
+** re-installs ours, counts replacements (hpplite_status.hooks_replaced) and
+** says so once. Called from every HPPLite entry point that runs on the
+** application thread (status reads, hpplite_flush(), hpplite_sync(), close).
+*/
+void hpplite_rearm_hooks(HppliteCtx *pCtx);
 
 /*
 ** Register HPPLite as a loadable extension.

@@ -273,7 +273,7 @@ of any database is `SELECT state_root FROM hpplite_status` (or
 ```bash
 sqlite3> .load ./hpplite
 sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
-sqlite3> SELECT height, state_root, replay_skipped FROM hpplite_status;
+sqlite3> SELECT height, state_root, roots_compared, root_mismatches, replay_skipped FROM hpplite_status;
 ```
 
 A `hpplite verify` command that does this without writing a file, reports
@@ -310,6 +310,10 @@ really differs: `random()`, `randomblob()`, `datetime('now')`,
 `changes()`. Compute such values in the application and **bind** them:
 bound parameters are expanded into the captured statement and replay exactly.
 Capture warns once and counts offenders in `hpplite_status.nondeterministic`.
+Detection is a scan of the statement text: it knows `random()`, the
+`current_*` keywords, `'now'`, and the time functions called with no time
+argument (`date()`, `datetime()`, `julianday()`, `unixepoch()`,
+`strftime('%s')`); it does not know your own non-deterministic UDFs.
 
 Two more consequences of replaying text, until row-level capture (#19):
 

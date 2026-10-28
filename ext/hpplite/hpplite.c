@@ -510,9 +510,37 @@ static int isNondeterministicSql(const char *z) {
     "last_insert_rowid(", "changes(", "total_changes(", "sqlite_version(",
     "load_extension(", "'now'", NULL
   };
+  /* date(), time(), datetime(), julianday(), unixepoch() with no argument,
+  ** and strftime('fmt') with only a format, all mean the current time */
+  static const char *aTime[] = { "date(", "time(", "datetime(", "julianday(", "unixepoch(", NULL };
   int i;
   for (i = 0; aFn[i]; i++) {
     if (strstr(z, aFn[i])) return 1;
+  }
+  for (i = 0; aTime[i]; i++) {
+    const char *p = z;
+    size_t n = strlen(aTime[i]);
+    while ((p = strstr(p, aTime[i])) != NULL) {
+      const char *q = p + n;
+      int boundary = (p == z) || !((p[-1] >= 'a' && p[-1] <= 'z') || p[-1] == '_');
+      while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+      if (boundary && *q == ')') return 1;
+      p += n;
+    }
+  }
+  {
+    const char *p = strstr(z, "strftime(");
+    if (p) {
+      const char *q = p + 9;
+      while (*q == ' ' || *q == '\t') q++;
+      if (*q == '\'') {                                 /* skip the format literal */
+        q++;
+        while (*q && !(*q == '\'' && q[1] != '\'')) q += (*q == '\'') ? 2 : 1;
+        if (*q) q++;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == ')') return 1;
+      }
+    }
   }
   return 0;
 }
@@ -533,16 +561,31 @@ static char *lowercaseDup(const char *z) {
 ** Does the statement reference one of our own tables? String literals do
 ** not count: 'see _hpplite_pending' is user data and must be captured.
 */
+static int isIdentChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
 static int mentionsHppliteTable(const char *z) {
+  char prev = ' ';
   while (*z) {
-    if (*z == '\'' || *z == '"') {
+    if (*z == '\'' || *z == '"' || *z == '`') {
       char q = *z++;
       while (*z && !(*z == q && z[1] != q)) z += (*z == q) ? 2 : 1;
       if (*z) z++;
-    } else if (strncmp(z, "_hpplite_", 9) == 0) {
-      return 1;
+      prev = 'x';
+    } else if (*z == '[') {                          /* [bracketed identifier] */
+      while (*z && *z != ']') z++;
+      if (*z) z++;
+      prev = 'x';
+    } else if (z[0] == '-' && z[1] == '-') {           /* -- comment to end of line */
+      while (*z && *z != '\n') z++;
+    } else if (z[0] == '/' && z[1] == '*') {           /* block comment */
+      const char *e = strstr(z + 2, "*/");
+      z = e ? e + 2 : z + strlen(z);
+    } else if (strncmp(z, "_hpplite_", 9) == 0 && !isIdentChar(prev)) {
+      return 1;                                        /* an identifier that starts with our prefix */
     } else {
-      z++;
+      prev = *z++;
     }
   }
   return 0;
@@ -720,6 +763,27 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
 
   *ppCtx = pCtx;
   return SQLITE_OK;
+}
+
+void hpplite_rearm_hooks(HppliteCtx *pCtx) {
+  void *prevCommit, *prevRollback;
+  int lost = 0;
+  if (!pCtx || pCtx->bDbClosed) return;
+  /* setting a hook returns the previous argument: not ours means replaced */
+  prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
+  prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
+  if (prevCommit != pCtx || prevRollback != pCtx) lost = 1;
+  /* the trace API returns no previous value: re-arm it unconditionally and
+  ** rely on the commit hook as the canary (a library that replaces one
+  ** usually replaces the others; the data_version check in #37 covers the rest) */
+  sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
+  if (lost) {
+    pCtx->nHooksReplaced++;
+    if (pCtx->nHooksReplaced == 1) {
+      fprintf(stderr, "hpplite: another component replaced the connection's commit/trace hooks; "
+                      "writes made meanwhile were not captured (re-armed, hooks_replaced counts this)\n");
+    }
+  }
 }
 
 /*
@@ -1142,7 +1206,9 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ** Only batches that carry a root (checkpoint boundaries) can be checked. */
   if (!pBatch->hasRoot) return SQLITE_OK;
   hpplite_get_state_root(pCtx, root);
+  pCtx->nRootsCompared++;
   if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
+    pCtx->nRootMismatches++;
     fprintf(stderr, "hpplite: state root mismatch after replaying batch %llu\n",
             (unsigned long long)pBatch->height);
   }
@@ -1343,7 +1409,8 @@ static void hpplite_on_close(sqlite3 *db);
 **
 ** One row: height, pending, state_root, prev_block_hash,
 ** last_checkpoint_height, lease, log_errors, replay_skipped, encryption,
-** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches.
+** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches,
+** hooks_replaced, roots_compared, root_mismatches.
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -1375,6 +1442,9 @@ typedef struct StatusCursor {
 #define STATUS_COL_DA_CONTRACT      12
 #define STATUS_COL_LAST_BATCH_TX    13
 #define STATUS_COL_FOREIGN_BATCHES  14
+#define STATUS_COL_HOOKS_REPLACED   15
+#define STATUS_COL_ROOTS_COMPARED   16
+#define STATUS_COL_ROOT_MISMATCHES  17
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1386,7 +1456,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
-        " foreign_batches INTEGER)");
+        " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1447,6 +1517,10 @@ static int statusClose(sqlite3_vtab_cursor *pCur) {
 
 static int statusFilter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr,
                         int argc, sqlite3_value **argv) {
+    {   /* application thread: a cheap moment to check our hooks are still ours */
+        HppliteNode *n = findNode(((StatusVtab *)pCur->pVtab)->db);
+        if (n && n->ctx) hpplite_rearm_hooks(n->ctx);
+    }
     (void)idxNum; (void)idxStr; (void)argc; (void)argv;
     ((StatusCursor *)pCur)->eof = 0;
     return SQLITE_OK;
@@ -1524,6 +1598,15 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         }
         case STATUS_COL_FOREIGN_BATCHES:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignBatches);
+            break;
+        case STATUS_COL_HOOKS_REPLACED:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nHooksReplaced);
+            break;
+        case STATUS_COL_ROOTS_COMPARED:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nRootsCompared);
+            break;
+        case STATUS_COL_ROOT_MISMATCHES:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nRootMismatches);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);
@@ -1628,7 +1711,7 @@ static void hpplite_on_close(sqlite3 *db) {
 
     /* Our own prepared statements would make the close fail; the trace
     ** callback re-prepares them if the connection lives on */
-    if (node->ctx) finalizeOwnStatements(node->ctx);
+    if (node->ctx) { hpplite_rearm_hooks(node->ctx); finalizeOwnStatements(node->ctx); }
 
     /* SQLite disconnects virtual tables before it checks for unfinalized
     ** statements. If the application still has one, this close is about to
@@ -1815,7 +1898,7 @@ static void hpplite_sync_func(
 
     /* Running inside a statement on this connection: replay without
     ** wrapping each batch transaction in BEGIN/COMMIT. */
-    if (node->ctx) node->ctx->bAppFlushing = 1;
+    if (node->ctx) { hpplite_rearm_hooks(node->ctx); node->ctx->bAppFlushing = 1; }
     int synced = hpplite_node_sync_from_l1(node, 0);
     if (node->ctx) node->ctx->bAppFlushing = 0;
     sqlite3_result_int(ctx, synced < 0 ? 0 : synced);
@@ -1841,7 +1924,7 @@ static void hpplite_flush_func(
         return;
     }
 
-    if (node->ctx) node->ctx->bAppFlushing = 1;
+    if (node->ctx) { hpplite_rearm_hooks(node->ctx); node->ctx->bAppFlushing = 1; }
     uint64_t height = hpplite_node_flush_batch(node);
     if (node->ctx) node->ctx->bAppFlushing = 0;
     sqlite3_result_int64(ctx, (sqlite3_int64)height);

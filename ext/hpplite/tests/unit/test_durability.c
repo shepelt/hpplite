@@ -1169,6 +1169,67 @@ static void test_stranger_lease_evicted_sibling_not(void) {
     PASS();
 }
 
+/* 31. A foreign trace/commit hook ends capture; HPPLite notices and re-arms (issue #41) */
+static int foreign_commit_hook(void *p) { (void)p; return 0; }
+static int foreign_trace(unsigned m, void *p, void *s, void *x) { (void)m; (void)p; (void)s; (void)x; return 0; }
+static void test_replaced_hooks_detected(void) {
+    TEST("another component replaces the hooks: writes lost meanwhile are reported, capture resumes");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/hooks.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_pending_count(n) != 2) FAIL("captured before");
+    /* an ORM or debugger installs its own hooks */
+    sqlite3_commit_hook(n->db, foreign_commit_hook, NULL);
+    sqlite3_trace_v2(n->db, SQLITE_TRACE_STMT, foreign_trace, NULL);
+    sqlite3_exec(n->db, "INSERT INTO t VALUES(2)", NULL, NULL, NULL);     /* this one is lost */
+    if (hpplite_node_pending_count(n) != 2) FAIL("expected the write to be uncaptured (that is the bug being detected)");
+    /* the next HPPLite entry point on this thread notices */
+    sqlite3_stmt *s;
+    sqlite3_prepare_v2(n->db, "SELECT hooks_replaced FROM hpplite_status", -1, &s, NULL);
+    sqlite3_step(s);
+    int replaced = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    if (replaced != 1) { printf("(hooks_replaced=%d) ", replaced); FAIL("replacement should be counted"); }
+    sqlite3_exec(n->db, "INSERT INTO t VALUES(3)", NULL, NULL, NULL);
+    if (hpplite_node_pending_count(n) != 3) FAIL("capture must resume after re-arming");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 32. Capture matching: our prefix is an identifier prefix, not a substring; bare time functions (issues #42, #43) */
+static void test_capture_matching(void) {
+    TEST("app_hpplite_cfg and comments are captured; bare date()/strftime('fmt') are flagged");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/match.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE app_hpplite_cfg(k, v)", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('a', 1) -- see _hpplite_pending", NULL);
+    hpplite_node_exec(n, "/* _hpplite_meta is ours */ INSERT INTO app_hpplite_cfg VALUES('b', 2)", NULL);
+    if (hpplite_node_pending_count(n) != 3) { printf("(pending=%d) ", hpplite_node_pending_count(n)); FAIL("statements naming app_hpplite_cfg or mentioning our tables in comments must be captured"); }
+    sqlite3_exec(n->db, "SELECT count(*) FROM _hpplite_pending", NULL, NULL, NULL);
+    sqlite3_exec(n->db, "DELETE FROM _hpplite_meta WHERE 0", NULL, NULL, NULL);     /* a real reference: still not captured */
+    if (hpplite_node_pending_count(n) != 3) FAIL("real references to our tables must not be captured");
+    uint64_t nd = n->ctx->nNondeterministic;
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t1', date())", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t2', datetime( ))", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t3', julianday())", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t4', strftime('%s'))", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t5', unixepoch())", NULL);
+    if (n->ctx->nNondeterministic != nd + 5) { printf("(flagged %llu) ", (unsigned long long)(n->ctx->nNondeterministic - nd)); FAIL("each bare time function must be flagged"); }
+    nd = n->ctx->nNondeterministic;
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok1', date('2026-01-01'))", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok2', strftime('%s', '2026-01-01'))", NULL);
+    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok3', 'update(') ", NULL);
+    if (n->ctx->nNondeterministic != nd) FAIL("time functions with an explicit time are deterministic");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1201,6 +1262,8 @@ int main(void) {
     test_close_during_timer_flush();
     test_foreign_batch_is_skipped();
     test_stranger_lease_evicted_sibling_not();
+    test_replaced_hooks_detected();
+    test_capture_matching();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

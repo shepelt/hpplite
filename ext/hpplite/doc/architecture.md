@@ -184,6 +184,14 @@ so the background flush never touches the application's transaction state.
 File databases are switched to WAL and both connections get a 5 s busy
 timeout; readers and the writer then never block each other.
 
+The hooks are one slot per connection, so another library installing its
+own trace or commit hook would silently end capture. Every HPPLite entry
+point that runs on the application thread (a `hpplite_status` read,
+`hpplite_flush()`, `hpplite_sync()`, close) re-installs ours and counts a
+replacement in `hpplite_status.hooks_replaced` - writes made in between are
+not captured and the next checkpoint root says so; a chaining API for apps
+that need their own trace is v0.2.
+
 Several connections, one log. A transaction is named by the rowid of its
 first logged row (`txn = 0` in the row means "my own id"), so transaction
 groups are unique across every connection and process that writes the
@@ -344,7 +352,7 @@ A key holder checks the whole history by rebuilding it:
 ```
 
 Opening an empty file with `hpplite=on` and the key does all four and
-reports on stderr; `hpplite verify` (v0.2) packages it as a command with
+reports on stderr and in `hpplite_status.roots_compared` / `root_mismatches`; `hpplite verify` (v0.2) packages it as a command with
 per-table reporting. It is an on-demand audit, not a running node.
 
 ---

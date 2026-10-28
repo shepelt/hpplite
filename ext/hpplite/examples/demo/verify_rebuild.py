@@ -18,7 +18,8 @@ def rebuild():
     c = sqlite3.connect(":memory:")
     c.enable_load_extension(True); c.load_extension(os.path.splitext(ext)[0]); c.close()
     c = sqlite3.connect(uri, uri=True)
-    st = c.execute("SELECT height, pending, state_root, last_checkpoint_height, replay_skipped, contract FROM hpplite_status").fetchone()
+    st = c.execute("SELECT height, pending, state_root, last_checkpoint_height, replay_skipped, contract, "
+                   "roots_compared, root_mismatches, foreign_batches FROM hpplite_status").fetchone()
     tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'")]
     rows = c.execute("SELECT count(*) FROM entries").fetchone()[0] if "entries" in tables else 0
     latest = c.execute("SELECT name, body FROM entries ORDER BY id DESC LIMIT 1").fetchone() if rows else None
@@ -28,6 +29,7 @@ def rebuild():
     os.rmdir(d)
     return {"height": st[0], "batches": st[0] - 1, "rows": rows, "state_root": st[2],
             "last_checkpoint_height": st[3], "replay_skipped": st[4], "contract": st[5],
+            "roots_compared": st[6], "root_mismatches": st[7], "foreign_batches": st[8],
             "latest": latest, "seconds": round(time.time() - t0, 1)}
 
 if len(sys.argv) > 2 and sys.argv[2] == "--child":
@@ -42,7 +44,7 @@ try:
     out.update(json.loads(p.stdout.strip().splitlines()[-1]))
 except Exception:
     out["error"] = (p.stdout + err)[-2000:]
-out["root_mismatches"] = err.count("state root mismatch")
-out["roots_compared"] = out.get("last_checkpoint_height", 0)
+out.setdefault("root_mismatches", err.count("state root mismatch"))   # the library counts; stderr is the fallback
+out.setdefault("roots_compared", 0)
 out["stderr"] = [l for l in err.splitlines() if "mismatch" in l or "cannot" in l or "failed" in l][:20]
 print(json.dumps(out))
