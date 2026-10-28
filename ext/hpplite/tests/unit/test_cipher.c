@@ -113,6 +113,13 @@ static void test_envelope(void) {
     }
 
     if (hpplite_envelope_is_sealed((const uint8_t*)payload, strlen(payload))) FAIL("plaintext JSON mistaken for an envelope");
+    /* truncated envelopes of every short length are rejected, never read past the end */
+    for (size_t n = 0; n <= 40; n++) {
+        uint8_t tiny[48]; memcpy(tiny, "HPE2", 4); tiny[4] = 1; tiny[5] = 0; memset(tiny + 6, 0x11, sizeof(tiny) - 6);
+        if (n >= 4 && hpplite_envelope_open(key, 1, tiny, n, &openLen, NULL) != NULL) FAIL("truncated envelope accepted");
+        memcpy(tiny, "HPE1", 4);
+        if (n >= 4 && hpplite_envelope_open(key, 1, tiny, n, &openLen, NULL) != NULL) FAIL("truncated v1 envelope accepted");
+    }
     /* two seals of the same payload differ (fresh nonce) */
     uint8_t *s1 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, HPPLITE_ENCODING_NONE, (const uint8_t*)payload, strlen(payload), &sealedLen);
     uint8_t *s2 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, HPPLITE_ENCODING_NONE, (const uint8_t*)payload, strlen(payload), &openLen);

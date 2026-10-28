@@ -20,7 +20,7 @@ static int tests_run = 0, tests_passed = 0;
 #define KEY_A "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 #define KEY_B "0x2020202020202020202020202020202020202020202020202020202020202020"
 
-static void reset_dir(void) { system("rm -rf " DIR " && mkdir -p " DIR); unsetenv("HPPLITE_PRIVATE_KEY"); unsetenv("HPPLITE_PRIVATE_KEY_FILE"); }
+static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); unsetenv("HPPLITE_PRIVATE_KEY"); unsetenv("HPPLITE_PRIVATE_KEY_FILE"); }
 
 static void write_file(const char *path, const char *content, mode_t mode) {
     FILE *f = fopen(path, "w");
@@ -191,7 +191,7 @@ int main(void) {
     test_keyfile_rejections();
     test_no_key_never_posts();
     test_encrypt_off_is_explicit();
-    system("rm -rf " DIR);
+    (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

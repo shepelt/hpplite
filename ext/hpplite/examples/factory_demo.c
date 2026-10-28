@@ -84,11 +84,11 @@ int main(void) {
                     printf("\n\n");
                 } else {
                     printf("Transaction failed\n");
-                    free(tx_hash);
+                    sqlite3_free(tx_hash);
                     return 1;
                 }
             }
-            free(tx_hash);
+            sqlite3_free(tx_hash);
         } else {
             printf("ERROR: Failed to create rollup\n");
             return 1;

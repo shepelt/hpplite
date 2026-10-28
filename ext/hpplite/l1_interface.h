@@ -145,6 +145,9 @@ void hpplite_l1_state_free(HppliteL1State *state);
 ** Claim sequencer lease.
 ** instanceId: unique identifier for this process (32 bytes)
 ** Returns transaction hash on success, NULL on failure.
+**
+** Every transaction hash returned by this interface is a string allocated
+** with sqlite3_mprintf(); release it with sqlite3_free(), never free().
 */
 char *hpplite_l1_claim_sequencer(
     HppliteL1 *l1,

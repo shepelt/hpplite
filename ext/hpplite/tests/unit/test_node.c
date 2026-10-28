@@ -53,14 +53,14 @@ static void on_batch_posted(void *arg, uint64_t height, const char *txHash) {
 static void ensure_test_dir(const char *path) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "mkdir -p %s", path);
-    system(cmd);
+    (void)!system(cmd);
 }
 
 /* Helper: cleanup test files */
 static void cleanup_test_files(const char *dir) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
-    system(cmd);
+    (void)!system(cmd);
 }
 
 /*

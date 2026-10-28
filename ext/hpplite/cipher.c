@@ -399,9 +399,9 @@ uint8_t *hpplite_envelope_open(const uint8_t key[32], uint64_t height,
   if (pScheme) *pScheme = cipher;
   if (!cipher) return NULL;
   hdr = (v == 2) ? HPPLITE_ENVELOPE_HEADER_LEN : HPPLITE_ENVELOPE_MAGIC_LEN + 1;
-  if (v == 2) encoding = data[HPPLITE_ENVELOPE_MAGIC_LEN + 1];
   headLen = hdr + cipher->nonceLen;
-  if (len < headLen + cipher->tagLen) return NULL;
+  if (len < headLen + cipher->tagLen) return NULL;   /* before touching any header byte */
+  if (v == 2) encoding = data[HPPLITE_ENVELOPE_MAGIC_LEN + 1];
   ctLen = len - headLen;
   out = malloc(ctLen - cipher->tagLen + 1);
   if (!out) return NULL;

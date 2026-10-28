@@ -41,7 +41,7 @@ static void test_load_and_use(void) {
     unlink("/tmp/hpplite_test_loadable.db");
     unlink("/tmp/hpplite_test_loadable.db-wal");
     unlink("/tmp/hpplite_test_loadable.db-shm");
-    system("mkdir -p /tmp/hpplite_test_loadable");
+    (void)!system("mkdir -p /tmp/hpplite_test_loadable");
 
     rc = sqlite3_open_v2(DB_URI, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc != SQLITE_OK) FAIL("open");
@@ -100,7 +100,7 @@ int main(void) {
     unlink("/tmp/hpplite_test_loadable.db");
     unlink("/tmp/hpplite_test_loadable.db-wal");
     unlink("/tmp/hpplite_test_loadable.db-shm");
-    system("rm -rf /tmp/hpplite_test_loadable");
+    (void)!system("rm -rf /tmp/hpplite_test_loadable");
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

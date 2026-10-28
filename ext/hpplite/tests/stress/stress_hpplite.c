@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("=== HPPLite stress: %d MB, checkpoint every %d batches, DA limit %zu, %d rows/txn ===\n",
            mb, checkpointEvery, limit, rowsPerTxn);
-    system("rm -rf " DIR " && mkdir -p " DIR);
+    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
 
     HppliteL1 *l1 = hpplite_l1_create_mock();
     hpplite_l1_mock_set_batch_size_limit(l1, limit);
@@ -134,6 +134,7 @@ int main(int argc, char **argv) {
     /* ---- checks on the writer side ---- */
     int ok = 1;
     if (hpplite_node_pending_count(w) != 0) { printf("FAIL: pending not empty\n"); ok = 0; }
+    if (count_rows(w->db) != rows) { printf("FAIL: writer has %lld rows, wrote %lld\n", (long long)count_rows(w->db), (long long)rows); ok = 0; }
     if (checkpoints < 1) { printf("FAIL: no checkpoint submitted\n"); ok = 0; }
     const HppliteCheckpoint *cp = hpplite_l1_mock_get_last_checkpoint(l1);
     /* the last checkpoint covers the state up to its toHeight; if nothing was
@@ -175,13 +176,31 @@ int main(int argc, char **argv) {
            (unsigned long long)(hpplite_node_get_height(r) - 1), tReplay / 1000, rowsR / (tReplay / 1000),
            (long long)rowsR, (unsigned long long)r->ctx->nReplaySkipped);
     if (rowsR != rows) { printf("FAIL: row count %lld != %lld\n", (long long)rowsR, (long long)rows); ok = 0; }
-    if (memcmp(rootW, rootR, 32) != 0) { printf("FAIL: content root differs after reconstruction\n"); ok = 0; }
+    if (memcmp(rootW, rootR, 32) != 0) {
+        printf("FAIL: content root differs after reconstruction\n"); ok = 0;
+        /* say which rows differ: the writer file is still on disk */
+        sqlite3_exec(r->db, "ATTACH '" DIR "/writer.db' AS w", NULL, NULL, NULL);
+        static const char *aDiff[] = {
+            "SELECT 'only in reader', id FROM t WHERE id NOT IN (SELECT id FROM w.t) LIMIT 5",
+            "SELECT 'only in writer', id FROM w.t WHERE id NOT IN (SELECT id FROM t) LIMIT 5",
+            "SELECT 'differs', t.id FROM t JOIN w.t AS wt ON wt.id = t.id"
+            " WHERE t.name IS NOT wt.name OR t.score IS NOT wt.score OR t.payload IS NOT wt.payload LIMIT 5",
+            NULL };
+        for (int i = 0; aDiff[i]; i++) {
+            sqlite3_stmt *st = NULL;
+            if (sqlite3_prepare_v2(r->db, aDiff[i], -1, &st, NULL) == SQLITE_OK) {
+                while (sqlite3_step(st) == SQLITE_ROW)
+                    printf("  %s: id %lld\n", sqlite3_column_text(st, 0), (long long)sqlite3_column_int64(st, 1));
+                sqlite3_finalize(st);
+            }
+        }
+    }
     if (hpplite_node_get_height(r) != height) { printf("FAIL: height %llu != %llu\n", (unsigned long long)hpplite_node_get_height(r), (unsigned long long)height); ok = 0; }
     if (r->ctx->nReplaySkipped) { printf("FAIL: statements skipped on replay\n"); ok = 0; }
     r->l1 = NULL;
     hpplite_node_destroy(r);
     hpplite_l1_disconnect(l1);
-    system("rm -rf " DIR);
+    (void)!system("rm -rf " DIR);
     printf("\n=== %s ===\n", ok ? "STRESS PASSED" : "STRESS FAILED");
     return ok ? 0 : 1;
 }

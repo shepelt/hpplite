@@ -64,10 +64,12 @@ static void generate_instance_id(unsigned char *out) {
 
     /* Remaining 20 bytes: random */
     FILE *urandom = fopen("/dev/urandom", "rb");
+    size_t got = 0;
     if (urandom) {
-        fread(out + 12, 1, 20, urandom);
+        got = fread(out + 12, 1, 20, urandom);
         fclose(urandom);
-    } else {
+    }
+    if (got < 20) {
         /* Fallback: use more timestamp bits */
         for (int i = 12; i < 32; i++) {
             out[i] = (unsigned char)(rand() ^ (tv.tv_usec >> (i % 20)));
@@ -194,7 +196,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                     hpplite_l1_wait_for_tx(tempL1, txHash, 60);
                     hpplite_l1_disconnect(tempL1);
                 }
-                free(txHash);
+                sqlite3_free(txHash);
 
                 /* Try again to get rollup address */
                 result = hpplite_l1_factory_get_my_rollup(
@@ -524,7 +526,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     if (confirmed && node->onBatchPosted) {
                         node->onBatchPosted(node->callbackArg, height, txHash);
                     }
-                    free(txHash);
+                    sqlite3_free(txHash);
                 }
             }
             free(sealed);

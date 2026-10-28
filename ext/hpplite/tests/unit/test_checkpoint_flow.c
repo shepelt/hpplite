@@ -25,7 +25,7 @@ static const unsigned char SEQ_PRIVKEY[32] = {
 static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
     HppliteNodeConfig config;
     HppliteNode *node;
-    system("rm -rf " DIR " && mkdir -p " DIR);
+    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     memset(&config, 0, sizeof(config));
     config.nodeId = "test-seq";
     memcpy(config.privkey, SEQ_PRIVKEY, 32);
@@ -134,7 +134,7 @@ static void test_checkpoint_without_l1(void) {
     HppliteNodeConfig config;
     HppliteNode *node;
     TEST("without L1 the interval is tracked and manual checkpoint is a no-op");
-    system("rm -rf " DIR " && mkdir -p " DIR);
+    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     memset(&config, 0, sizeof(config));
     config.nodeId = "local"; memcpy(config.privkey, SEQ_PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/local.db"; config.checkpointInterval = 2;
@@ -154,7 +154,7 @@ int main(void) {
     test_checkpoint_chain();
     test_checkpoint_every_batch();
     test_checkpoint_without_l1();
-    system("rm -rf " DIR);
+    (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

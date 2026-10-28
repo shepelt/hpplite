@@ -158,7 +158,7 @@ static void test_factory_create_rollup(void) {
     HppliteL1 *temp = hpplite_l1_connect(RPC_URL, FACTORY_ADDRESS);
     int status = temp ? hpplite_l1_wait_for_tx(temp, tx_hash, 60) : -1;
     if (temp) hpplite_l1_disconnect(temp);
-    free(tx_hash);
+    sqlite3_free(tx_hash);
 
     if (status == 1) {
         if (hpplite_l1_factory_get_my_rollup(RPC_URL, FACTORY_ADDRESS, g_privkey, rollup) == 1) {

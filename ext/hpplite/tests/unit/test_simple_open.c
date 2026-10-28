@@ -33,7 +33,7 @@ int main(void) {
 
     /* Clean up any previous test data */
     unlink("/tmp/test_simple_open.db");
-    system("rm -rf /tmp/hpplite_test_simple");
+    (void)!system("rm -rf /tmp/hpplite_test_simple");
     mkdir("/tmp/hpplite_test_simple", 0755);
 
     /* Test 1: Basic open/close */
@@ -374,7 +374,7 @@ int main(void) {
 
     /* Cleanup */
     unlink("/tmp/test_simple_open.db");
-    system("rm -rf /tmp/hpplite_test_simple");
+    (void)!system("rm -rf /tmp/hpplite_test_simple");
 
     return (passed == tests) ? 0 : 1;
 }

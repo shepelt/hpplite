@@ -32,7 +32,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_durability"
 
 static void reset_dir(void) {
-    system("rm -rf " DIR " && mkdir -p " DIR);
+    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
 }
 
 static int count_rows(sqlite3 *db, const char *table) {
@@ -740,6 +740,58 @@ static void test_encryption_off_and_legacy(void) {
     PASS();
 }
 
+/* 21. A background flush must never make the application lose a capture */
+#include <pthread.h>
+typedef struct { HppliteNode *n; int rows; volatile int done; } WriterArgs;
+static void *writer_thread(void *arg) {
+    WriterArgs *w = arg;
+    char sql[128];
+    for (int i = 1; i <= w->rows; i++) {
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d,'r%d')", i, i);
+        sqlite3_exec(w->n->db, sql, NULL, NULL, NULL);          /* autocommit, app thread */
+    }
+    w->done = 1;
+    return NULL;
+}
+static void test_flush_thread_never_loses_captures(void) {
+    TEST("concurrent flush thread loses no captures (issue #20)");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
+    HppliteNode *n = open_node(DIR "/race.db", l1);
+    if (!n) FAIL("open");
+    n->config.checkpointInterval = 1;                         /* every flush hashes the database */
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_flush_batch(n);
+    /* some bulk so the root hash (and thus the bookkeeping window) is not trivial */
+    hpplite_node_exec(n, "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<200000)"
+                          " INSERT INTO t SELECT -i, 'bulk' FROM s", NULL);
+    hpplite_node_flush_batch(n);
+    uint64_t h0 = hpplite_node_get_height(n);
+
+    WriterArgs w = { n, 4000, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, writer_thread, &w);
+    int flushes = 0;
+    while (!w.done) { hpplite_node_flush_batch(n); flushes++; }  /* bookkeeping hammering the flag */
+    pthread_join(th, NULL);
+    uint64_t last = hpplite_node_flush_batch(n);
+    if (last == 0) last = hpplite_node_get_height(n) - 1;
+
+    int captured = hpplite_node_pending_count(n);
+    for (uint64_t h = h0; h <= last; h++) {
+        HppliteBatch *b = hpplite_node_fetch_batch(n, h);
+        if (!b) FAIL("batch missing");
+        captured += b->nTxns;
+        hpplite_batch_free(b);
+    }
+    printf("(%d flushes, %d/%d captured) ", flushes, captured, w.rows);
+    if (captured != w.rows) FAIL("captures were lost while the flusher ran");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -762,7 +814,8 @@ int main(void) {
     test_replay_skips_failed_statement();
     test_encryption_default();
     test_encryption_off_and_legacy();
-    system("rm -rf " DIR);
+    test_flush_thread_never_loses_captures();
+    (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

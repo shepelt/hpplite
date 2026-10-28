@@ -178,15 +178,31 @@ static const char *HPPLITE_SCHEMA =
   ");";
 
 /*
-** Run SQL on behalf of HPPLite itself. Statements issued while bInternal is
-** set are ignored by the trace and commit hooks.
+** bInternal tells the trace and commit hooks on the application connection
+** to ignore HPPLite's own statements. Only statements that run on that
+** connection need it: the bookkeeping connection has no hooks, and the
+** timer thread must not touch a flag the application thread is reading
+** (that silently dropped captures, issue #20). bkEnter() sets the flag only
+** when bookkeeping shares the application connection (:memory:).
+*/
+static int bkEnter(HppliteCtx *pCtx) {
+  int saved = pCtx->bInternal;
+  if (pCtx->bkDb == pCtx->db) pCtx->bInternal = 1;
+  return saved;
+}
+static void bkLeave(HppliteCtx *pCtx, int saved) {
+  if (pCtx->bkDb == pCtx->db) pCtx->bInternal = saved;
+}
+
+/*
+** Run SQL on behalf of HPPLite itself on the given connection.
 */
 static int internalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql) {
   int saved = pCtx->bInternal;
   int rc;
-  pCtx->bInternal = 1;
+  if (db == pCtx->db) pCtx->bInternal = 1;
   rc = sqlite3_exec(db, zSql, NULL, NULL, NULL);
-  pCtx->bInternal = saved;
+  if (db == pCtx->db) pCtx->bInternal = saved;
   return rc;
 }
 
@@ -206,8 +222,7 @@ static void columnHash(sqlite3_stmt *pStmt, int i, unsigned char *pOut) {
 static int loadMeta(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt;
   int rc;
-
-  pCtx->bInternal = 1;
+  int saved = bkEnter(pCtx);
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT next_height, prev_block_hash, state_root,"
     "       last_checkpoint_height, last_checkpoint_root"
@@ -232,7 +247,7 @@ static int loadMeta(HppliteCtx *pCtx) {
     }
     sqlite3_finalize(pStmt);
   }
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, saved);
   pCtx->bRootDirty = 1;
   return rc;
 }
@@ -655,12 +670,11 @@ void hpplite_enable(HppliteCtx *pCtx, int bEnable) {
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut) {
   if (!pCtx || !pOut) return;
   if (pCtx->bRootDirty) {
-    int saved = pCtx->bInternal;
-    pCtx->bInternal = 1;
+    int saved = bkEnter(pCtx);
     if (hpplite_db_hash(pCtx->bkDb, pCtx->curRoot) == SQLITE_OK) {
       pCtx->bRootDirty = 0;
     }
-    pCtx->bInternal = saved;
+    bkLeave(pCtx, saved);
   }
   memcpy(pOut, pCtx->curRoot, HPPLITE_HASH_SIZE);
 }
@@ -762,7 +776,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
 
   if (!pCtx) return NULL;
   if (bkBegin(pCtx, 0) != SQLITE_OK) return NULL;
-  pCtx->bInternal = 1;
+  int savedInternal = bkEnter(pCtx);
 
   /* Read pending rows in order. With a size limit, stop as soon as the
   ** estimated JSON size passes it: the rest belongs to later batches, and
@@ -816,7 +830,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       }
     }
   }
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, savedInternal);
   bkEnd(pCtx, SQLITE_OK);
 
   /* The estimate is conservative; confirm with one real serialization and
@@ -868,13 +882,13 @@ sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt;
   sqlite3_int64 n = 0;
   if (!pCtx) return 0;
-  pCtx->bInternal = 1;
+  int saved = bkEnter(pCtx);
   if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending",
                          -1, &pStmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int64(pStmt, 0);
     sqlite3_finalize(pStmt);
   }
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, saved);
   return n;
 }
 
@@ -928,9 +942,11 @@ int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3
   if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
   rc = bkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
-  pCtx->bInternal = 1;
-  rc = advanceMeta(pCtx, pBatch, maxId);
-  pCtx->bInternal = 0;
+  {
+    int saved = bkEnter(pCtx);
+    rc = advanceMeta(pCtx, pBatch, maxId);
+    bkLeave(pCtx, saved);
+  }
   return bkEnd(pCtx, rc);
 }
 
@@ -954,50 +970,53 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (pBatch->height < pCtx->blockHeight) return SQLITE_DONE;   /* already applied */
   if (pBatch->height > pCtx->blockHeight) return SQLITE_MISMATCH; /* gap */
 
+  /* Replay runs on the bookkeeping connection: no hooks there, so nothing
+  ** is captured and the application thread's flags are left alone. */
+  sqlite3 *rdb = pCtx->bkDb;
   savedEnabled = pCtx->bEnabled;
-  pCtx->bEnabled = 0;
-  pCtx->bInternal = 1;
+  if (rdb == pCtx->db) { pCtx->bEnabled = 0; pCtx->bInternal = 1; }
   for (i = 0; i < pBatch->nTxns && rc == SQLITE_OK; i++) {
     const char *zSql = pBatch->aTxns[i].zSql;
     if (!zSql) continue;
     if (useTxn && pBatch->aTxns[i].txn != lastTxn) {
-      if (open) rc = sqlite3_exec(pCtx->db, "COMMIT", NULL, NULL, NULL);
-      if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, "BEGIN", NULL, NULL, NULL);
+      if (open) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
+      if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "BEGIN", NULL, NULL, NULL);
       open = (rc == SQLITE_OK);
       lastTxn = pBatch->aTxns[i].txn;
     }
-    if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, zSql, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
       /* The statement failed here as it did at the sequencer (a failed
       ** statement has no effect, so it is skipped there and skipped here;
       ** capture removes most of them, but not one whose triggers changed
       ** rows before it aborted). A statement-level failure leaves an open
       ** transaction usable; anything that rolled it back is fatal. */
-      if (open && sqlite3_get_autocommit(pCtx->db)) break;
+      if (open && sqlite3_get_autocommit(rdb)) break;
       pCtx->nReplaySkipped++;
       fprintf(stderr, "hpplite: batch %llu statement %d failed on replay (%s); skipped\n",
-              (unsigned long long)pBatch->height, i, sqlite3_errmsg(pCtx->db));
+              (unsigned long long)pBatch->height, i, sqlite3_errmsg(rdb));
       rc = SQLITE_OK;
     }
   }
   if (open) {
-    if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, "COMMIT", NULL, NULL, NULL);
-    else sqlite3_exec(pCtx->db, "ROLLBACK", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
+    else sqlite3_exec(rdb, "ROLLBACK", NULL, NULL, NULL);
   }
-  pCtx->bInternal = 0;
-  pCtx->bEnabled = savedEnabled;
+  if (rdb == pCtx->db) { pCtx->bInternal = 0; pCtx->bEnabled = savedEnabled; }
   pCtx->bRootDirty = 1;
   if (rc != SQLITE_OK) {
     fprintf(stderr, "hpplite: replay of batch %llu failed at statement %d (rc=%d): %s\n",
-            (unsigned long long)pBatch->height, i, rc, sqlite3_errmsg(pCtx->db));
+            (unsigned long long)pBatch->height, i, rc, sqlite3_errmsg(rdb));
     return rc;
   }
 
   rc = bkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
-  pCtx->bInternal = 1;
-  rc = advanceMeta(pCtx, pBatch, 0);
-  pCtx->bInternal = 0;
+  {
+    int saved = bkEnter(pCtx);
+    rc = advanceMeta(pCtx, pBatch, 0);
+    bkLeave(pCtx, saved);
+  }
   rc = bkEnd(pCtx, rc);
   if (rc != SQLITE_OK) return rc;
 
@@ -1020,10 +1039,10 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
   if (!pCtx || !pBatch) return SQLITE_MISUSE;
   if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
 
-  pCtx->bInternal = 1;
+  int saved = bkEnter(pCtx);
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT id, sql FROM _hpplite_pending ORDER BY id LIMIT ?1", -1, &pStmt, NULL);
-  if (rc != SQLITE_OK) { pCtx->bInternal = 0; return rc; }
+  if (rc != SQLITE_OK) { bkLeave(pCtx, saved); return rc; }
   sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
   while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
@@ -1035,7 +1054,7 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
     i++;
   }
   sqlite3_finalize(pStmt);
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, saved);
   if (!ok || i != pBatch->nTxns) return SQLITE_MISMATCH;
 
   return hpplite_finalize_batch(pCtx, pBatch, maxId);
@@ -1045,13 +1064,13 @@ int hpplite_pending_count(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt;
   int n = 0;
   if (!pCtx) return 0;
-  pCtx->bInternal = 1;
+  int saved = bkEnter(pCtx);
   if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT count(*) FROM _hpplite_pending",
                          -1, &pStmt, NULL) == SQLITE_OK) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int(pStmt, 0);
     sqlite3_finalize(pStmt);
   }
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, saved);
   return n;
 }
 
@@ -1069,7 +1088,7 @@ int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned cha
   sqlite3_stmt *pStmt;
   int rc;
   if (!pCtx || !pRoot) return SQLITE_MISUSE;
-  pCtx->bInternal = 1;
+  int saved = bkEnter(pCtx);
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "UPDATE _hpplite_meta SET last_checkpoint_height=?1, last_checkpoint_root=?2 WHERE id=1",
     -1, &pStmt, NULL);
@@ -1079,7 +1098,7 @@ int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned cha
     rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
     sqlite3_finalize(pStmt);
   }
-  pCtx->bInternal = 0;
+  bkLeave(pCtx, saved);
   if (rc == SQLITE_OK) {
     pCtx->lastCheckpointHeight = height;
     memcpy(pCtx->lastCheckpointRoot, pRoot, HPPLITE_HASH_SIZE);

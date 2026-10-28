@@ -3,6 +3,8 @@ project(hpplite VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+# glibc hides dladdr()/Dl_info, RTLD_NODELETE and memmem() behind this; a no-op elsewhere
+add_compile_definitions(_GNU_SOURCE)
 
 # Optimized by default (single-config generators); -DCMAKE_BUILD_TYPE=Debug to override
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)

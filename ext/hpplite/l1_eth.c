@@ -156,6 +156,20 @@ void hpplite_l1_system_config_free(HppliteSystemConfig *config) {
     free(config);
 }
 
+
+/*
+** Transaction hashes cross the L1 interface as strings the caller releases
+** with sqlite3_free(): the mock builds them with sqlite3_mprintf(), so the
+** real backend must too (free() on them aborts under glibc).
+*/
+static char *txHashString(uint8_t *tx_hash) {
+    char *hex = eth_hex_encode(tx_hash, 32);
+    char *out = hex ? sqlite3_mprintf("%s", hex) : NULL;
+    free(hex);
+    free(tx_hash);
+    return out;
+}
+
 /* Set private key for signing transactions */
 int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     memcpy(l1->privkey, privkey, 32);
@@ -350,8 +364,7 @@ char *hpplite_l1_submit_checkpoint(
 
     if (!tx_hash) return NULL;
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
@@ -368,8 +381,7 @@ char *hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 200000, 0);
     if (!tx_hash) return NULL;
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
@@ -386,8 +398,7 @@ char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 100000, 0);
     if (!tx_hash) return NULL;
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
@@ -402,8 +413,7 @@ char *hpplite_l1_release_lease(HppliteL1 *l1) {
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
@@ -578,8 +588,7 @@ char *hpplite_l1_factory_get_or_create_rollup(
     }
     eth_client_destroy(eth);
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
 
     /* Caller should wait for tx and then call get_rollup to get the address */
     return hash_hex;
@@ -707,8 +716,7 @@ char *hpplite_l1_submit_batch(
 
     if (!tx_hash) return NULL;
 
-    char *hash_hex = eth_hex_encode(tx_hash, 32);
-    free(tx_hash);
+    char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 

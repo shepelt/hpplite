@@ -43,7 +43,7 @@ static void record(const char *name, double value, const char *unit) {
     printf("  %-44s %12.1f %s\n", name, value, unit);
 }
 
-static void reset_dir(void) { system("rm -rf " DIR " && mkdir -p " DIR); }
+static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
 
 static HppliteNode *open_node(const char *path, HppliteL1 *l1, int checkpointInterval) {
     HppliteNodeConfig config;
@@ -269,6 +269,6 @@ int main(int argc, char **argv) {
     bench_root_hash(mbList);
     bench_open_with_pending(rows);
     if (json) write_json(json);
-    system("rm -rf " DIR);
+    (void)!system("rm -rf " DIR);
     return 0;
 }
