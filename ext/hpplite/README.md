@@ -137,7 +137,7 @@ sqlite> .load ./build/hpplite
 sqlite> .open 'file:app.db?hpplite=on&l1=hpp-sepolia&privkey=0x...'
 sqlite> CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
 sqlite> INSERT INTO users VALUES(1,'alice');
-sqlite> SELECT * FROM hpplite_status;      -- height, pending, state_root, ...
+sqlite> SELECT * FROM hpplite_status;      -- height, pending, state_root, ..., contract, last_batch_tx
 sqlite> SELECT hpplite_flush();            -- or just wait for the interval / close
 ```
 
@@ -190,6 +190,16 @@ make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYT
 # moments while the timer flushes; reopen, check nothing is lost or duplicated
 ./crash_hpplite --rounds 20
 ```
+
+## Demo
+
+`examples/demo/` is a public timeline page: stock Python `sqlite3` loads the
+module, every entry (and a heartbeat a minute) becomes an encrypted batch on
+HPP Sepolia with explorer links, a panel shows the ciphertext the chain
+holds, and **Verify** rebuilds the database from the chain alone in a
+separate process and compares roots. `examples/demo/run_demo.sh` serves it
+and opens a Cloudflare quick tunnel (needs `cloudflared`, a real-L1 build
+and `HPPLITE_PRIVATE_KEY`).
 
 ## Gas Costs (HPP Sepolia)
 

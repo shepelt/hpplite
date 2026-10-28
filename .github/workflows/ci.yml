@@ -51,6 +51,12 @@ jobs:
       - name: stress (10 MB)
         if: matrix.mode == 'release'
         run: cd ext/hpplite/build && ./stress_hpplite --mb 10
+      - name: real-L1 backend compiles (not run; l1_eth.c is outside the mock suite)
+        if: matrix.mode == 'release'
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_SQLITE_SRC=$PWD/build \
+            -DHPPLITE_USE_REAL_L1=ON -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
+          cmake --build ext/hpplite/build_real -j"$(nproc)"
 
   macos:
     name: macos

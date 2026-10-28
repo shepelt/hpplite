@@ -95,6 +95,7 @@ typedef struct HppliteNode {
     int hasEncKey;
     int warnedNoKey;                /* "no key, not posting" said once */
     int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
+    char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
     int warnedNoL1;                 /* "L1 requested but not connected" said once */
 
     /* Checkpoint tracking */

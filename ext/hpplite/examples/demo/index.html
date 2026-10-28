@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HPPLite timeline</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e8ee;--mut:#8b93a7;--acc:#7cc4ff;--ok:#5ad38f;--bad:#ff6b6b;--warn:#ffcc66}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{font-size:24px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}.card .k{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:20px;font-weight:600;margin-top:2px;word-break:break-all}.card .v.small{font-size:13px;font-weight:500;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:760px){.row{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:16px}.panel h2{font-size:15px;margin:0 0 10px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+form{display:flex;flex-direction:column;gap:8px}input,textarea{background:#0c0e12;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit}textarea{min-height:70px;resize:vertical}
+button{background:var(--acc);color:#0b1620;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.5;cursor:default}button.ghost{background:transparent;color:var(--acc);border:1px solid var(--line)}
+.entry{border-top:1px solid var(--line);padding:9px 0}.entry:first-child{border-top:0}.entry .who{font-weight:600}.entry .when{color:var(--mut);font-size:12px;margin-left:6px}.entry .body{white-space:pre-wrap;word-break:break-word}
+.hb{color:var(--mut)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all;color:var(--mut)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.note{color:var(--mut);font-size:13px}
+</style></head><body><div class="wrap">
+<h1>HPPLite timeline</h1>
+<p class="sub">A plain SQLite database (stock Python <code>sqlite3</code> + the <code>hpplite</code> loadable extension). Every entry you post is captured inside its own transaction, batched, encrypted (ChaCha20-Poly1305) and posted to <a href="https://sepolia-explorer.hpp.io" target="_blank">HPP Sepolia</a>; every 5 batches a SHA-256 of the whole database is anchored on-chain. <b>Verify</b> rebuilds the database from the chain alone and checks it.</p>
+
+<div class="grid" id="cards"></div>
+
+<div class="row">
+ <div>
+  <div class="panel"><h2>Post to the timeline</h2>
+   <form id="f"><input id="name" placeholder="your name (optional)" maxlength="40"><textarea id="body" placeholder="say something (280 chars). It will live on a chain." maxlength="280" required></textarea>
+   <div style="display:flex;gap:8px;align-items:center"><button type="submit" id="post">Post</button><span id="postmsg" class="note"></span></div></form></div>
+  <div class="panel"><h2>Timeline</h2><div id="entries"></div></div>
+ </div>
+ <div>
+  <div class="panel"><h2>Verify from the chain</h2>
+   <p class="note">Opens an empty file with the key and <code>l1=hpp-sepolia</code> in a separate process: fetches every batch, decrypts, replays the SQL, and compares each posted state root with the hash it computes.</p>
+   <div style="display:flex;gap:8px;align-items:center"><button id="verify">Rebuild &amp; verify</button><span id="vmsg" class="note"></span></div>
+   <div id="vres" style="margin-top:10px"></div></div>
+  <div class="panel"><h2>What the chain sees</h2>
+   <p class="note">The newest batch, read back from the DA contract with <code>eth_call getBatch(height)</code>. Ciphertext: the chain never sees your SQL.</p>
+   <div id="chain" class="mono">…</div></div>
+  <div class="panel"><h2>How to read the numbers</h2>
+   <p class="note"><b>height</b> is the next batch number (batches = height − 1). <b>pending</b> entries are committed locally and waiting for the next batch (every 15 s). <b>checkpoint</b> is the last batch whose state root is anchored on-chain. A heartbeat entry posts once a minute so the ledger moves even when nobody is here.</p></div>
+ </div>
+</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let st=null;
+function card(k,v,cls){return `<div class="card"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div></div>`}
+async function refresh(){
+  try{st=await (await fetch('/api/status')).json();}catch(e){return}
+  const ex=st.explorer;
+  const link=(a,t)=>a?`<a target="_blank" href="${ex}/${t}/${a}">${a.slice(0,10)}…${a.slice(-4)}</a>`:'—';
+  $('#cards').innerHTML=card('batches on chain',st.batches)+card('pending entries',st.pending,st.pending?'warn':'')+card('last checkpoint','batch '+st.last_checkpoint_height)
+   +card('entries',st.entries)+card('db size',(st.db_bytes/1024).toFixed(0)+' KB')+card('lease',st.lease?'held':'—',st.lease?'ok':'')
+   +card('state root',st.state_root?st.state_root.slice(0,18)+'…':'—','small')+card('encryption',st.encryption,'small')
+   +card('rollup contract',link(st.contract,'address'),'small')+card('DA contract',link(st.da_contract,'address'),'small')+card('last batch tx',link(st.last_batch_tx,'tx'),'small');
+  const es=await (await fetch('/api/entries')).json();
+  $('#entries').innerHTML=es.map(e=>`<div class="entry ${e.name==='heartbeat'?'hb':''}"><span class="who">${esc(e.name)}</span><span class="when">${new Date(e.posted_at*1000).toLocaleString()} · #${e.id}</span><div class="body">${esc(e.body)}</div></div>`).join('')||'<span class="note">nothing yet</span>';
+  if(st.batches>0){try{const b=await (await fetch('/api/batch?h='+st.batches)).json();
+    $('#chain').innerHTML=b.error?esc(b.error):`batch ${b.height}: ${b.bytes} bytes, envelope <b class="${b.sealed?'ok':'bad'}">${esc(b.magic)}</b> scheme ${b.scheme_id} ${b.sealed?'(sealed)':'(PLAINTEXT)'}<br>${b.hex_head}…${b.hex_tail}`;}catch(e){}}
+}
+$('#f').addEventListener('submit',async ev=>{ev.preventDefault();$('#post').disabled=true;$('#postmsg').textContent='posting…';
+  try{const r=await fetch('/api/entries',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:$('#name').value,body:$('#body').value})});const j=await r.json();
+    $('#postmsg').textContent=j.error?j.error:`entry #${j.id} committed; on chain within ~15 s`;if(!j.error)$('#body').value='';}catch(e){$('#postmsg').textContent='failed'}
+  $('#post').disabled=false;refresh();});
+$('#verify').addEventListener('click',async()=>{$('#verify').disabled=true;$('#vmsg').textContent='rebuilding from chain… (fetches every batch)';$('#vres').innerHTML='';
+  try{const j=await (await fetch('/api/verify',{method:'POST'})).json();
+    if(j.error&&!j.height){$('#vres').innerHTML=`<span class="bad">${esc(j.error)}</span>`;}
+    else{const same=j.state_root===j.live.state_root&&j.rows===j.live.entries;
+      $('#vres').innerHTML=`<div>rebuilt <b>${j.batches}</b> batches → <b>${j.rows}</b> entries in ${j.seconds}s; replay skipped ${j.replay_skipped}</div>
+      <div>posted roots compared: <b>${j.roots_compared}</b>, mismatches: <b class="${j.root_mismatches?'bad':'ok'}">${j.root_mismatches}</b></div>
+      <div>rebuilt root <span class="mono">${esc(j.state_root||'')}</span></div>
+      <div>live root &nbsp;&nbsp;&nbsp;<span class="mono">${esc(j.live.state_root||'')}</span> → ${same?'<b class="ok">identical to the live database</b>':`<b class="warn">live db is ahead</b> (${j.live.pending} pending, ${j.live.entries-j.rows} entries not on chain yet)`}</div>
+      ${j.latest?`<div class="note">newest rebuilt entry: ${esc(j.latest[0])}: ${esc(j.latest[1])}</div>`:''}${(j.stderr||[]).map(l=>`<div class="mono">${esc(l)}</div>`).join('')}`;}
+  }catch(e){$('#vres').innerHTML='<span class="bad">verify request failed</span>'}
+  $('#vmsg').textContent='';$('#verify').disabled=false;});
+refresh();setInterval(refresh,4000);
+</script></body></html>

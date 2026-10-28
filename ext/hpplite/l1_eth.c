@@ -6,6 +6,7 @@
 */
 
 #include "l1_interface.h"
+#include "hpplite_sqlite.h"
 #include "eth_client.h"
 #include "abi.h"
 #include "keccak256.h"
@@ -415,6 +416,20 @@ char *hpplite_l1_release_lease(HppliteL1 *l1) {
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
+}
+
+int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
+    static const char *h = "0123456789abcdef";
+    int i;
+    if (!l1) return -1;
+    contractHex[0] = daHex[0] = '0'; contractHex[1] = daHex[1] = 'x';
+    for (i = 0; i < 20; i++) {
+        contractHex[2 + 2*i] = h[l1->contract[i] >> 4]; contractHex[3 + 2*i] = h[l1->contract[i] & 15];
+        daHex[2 + 2*i] = h[l1->da_contract[i] >> 4];     daHex[3 + 2*i] = h[l1->da_contract[i] & 15];
+    }
+    contractHex[42] = daHex[42] = 0;
+    if (!l1->has_da_contract) daHex[0] = 0;
+    return 0;
 }
 
 int hpplite_l1_is_lease_active(HppliteL1 *l1) {

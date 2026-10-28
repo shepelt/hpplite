@@ -1314,7 +1314,8 @@ static void hpplite_on_close(sqlite3 *db);
 **   SELECT * FROM hpplite_status;
 **
 ** One row: height, pending, state_root, prev_block_hash,
-** last_checkpoint_height, lease, log_errors.
+** last_checkpoint_height, lease, log_errors, replay_skipped, encryption,
+** keyed, nondeterministic, contract, da_contract, last_batch_tx.
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -1342,6 +1343,9 @@ typedef struct StatusCursor {
 #define STATUS_COL_ENCRYPTION 8
 #define STATUS_COL_KEYED 9
 #define STATUS_COL_NONDETERMINISTIC 10
+#define STATUS_COL_CONTRACT         11
+#define STATUS_COL_DA_CONTRACT      12
+#define STATUS_COL_LAST_BATCH_TX    13
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1352,7 +1356,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
-        " nondeterministic INTEGER)");
+        " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1476,6 +1480,21 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_NONDETERMINISTIC:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nNondeterministic);
+            break;
+        case STATUS_COL_CONTRACT:
+        case STATUS_COL_DA_CONTRACT: {
+            char c[43], d[43];
+            if (node->l1 && hpplite_l1_get_addresses(node->l1, c, d) == 0) {
+                const char *z = (col == STATUS_COL_CONTRACT) ? c : d;
+                if (z[0]) sqlite3_result_text(ctx, z, -1, SQLITE_TRANSIENT); else sqlite3_result_null(ctx);
+            } else {
+                sqlite3_result_null(ctx);
+            }
+            break;
+        }
+        case STATUS_COL_LAST_BATCH_TX:
+            if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);
+            else sqlite3_result_null(ctx);
             break;
         default:
             sqlite3_result_null(ctx);

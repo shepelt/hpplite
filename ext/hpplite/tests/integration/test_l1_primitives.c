@@ -18,6 +18,7 @@
 */
 
 #include "l1_interface.h"
+#include "hpplite_sqlite.h"
 #include "eth_client.h"
 #include "test_util.h"
 #include <stdio.h>

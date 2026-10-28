@@ -363,6 +363,12 @@ void hpplite_l1_state_free(HppliteL1State *state) {
 /*
 ** Check if lease is currently active
 */
+int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
+    (void)l1;
+    contractHex[0] = daHex[0] = 0;
+    return -1;
+}
+
 int hpplite_l1_is_lease_active(HppliteL1 *l1) {
     if (!l1 || !l1->hasSequencer) return 0;
     return l1->currentTimestamp < l1->leaseExpiry;

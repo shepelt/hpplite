@@ -177,6 +177,12 @@ char *hpplite_l1_release_lease(HppliteL1 *l1);
 int hpplite_l1_is_lease_active(HppliteL1 *l1);
 
 /*
+** Addresses of the rollup's coordinator and DA contracts as 0x-hex strings
+** (43-byte buffers). Returns 0 on success, -1 when the backend has none (mock).
+*/
+int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]);
+
+/*
 ** Check if we are the current sequencer.
 ** pubkey: our public key (33 bytes)
 ** Returns 1 if we are sequencer with active lease.

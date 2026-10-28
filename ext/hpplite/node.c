@@ -684,6 +684,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                                         payload, payloadLen);
                 if (txHash) {
                     confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
+                    if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash);
                     if (confirmed && node->onBatchPosted) {
                         node->onBatchPosted(node->callbackArg, height, txHash);
                     }
