@@ -50,7 +50,7 @@ struct HppliteCtx {
   int bDbClosed;              /* db is a zombie: no SQLite calls on it any more */
   int bAppFlushing;           /* hpplite_flush() is running on the application thread */
   int bStatusGone;            /* hpplite_status was disconnected by a close that failed */
-  uint64_t txnSeq;            /* Groups pending SQL by transaction */
+  sqlite3_int64 curTxn;       /* Id of the first logged row of the open transaction (0 = none) */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
   sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
@@ -333,6 +333,9 @@ struct HppliteNode *hpplite_get_node(sqlite3 *db);
 ** Called automatically by hpplite_node_create() and hpplite_node_create_with_db().
 */
 void hpplite_register_node(sqlite3 *db, struct HppliteNode *node);
+
+/* The registered node sequencing this file (by canonical path), or NULL */
+struct HppliteNode *hpplite_find_sequencer(const char *zCanonicalPath);
 
 /*
 ** Remove a connection from the registry (no-op if not registered).

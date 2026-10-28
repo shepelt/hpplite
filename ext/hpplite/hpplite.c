@@ -238,15 +238,6 @@ static int loadMeta(HppliteCtx *pCtx) {
     sqlite3_finalize(pStmt);
   }
 
-  /* Pending rows carry transaction numbers; keep numbering above them */
-  if (sqlite3_prepare_v2(pCtx->bkDb,
-        "SELECT COALESCE(MAX(txn), 0) + 1 FROM _hpplite_pending",
-        -1, &pStmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(pStmt) == SQLITE_ROW) {
-      pCtx->txnSeq = (uint64_t)sqlite3_column_int64(pStmt, 0);
-    }
-    sqlite3_finalize(pStmt);
-  }
   bkLeave(pCtx, saved);
   pCtx->bRootDirty = 1;
   return rc;
@@ -633,12 +624,16 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     if (rc != SQLITE_OK) pCtx->pLogStmt = NULL;
   }
   if (pCtx->pLogStmt) {
-    sqlite3_bind_int64(pCtx->pLogStmt, 1, (sqlite3_int64)pCtx->txnSeq);
+    /* A transaction is named by the id of its first logged row (stored as 0
+    ** there, "= id"): unique across every connection and process writing
+    ** this file, with no counter to keep in step (issue #24). */
+    sqlite3_bind_int64(pCtx->pLogStmt, 1, pCtx->curTxn);
     sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(pCtx->pLogStmt);
     if (rc == SQLITE_DONE) {
       pCtx->pLastLogged = pS;
       pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->lastLogId;
       pCtx->changesAtLog = totalChanges(pCtx->db);
       pCtx->schemaAtLog = schemaVersion(pCtx);
     }
@@ -663,7 +658,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
 static int hppliteCommitHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   if (pCtx->bInternal) return 0;
-  pCtx->txnSeq++;
+  pCtx->curTxn = 0;
   pCtx->bRootDirty = 1;
   if (pCtx->xOnCommit) {
     pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
@@ -677,6 +672,7 @@ static int hppliteCommitHook(void *pArg) {
 static void hppliteRollbackHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   if (pCtx->bInternal) return;
+  pCtx->curTxn = 0;
   if (pCtx->xOnRollback) {
     pCtx->xOnRollback(pCtx->pCallbackArg);
   }
@@ -892,7 +888,8 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   size_t estSize = hpplite_batch_json_overhead();
   int overLimit = 0;
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, txn, sql FROM _hpplite_pending ORDER BY id", -1, &pStmt, NULL);
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql FROM _hpplite_pending ORDER BY id",
+    -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
       sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
@@ -1504,6 +1501,23 @@ static sqlite3_module hpplite_status_module = {
 ** hpplite_sync(), hpplite_flush() and the hpplite_status table.
 ** Called by hpplite_node_create() and hpplite_node_create_with_db().
 */
+HppliteNode *hpplite_find_sequencer(const char *zCanonicalPath) {
+    sqlite3_mutex *m = regMutex();
+    NodeEntry *e;
+    HppliteNode *found = NULL;
+    if (!zCanonicalPath) return NULL;
+    sqlite3_mutex_enter(m);
+    for (e = g_nodeRegistry; e; e = e->next) {
+        if (e->node && !e->node->follower && e->node->canonicalPath
+            && strcmp(e->node->canonicalPath, zCanonicalPath) == 0) {
+            found = e->node;
+            break;
+        }
+    }
+    sqlite3_mutex_leave(m);
+    return found;
+}
+
 void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
     if (!db || !node) return;
 

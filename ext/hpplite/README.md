@@ -10,7 +10,7 @@ database (the *state root*) on the same chain. Open an empty file with the
 same key and the database rebuilds itself from the chain; replay compares
 every posted root with what it computes and says so when they differ.
 
-Stock SQLite, loadable extension, no patches. One process writes; the chain
+Stock SQLite, loadable extension, no patches. One sequencer posts; the chain
 keeps the history; whoever holds the key can rebuild and check it.
 
 What v0.1 is **not**: not a multi-writer database, not a public verifier
@@ -142,11 +142,18 @@ sqlite> SELECT hpplite_flush();            -- or just wait for the interval / cl
 ```
 
 Programs call `sqlite3_load_extension()` once; every later connection in the
-process that opens with `?hpplite=on` is handled automatically. Open **one**
-`hpplite=on` connection per database file per process in v0.1 (a connection
-pool is #24); other connections to the same file should open it plainly.
-Loading HPPLite twice into one connection (static library plus module) is
-refused.
+process that opens with `?hpplite=on` is handled automatically.
+
+**Every connection that writes must open with `hpplite=on`** - a plain
+connection's writes are not captured. The first `hpplite=on` connection to a
+file in a process is the sequencer (L1, lease, timer); later ones are
+*followers*: they capture into the same log in the file and post nothing,
+the sequencer's flush posts everyone's rows (transaction groups stay correct
+across connections). Close the sequencer last; rows a follower captures
+after it is gone wait in the file for the next sequencer. Several
+*processes* on one file work the same way, with the lease deciding who
+posts. Loading HPPLite twice into one connection (static library plus
+module) is refused.
 
 **Statically linked** with the SQLite built in this tree (what the tests use):
 

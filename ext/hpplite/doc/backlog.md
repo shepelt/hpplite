@@ -54,6 +54,13 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Several connections to one file (issue #24, v0.1 slice)
+- Transaction ids come from the log rowids (unique across connections and
+  processes); later `hpplite=on` connections in a process are capture-only
+  followers of the first; the sequencer posts everyone's rows
+- Left for v0.2: follower promotion when the sequencer closes, a
+  `sequencer` status column, cross-process `flock` sidecar
+
 ### Crash harness and chain-free mock (issue #26)
 - `l1_mock` can live in a directory (`hpplite_l1_create_mock_dir`): batches,
   lease, checkpoints and clock survive the process (atomic rename); the seed

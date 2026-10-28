@@ -22,7 +22,9 @@ for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/pyth
 done
 
 # sqlite3 shell: .load, URI open, status, flush, close, reopen
-if command -v sqlite3 >/dev/null 2>&1; then
+# (Apple's /usr/bin/sqlite3 is built without extension loading: skip it)
+if command -v sqlite3 >/dev/null 2>&1 \
+   && ! sqlite3 :memory: ".load /nonexistent/module" 2>&1 | grep -q "unknown command"; then
     key=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
     uri="file:$dir/cli.db?hpplite=on&privkey=0x$key&datadir=$dir"
     mod=${ext%.*}

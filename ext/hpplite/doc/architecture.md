@@ -184,6 +184,18 @@ so the background flush never touches the application's transaction state.
 File databases are switched to WAL and both connections get a 5 s busy
 timeout; readers and the writer then never block each other.
 
+Several connections, one log. A transaction is named by the rowid of its
+first logged row (`txn = 0` in the row means "my own id"), so transaction
+groups are unique across every connection and process that writes the
+file - there is no counter to keep in step. Within a process the first
+`hpplite=on` connection to a file is the sequencer; later ones detect it
+(canonical path in the connection registry) and become followers: hooks
+installed, same `_hpplite_pending`, no bookkeeping connection, L1, lease
+or timer. The sequencer's flush posts everyone's rows. Across processes
+the lease does the same job: both capture, the lease holder posts. A plain
+connection (no `hpplite=on`) is not captured, so every writer must open
+with it.
+
 Reopening a file continues at the recorded height. If L1 is ahead (a fresh
 file, or history written elsewhere), the missing batches are replayed with
 tracking disabled and are not logged again. If local pending SQL and the

@@ -1015,6 +1015,63 @@ static void test_no_commit_under_app_read(void) {
     PASS();
 }
 
+/* 27. Two hpplite=on connections to one file: one sequencer, one follower, one log */
+static void test_second_connection_is_follower(void) {
+    TEST("second connection to the same file captures into the shared log; sequencer posts all");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/pool.db", l1);
+    if (!a) FAIL("open a");
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "b"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
+    config.dataDir = DIR; config.dbPath = DIR "/pool.db";
+    HppliteNode *b = hpplite_node_create(&config);
+    if (!b) FAIL("open b");
+    if (!b->follower || a->follower) FAIL("b should be the follower, a the sequencer");
+    hpplite_node_set_l1(b, l1);
+    if (hpplite_node_start(b) != 0 || b->hasLease) FAIL("follower never claims the lease");
+
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, who)", NULL);
+    hpplite_node_exec(a, "INSERT INTO t VALUES(1,'a')", NULL);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(2,'b')", NULL);
+    hpplite_node_exec(b, "BEGIN; INSERT INTO t VALUES(3,'b'); INSERT INTO t VALUES(4,'b'); COMMIT", NULL);
+    hpplite_node_exec(a, "BEGIN; INSERT INTO t VALUES(5,'a'); INSERT INTO t VALUES(6,'a'); COMMIT", NULL);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(7,'b')", NULL);
+    if (hpplite_node_pending_count(a) != 8 || hpplite_node_pending_count(b) != 8) FAIL("both see the shared log");
+    if (hpplite_node_flush_batch(b) != 0) FAIL("follower must not post");
+    if (hpplite_node_flush_batch(a) != 1) FAIL("sequencer posts");
+    HppliteBatch *batch = hpplite_node_fetch_batch(a, 1);
+    if (!batch || batch->nTxns != 8) FAIL("one batch with every statement from both connections");
+    /* transaction ids come from the log, so groups are right across connections */
+    if (batch->aTxns[3].txn != batch->aTxns[4].txn) FAIL("b's transaction (3,4) should be one group");
+    if (batch->aTxns[5].txn != batch->aTxns[6].txn) FAIL("a's transaction (5,6) should be one group");
+    if (batch->aTxns[2].txn == batch->aTxns[3].txn || batch->aTxns[4].txn == batch->aTxns[5].txn
+        || batch->aTxns[6].txn == batch->aTxns[7].txn) FAIL("separate transactions must not share a group");
+    hpplite_batch_free(batch);
+
+    /* the sequencer closes first; the follower keeps capturing into the file,
+    ** and the next sequencer to open posts what it left */
+    hpplite_node_destroy(a);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(8,'b-after')", NULL);
+    if (hpplite_node_flush_batch(b) != 0 || hpplite_node_pending_count(b) != 1) FAIL("follower still posts nothing");
+    hpplite_node_destroy(b);
+    HppliteNode *c = open_node(DIR "/pool.db", l1);
+    if (!c) FAIL("reopen");
+    if (c->follower) FAIL("with a and b gone, c is the sequencer");
+    if (hpplite_node_pending_count(c) != 1 || hpplite_node_flush_batch(c) != 2) FAIL("c posts the follower's leftover");
+    unsigned char rootC[32], rootR[32];
+    hpplite_node_get_state_root(c, rootC);
+    hpplite_node_destroy(c);
+    HppliteNode *r = open_node(DIR "/pool_r.db", l1);
+    if (!r) FAIL("reader");
+    hpplite_node_get_state_root(r, rootR);
+    if (count_rows(r->db, "t") != 8 || memcmp(rootC, rootR, 32) != 0) FAIL("rebuild from the merged log");
+    r->l1 = NULL; hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1043,6 +1100,7 @@ int main(void) {
     test_memory_no_timer();
     test_close_busy_keeps_capturing();
     test_no_commit_under_app_read();
+    test_second_connection_is_follower();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

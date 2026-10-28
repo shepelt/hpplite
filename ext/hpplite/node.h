@@ -119,6 +119,11 @@ typedef struct HppliteNode {
     /* Ownership flags */
     int ownsDb;
     int ownsL1;
+
+    /* One sequencer per file per process: later hpplite=on connections to
+    ** the same file capture into the shared log and post nothing */
+    char *canonicalPath;
+    int follower;
 } HppliteNode;
 
 /*

@@ -15,6 +15,7 @@
 #include "node.h"
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <stdio.h>
 #include <time.h>
 #include <pthread.h>
@@ -159,6 +160,24 @@ static void node_set_stmt_limit(HppliteNode *node) {
     node->ctx->maxStmtBytes = limit;
 }
 
+/*
+** Is another connection in this process already sequencing this file? Then
+** this one only captures: the log lives in the file and is shared, the
+** sequencer's flush posts everyone's rows. No L1, lease or timer here.
+*/
+static void node_detect_follower(HppliteNode *node) {
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    char resolved[PATH_MAX];
+    if (!zFile || !zFile[0]) return;
+    if (!realpath(zFile, resolved)) return;
+    node->canonicalPath = node_strdup(resolved);
+    if (hpplite_find_sequencer(resolved)) {
+        node->follower = 1;
+        fprintf(stderr, "hpplite: %s is already sequenced by another connection in this process; "
+                        "this connection captures only\n", zFile);
+    }
+}
+
 static int node_init_tracking(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     int rc;
@@ -191,6 +210,7 @@ static int node_init_tracking(HppliteNode *node) {
         node->batchesSinceCheckpoint = (int)(node->ctx->blockHeight - 1 - node->lastCheckpointHeight);
     node->lastFlushTime = node_current_time_ms();
     node_set_stmt_limit(node);
+    node_detect_follower(node);
     return SQLITE_OK;
 }
 
@@ -200,6 +220,7 @@ static void node_learn_batch_limit(HppliteNode *node);
 ** Auto-connect to L1 and sync state.
 */
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
+    if (node->follower) return;
     if (!config->rpcUrl) return;
     if (!config->hasContract && !config->hasFactory) return;
     node->wantsL1 = 1;
@@ -401,6 +422,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.dataDir);
     sqlite3_free(node->config.dbPath);
     sqlite3_free(node->config.rpcUrl);
+    sqlite3_free(node->canonicalPath);
     if (node->flushMutex) {
         pthread_mutex_destroy((pthread_mutex_t *)node->flushMutex);
         sqlite3_free(node->flushMutex);
@@ -720,6 +742,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     int more;
 
     if (!node->ctx) return 0;
+    if (node->follower) return 0;          /* the sequencer connection posts */
     node->lastFlushTime = node_current_time_ms();
 
     /* Finish anything a previous attempt left on L1; if L1 holds history
@@ -862,6 +885,7 @@ void hpplite_node_start_timer(HppliteNode *node) {
     if (!node) return;
     if (node->config.batchIntervalMs <= 0) return;
     if (node->timerRunning) return;
+    if (node->follower) return;
     if (!node->bkDb) {
         /* In-memory databases have no bookkeeping connection: a timer would
         ** run BEGIN/COMMIT on the application's connection from another
@@ -973,7 +997,7 @@ int hpplite_node_start(HppliteNode *node) {
     if (node->state == HPPLITE_STATE_RUNNING) return 0;
 
     /* Try to claim sequencer lease */
-    if (node->l1) {
+    if (node->l1 && !node->follower) {
         if (hpplite_node_claim_lease(node) != 0) {
             return -1;  /* Failed to claim lease */
         }
