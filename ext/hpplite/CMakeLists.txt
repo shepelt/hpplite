@@ -157,6 +157,11 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_checkpoint_flow hpplite)
         add_executable(test_durability tests/unit/test_durability.c)
         target_link_libraries(test_durability hpplite)
+
+        # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
+        add_executable(bench_hpplite tests/bench/bench_hpplite.c)
+        target_link_libraries(bench_hpplite hpplite)
+        add_custom_target(bench COMMAND bench_hpplite DEPENDS bench_hpplite USES_TERMINAL)
     endif()
 
     # Loadable extension against stock SQLite: links only the amalgamation,

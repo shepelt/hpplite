@@ -34,6 +34,11 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Microbenchmark
+- `tests/bench/bench_hpplite.c` (`make bench`), reference numbers in
+  `doc/performance.md`; found the O(n^2) size-limit cut and the
+  failed-statement-in-transaction capture hole
+
 ### v0.1 wrap-up (issues #10, #13)
 - State root at checkpoint cadence: only the interval-closing batch carries
   `state_root`; the flush loop submits the checkpoint automatically (before,

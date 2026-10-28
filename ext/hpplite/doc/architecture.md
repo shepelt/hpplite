@@ -141,9 +141,19 @@ How a statement gets logged: SQLite's statement trace fires at the start of
 every statement on the connection. HPPLite inserts the statement text (with
 bound parameters expanded) into `_hpplite_pending` through the same
 connection. Because the insert runs inside the statement's own transaction
-(implicit or explicit), a failed statement or a `ROLLBACK` discards the log
-row too. No separate journal, no sync interval, no durability model beyond
-SQLite's own.
+(implicit or explicit), a `ROLLBACK` discards the log row too, and in
+autocommit so does a failed statement. No separate journal, no sync
+interval, no durability model beyond SQLite's own.
+
+Inside an explicit transaction a failed statement only undoes its own
+changes, so when a logged statement completes HPPLite checks whether it had
+any effect (rows changed or schema changed) and deletes the log row if not:
+failed statements and no-ops are never replayed. SQLite reports a
+statement's error only after the trace sees it finish, so effect is the
+signal; its one blind spot is a statement whose triggers changed rows
+before it aborted. Replay therefore skips any statement that fails
+(`hpplite_status.replay_skipped`), which reproduces what happened at the
+sequencer, and the checkpoint root remains the arbiter of equivalence.
 
 Flushing a batch:
 

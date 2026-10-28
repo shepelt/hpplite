@@ -49,6 +49,12 @@ struct HppliteCtx {
   int bInternal;              /* Set while HPPLite runs its own statements */
   uint64_t txnSeq;            /* Groups pending SQL by transaction */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
+  sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
+  sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
+  sqlite3_int64 lastLogId;    /* ...and that row's id */
+  sqlite3_int64 changesAtLog; /* total_changes when it was logged */
+  int schemaAtLog;            /* schema_version when it was logged */
+  sqlite3_stmt *pSchemaStmt;  /* Cached PRAGMA schema_version */
 
   /* Mirror of _hpplite_meta (the row in the database is authoritative) */
   uint64_t blockHeight;       /* Next batch height to produce */
@@ -62,6 +68,7 @@ struct HppliteCtx {
   int bRootDirty;
 
   uint64_t nLogErrors;        /* Statements that could not be logged */
+  uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
 
   /* Callbacks for external integration */
   void *pCallbackArg;

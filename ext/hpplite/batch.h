@@ -9,6 +9,7 @@
 #define HPPLITE_BATCH_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -142,6 +143,18 @@ void hpplite_checkpoint_hash(
   const HppliteCheckpoint *pCheckpoint,
   unsigned char *pHashOut  /* 32 bytes */
 );
+
+/*
+** Number of bytes a statement occupies in the batch JSON (escaped text plus
+** the per-statement framing). Used to cut batches at the DA size limit
+** without serializing.
+*/
+size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn);
+
+/*
+** Bytes of batch JSON outside the statements (header, roots, brackets).
+*/
+size_t hpplite_batch_json_overhead(void);
 
 /*
 ** Helper: convert bytes to hex string

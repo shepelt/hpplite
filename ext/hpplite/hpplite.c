@@ -411,11 +411,75 @@ static int isTrackedSql(const char *z) {
   return 1;
 }
 
+static sqlite3_int64 totalChanges(sqlite3 *db) {
+#if SQLITE_VERSION_NUMBER >= 3037000
+  return sqlite3_total_changes64(db);
+#else
+  return sqlite3_total_changes(db);
+#endif
+}
+
+static int schemaVersion(HppliteCtx *pCtx) {
+  int v = -1;
+  if (!pCtx->pSchemaStmt) {
+    if (sqlite3_prepare_v3(pCtx->db, "PRAGMA schema_version", -1, SQLITE_PREPARE_PERSISTENT,
+                           &pCtx->pSchemaStmt, NULL) != SQLITE_OK) {
+      pCtx->pSchemaStmt = NULL;
+      return -1;
+    }
+  }
+  if (sqlite3_step(pCtx->pSchemaStmt) == SQLITE_ROW) v = sqlite3_column_int(pCtx->pSchemaStmt, 0);
+  sqlite3_reset(pCtx->pSchemaStmt);
+  return v;
+}
+
 /*
-** Trace callback: runs at the start of every statement on the application
-** connection. Writes the statement text into _hpplite_pending through the
-** same connection, so the row is part of whatever transaction the statement
-** runs in - it commits with the statement and rolls back with it.
+** A logged statement finished. If it had no effect, remove its log row.
+**
+** A statement's error is not observable from the trace (the profile
+** callback runs before SQLite records the result code), but its effect is:
+** rows changed (sqlite3_total_changes, which excludes the rows of an
+** aborted statement) or a schema change. A statement with neither either
+** failed or was a no-op; replaying it adds nothing and, if it failed, would
+** fail again - or succeed elsewhere and diverge.
+**
+** In autocommit a failed statement's implicit transaction already rolled
+** the row back. Inside an explicit transaction a failed statement only
+** undoes its own changes, and the log row was written by a separate
+** statement, so it would survive to COMMIT. The DELETE runs inside the same
+** transaction.
+*/
+static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  if (pS != pCtx->pLastLogged) return;
+  pCtx->pLastLogged = NULL;
+
+  pCtx->bInternal = 1;
+  if (totalChanges(pCtx->db) != pCtx->changesAtLog
+      || schemaVersion(pCtx) != pCtx->schemaAtLog) {
+    pCtx->bInternal = 0;
+    return;   /* had an effect: keep */
+  }
+  if (!pCtx->pUnlogStmt) {
+    if (sqlite3_prepare_v3(pCtx->db, "DELETE FROM _hpplite_pending WHERE id = ?1",
+                           -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pUnlogStmt, NULL) != SQLITE_OK) {
+      pCtx->pUnlogStmt = NULL;
+    }
+  }
+  if (pCtx->pUnlogStmt) {
+    sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->lastLogId);
+    sqlite3_step(pCtx->pUnlogStmt);
+    sqlite3_reset(pCtx->pUnlogStmt);
+  }
+  pCtx->bInternal = 0;
+}
+
+/*
+** Trace callback. SQLITE_TRACE_STMT runs at the start of every statement on
+** the application connection: the statement text is written into
+** _hpplite_pending through the same connection, so the row is part of
+** whatever transaction the statement runs in - it commits with the
+** statement and rolls back with it. SQLITE_TRACE_PROFILE runs when the
+** statement finishes and removes the row again if the statement failed.
 */
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
@@ -423,9 +487,13 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   const char *zSql = (const char*)pX;
   char *zExpanded;
   int rc;
-  (void)mask;
 
-  if (!pCtx || !pCtx->bEnabled || pCtx->bInternal || !zSql) return 0;
+  if (!pCtx || !pCtx->bEnabled || pCtx->bInternal) return 0;
+  if (mask == SQLITE_TRACE_PROFILE) {
+    hppliteStatementDone(pCtx, pS);
+    return 0;
+  }
+  if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
   if (!isTrackedSql(zSql)) return 0;
   if (strstr(zSql, "_hpplite_")) return 0;  /* never log our own tables */
 
@@ -443,6 +511,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     sqlite3_bind_int64(pCtx->pLogStmt, 1, (sqlite3_int64)pCtx->txnSeq);
     sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded ? zExpanded : zSql, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(pCtx->pLogStmt);
+    if (rc == SQLITE_DONE) {
+      pCtx->pLastLogged = pS;
+      pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      pCtx->changesAtLog = totalChanges(pCtx->db);
+      pCtx->schemaAtLog = schemaVersion(pCtx);
+    }
     sqlite3_reset(pCtx->pLogStmt);
     sqlite3_clear_bindings(pCtx->pLogStmt);
   } else {
@@ -509,7 +583,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
 
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
-  sqlite3_trace_v2(db, SQLITE_TRACE_STMT, hppliteTraceCallback, pCtx);
+  sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
 
   *ppCtx = pCtx;
   return SQLITE_OK;
@@ -522,6 +596,8 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   sqlite3_rollback_hook(pCtx->db, NULL, NULL);
   sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
   if (pCtx->pLogStmt) sqlite3_finalize(pCtx->pLogStmt);
+  if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
+  if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
   sqlite3_free(pCtx);
 }
 
@@ -647,14 +723,27 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   if (bkBegin(pCtx, 0) != SQLITE_OK) return NULL;
   pCtx->bInternal = 1;
 
+  /* Read pending rows in order. With a size limit, stop as soon as the
+  ** estimated JSON size passes it: the rest belongs to later batches, and
+  ** a large backlog must not be re-read for every chunk. */
+  size_t estSize = hpplite_batch_json_overhead();
+  int overLimit = 0;
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT id, txn, sql FROM _hpplite_pending ORDER BY id", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
       sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
+      const char *zSql = (const char*)sqlite3_column_text(pStmt, 2);
       if (!pBatch) {
         pBatch = hpplite_batch_new(pCtx->blockHeight);
         if (!pBatch) break;
+      }
+      if (maxBytes > 0) {
+        estSize += hpplite_batch_stmt_json_size(zSql, -1, txnRel);
+        if (estSize > maxBytes && pBatch->nTxns > 0) {
+          overLimit = 1;          /* this row starts the next batch */
+          break;
+        }
       }
       if (pBatch->nTxns >= nAlloc) {
         sqlite3_int64 *aNew;
@@ -664,11 +753,12 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
         aId = aNew;
       }
       if (txn != lastTxn) { txnRel++; lastTxn = txn; }
-      hpplite_batch_add_stmt(pBatch, (const char*)sqlite3_column_text(pStmt, 2), -1, txnRel);
+      hpplite_batch_add_stmt(pBatch, zSql, -1, txnRel);
       aId[pBatch->nTxns - 1] = sqlite3_column_int64(pStmt, 0);
     }
     sqlite3_finalize(pStmt);
   }
+  if (pBatch && overLimit) pBatch->partial = 1;
 
   if (pBatch) {
     pBatch->timestamp = (uint64_t)time(NULL);
@@ -686,8 +776,9 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   pCtx->bInternal = 0;
   bkEnd(pCtx, SQLITE_OK);
 
-  /* Trim to the size limit: drop trailing statements until the JSON fits,
-  ** then back up to a transaction boundary when that leaves anything. */
+  /* The estimate is conservative; confirm with one real serialization and
+  ** drop trailing statements in the rare case it still does not fit. Then
+  ** back up to a transaction boundary when that leaves anything. */
   if (pBatch && maxBytes > 0) {
     int nFull = pBatch->nTxns;
     for (;;) {
@@ -833,6 +924,18 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       lastTxn = pBatch->aTxns[i].txn;
     }
     if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, zSql, NULL, NULL, NULL);
+    if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
+      /* The statement failed here as it did at the sequencer (a failed
+      ** statement has no effect, so it is skipped there and skipped here;
+      ** capture removes most of them, but not one whose triggers changed
+      ** rows before it aborted). A statement-level failure leaves an open
+      ** transaction usable; anything that rolled it back is fatal. */
+      if (open && sqlite3_get_autocommit(pCtx->db)) break;
+      pCtx->nReplaySkipped++;
+      fprintf(stderr, "hpplite: batch %llu statement %d failed on replay (%s); skipped\n",
+              (unsigned long long)pBatch->height, i, sqlite3_errmsg(pCtx->db));
+      rc = SQLITE_OK;
+    }
   }
   if (open) {
     if (rc == SQLITE_OK) rc = sqlite3_exec(pCtx->db, "COMMIT", NULL, NULL, NULL);
@@ -842,8 +945,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   pCtx->bEnabled = savedEnabled;
   pCtx->bRootDirty = 1;
   if (rc != SQLITE_OK) {
-    fprintf(stderr, "hpplite: replay of batch %llu failed: %s\n",
-            (unsigned long long)pBatch->height, sqlite3_errmsg(pCtx->db));
+    fprintf(stderr, "hpplite: replay of batch %llu failed at statement %d (rc=%d): %s\n",
+            (unsigned long long)pBatch->height, i, rc, sqlite3_errmsg(pCtx->db));
     return rc;
   }
 
@@ -1034,6 +1137,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_LAST_CHECKPOINT 4
 #define STATUS_COL_LEASE 5
 #define STATUS_COL_LOG_ERRORS 6
+#define STATUS_COL_REPLAY_SKIPPED 7
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1043,7 +1147,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
     rc = sqlite3_declare_vtab(db,
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
-        " log_errors INTEGER)");
+        " log_errors INTEGER, replay_skipped INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1134,6 +1238,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_LOG_ERRORS:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nLogErrors);
+            break;
+        case STATUS_COL_REPLAY_SKIPPED:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nReplaySkipped);
             break;
         default:
             sqlite3_result_null(ctx);

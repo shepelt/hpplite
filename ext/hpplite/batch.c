@@ -148,6 +148,36 @@ static char *json_escape_string(const char *zIn) {
 }
 
 /*
+** Length json_escape_string() would produce, without allocating
+*/
+static size_t json_escaped_len(const char *zIn) {
+  size_t n = 0;
+  const char *p;
+  for (p = zIn; *p; p++) {
+    switch (*p) {
+      case '"': case '\\': case '\b': case '\f': case '\n': case '\r': case '\t':
+        n += 2; break;
+      default:
+        n += ((unsigned char)*p < 0x20) ? 6 : 1;
+    }
+  }
+  return n;
+}
+
+size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn) {
+  /*    {"sql": "...", "txn": N[, "rows_affected": M]},\n   */
+  size_t n = 4 + 9 + json_escaped_len(zSql ? zSql : "") + 10 + 20 + 3;
+  if (nRowsAffected >= 0) n += 20 + 20;
+  (void)txn;
+  return n;
+}
+
+size_t hpplite_batch_json_overhead(void) {
+  /* height, timestamp, state_root, partial, "transactions": [ ] and braces */
+  return 256;
+}
+
+/*
 ** Serialize batch to JSON
 */
 char *hpplite_batch_to_json(const HppliteBatch *pBatch) {

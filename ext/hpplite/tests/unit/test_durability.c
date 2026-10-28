@@ -639,6 +639,38 @@ static void test_slow_confirmation(void) {
     PASS();
 }
 
+/* 18. A statement that failed at the sequencer but was logged (trigger changed
+**     rows before the abort) is skipped on replay; content and root match */
+static void test_replay_skips_failed_statement(void) {
+    TEST("statement failed at sequencer is skipped on replay, content identical");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/skip_a.db", l1);
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(a, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET v=upper(v) WHERE id=NEW.id; END", NULL);
+    hpplite_node_exec(a, "INSERT INTO t VALUES(1,'a')", NULL);
+    hpplite_node_exec(a, "BEGIN", NULL);
+    hpplite_node_exec(a, "INSERT INTO t VALUES(50,'x'),(1,'dup')", NULL);   /* trigger ran, then abort */
+    hpplite_node_exec(a, "INSERT INTO t VALUES(2,'b')", NULL);
+    hpplite_node_exec(a, "COMMIT", NULL);
+    if (count_rows(a->db, "t") != 2) FAIL("sequencer content");
+    if (hpplite_node_flush_batch(a) != 1) FAIL("flush");
+    unsigned char ra[32]; hpplite_node_get_state_root(a, ra);
+    hpplite_node_destroy(a);
+
+    HppliteNode *b = open_node(DIR "/skip_b.db", l1);
+    if (!b) FAIL("open b (replay)");
+    if (count_rows(b->db, "t") != 2) FAIL("replayed content differs");
+    unsigned char rb[32]; hpplite_node_get_state_root(b, rb);
+    if (memcmp(ra, rb, 32) != 0) FAIL("root differs after replay");
+    if (b->ctx->nReplaySkipped > 1) FAIL("at most the aborted statement should be skipped");
+    b->l1 = NULL;
+    hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -658,6 +690,7 @@ int main(void) {
     test_sync_function();
     test_batch_size_limit();
     test_slow_confirmation();
+    test_replay_skips_failed_statement();
     system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

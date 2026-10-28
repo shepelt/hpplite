@@ -131,9 +131,12 @@ cmake --build ext/hpplite/build_real
 ctest                    # 13 suites, ~6s: core, batch, node, open API,
                          # durability (16 cases), loadable extension, docs check
 
-# Integration tests (real L1, requires funded wallet)
+# Integration tests (real L1, requires funded wallet); also runs the examples
 export HPPLITE_PRIVATE_KEY=0x...
 ./tests/integration/run_integration.sh
+
+# Microbenchmark (write overhead, flush, replay, root hash); see doc/performance.md
+make bench
 ```
 
 ## Gas Costs (HPP Sepolia)

@@ -222,6 +222,41 @@ static void test_statement_classification(void) {
 
     exec(db, "BEGIN; INSERT INTO t VALUES(20,'r'); ROLLBACK;");
     if (pending_has(ctx, "'r'")) FAIL("rolled-back statement was logged");
+
+    /* a statement that fails inside a transaction which then COMMITs */
+    int before2 = hpplite_pending_count(ctx);
+    exec(db, "BEGIN");
+    exec(db, "INSERT INTO t VALUES(30,'ok')");
+    exec(db, "INSERT INTO t VALUES(1,'dup-in-txn')");      /* fails, txn continues */
+    exec(db, "INSERT INTO t VALUES(31,'ok2')");
+    exec(db, "COMMIT");
+    if (pending_has(ctx, "'dup-in-txn'")) FAIL("failed statement inside a committed txn was logged");
+    if (hpplite_pending_count(ctx) != before2 + 2) FAIL("the two successful statements should be logged");
+
+    /* same through a prepared statement stepped directly */
+    sqlite3_prepare_v2(db, "INSERT INTO t VALUES(?, 'p')", -1, &stmt, NULL);
+    exec(db, "BEGIN");
+    sqlite3_bind_int(stmt, 1, 1); sqlite3_step(stmt); sqlite3_reset(stmt);   /* dup: fails */
+    sqlite3_bind_int(stmt, 1, 40); sqlite3_step(stmt); sqlite3_reset(stmt);  /* ok */
+    sqlite3_finalize(stmt);
+    exec(db, "COMMIT");
+    if (pending_has(ctx, "VALUES(1, 'p')")) FAIL("failed prepared statement was logged");
+    if (pending_has(ctx, "VALUES(40, 'p')") != 1) FAIL("successful prepared statement not logged");
+
+    /* statements with no effect are not worth replaying; DDL is kept */
+    exec(db, "UPDATE t SET v='none' WHERE id=99999");
+    if (pending_has(ctx, "'none'")) FAIL("no-op UPDATE should not be logged");
+    exec(db, "INSERT OR IGNORE INTO t VALUES(1,'ignored')");
+    if (pending_has(ctx, "'ignored'")) FAIL("ignored INSERT should not be logged");
+    exec(db, "CREATE INDEX t_v ON t(v)");
+    if (pending_has(ctx, "CREATE INDEX t_v") != 1) FAIL("DDL must be logged");
+    /* a multi-row INSERT aborted mid-way (table without triggers: with a
+    ** trigger that changed rows first, SQLite reports changes for the
+    ** aborted statement and capture cannot tell; replay skips it instead) */
+    exec(db, "CREATE TABLE u(id INTEGER PRIMARY KEY, v); INSERT INTO u VALUES(1,'a');");
+    exec(db, "BEGIN; INSERT INTO u VALUES(50,'x'),(1,'dup-multi'); COMMIT;");
+    if (pending_has(ctx, "'dup-multi'")) FAIL("aborted multi-row INSERT was logged");
+    exec(db, "ROLLBACK");   /* the aborted exec string never reached COMMIT */
     close_ctx(db, ctx);
     PASS();
 }
