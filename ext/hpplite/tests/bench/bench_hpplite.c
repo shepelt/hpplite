@@ -149,7 +149,7 @@ static void bench_flush_and_replay(int rows) {
             double t1 = now_ms();
             for (int i = 0; i < 5; i++) {
                 size_t sl = 0;
-                uint8_t *s = hpplite_envelope_seal(n->cipher, n->encKey, 1, plain, plainLen, &sl);
+                uint8_t *s = hpplite_envelope_seal(n->cipher, n->encKey, 1, HPPLITE_ENCODING_NONE, plain, plainLen, &sl);
                 free(s);
             }
             double seal = (now_ms() - t1) / 5;

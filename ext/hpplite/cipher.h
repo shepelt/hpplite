@@ -12,10 +12,14 @@
 ** rollup can read it and no extra secret exists.
 **
 ** Envelope (binary, posted as the batch bytes):
-**   "HPE1" | scheme id (1) | nonce (12) | ciphertext || tag (16)
-** Associated data: scheme id | height (8 bytes big-endian), so a ciphertext
-** cannot be moved to another height. A payload that does not start with
-** "HPE1" is treated as plaintext JSON (batches written before encryption).
+**   "HPE2" | scheme id (1) | encoding (1) | nonce | ciphertext || tag
+** encoding: how the payload was transformed before sealing - 0 = none,
+** 1 = deflate (compression lives inside the envelope: ciphertext does not
+** compress). Associated data: scheme id | encoding | height (8 bytes
+** big-endian), so a ciphertext cannot be moved to another height.
+** "HPE1" (no encoding byte) is the v0.1 pre-release layout and still opens.
+** A payload that starts with neither is plaintext JSON (history written
+** before encryption, or encrypt=off).
 */
 
 #ifndef HPPLITE_CIPHER_H
@@ -29,8 +33,14 @@ extern "C" {
 #endif
 
 #define HPPLITE_CIPHER_KEY_SIZE 32
-#define HPPLITE_ENVELOPE_MAGIC "HPE1"
+#define HPPLITE_ENVELOPE_MAGIC "HPE2"
+#define HPPLITE_ENVELOPE_MAGIC_V1 "HPE1"
 #define HPPLITE_ENVELOPE_MAGIC_LEN 4
+#define HPPLITE_ENVELOPE_HEADER_LEN (HPPLITE_ENVELOPE_MAGIC_LEN + 2)   /* magic, scheme, encoding */
+
+/* Payload encodings (applied before sealing, undone after opening) */
+#define HPPLITE_ENCODING_NONE 0
+#define HPPLITE_ENCODING_DEFLATE 1
 
 typedef struct HppliteCipher {
     const char *name;
@@ -68,8 +78,12 @@ void hpplite_cipher_derive_key(const uint8_t privkey[32], uint8_t key[32]);
 ** and its length, or NULL on failure.
 */
 uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32],
-                               uint64_t height, const uint8_t *payload, size_t payloadLen,
+                               uint64_t height, uint8_t encoding,
+                               const uint8_t *payload, size_t payloadLen,
                                size_t *pOutLen);
+
+/* Bytes the envelope adds around the (encoded) payload */
+size_t hpplite_envelope_overhead(const HppliteCipher *cipher);
 
 /*
 ** Is this an envelope (vs plaintext JSON)?
@@ -84,6 +98,9 @@ int hpplite_envelope_is_sealed(const uint8_t *data, size_t len);
 uint8_t *hpplite_envelope_open(const uint8_t key[32], uint64_t height,
                                const uint8_t *data, size_t len, size_t *pOutLen,
                                const HppliteCipher **pScheme);
+
+/* Encoding byte of a sealed envelope (HPPLITE_ENCODING_NONE for HPE1), or -1 */
+int hpplite_envelope_encoding(const uint8_t *data, size_t len);
 
 /* Primitives, exposed for tests */
 void hpplite_hmac_sha256(const uint8_t *key, size_t keyLen, const uint8_t *msg, size_t msgLen, uint8_t out[32]);

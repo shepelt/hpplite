@@ -26,9 +26,10 @@ static void test_roundtrip(void) {
     hpplite_batch_add_stmt(b, "INSERT INTO users (name) VALUES ('Bob')", -1, 1);
     json = hpplite_batch_to_json(b);
     if (!json) FAIL("to_json");
-    if (!strstr(json, "\"height\": 7")) FAIL("height missing");
-    if (!strstr(json, "\"txn\": 1")) FAIL("txn group missing");
-    if (!strstr(json, "\"state_root\": \"a1b2c3d4")) FAIL("state_root missing");
+    if (!strstr(json, "\"height\":7")) FAIL("height missing");
+    if (!strstr(json, "\"txn\":1")) FAIL("txn group missing");
+    if (!strstr(json, "\"state_root\":\"a1b2c3d4")) FAIL("state_root missing");
+    if (strchr(json, '\n') || strstr(json, ": ")) FAIL("batch JSON should be compact");
     if (strstr(json, "\"partial\"")) FAIL("partial must be absent for a full batch");
     p = hpplite_batch_from_json(json);
     if (!p) FAIL("from_json");
@@ -103,7 +104,7 @@ static void test_legacy_and_partial(void) {
     b->partial = 1;
     hpplite_batch_add_txn(b, "X", -1);
     json = hpplite_batch_to_json(b);
-    if (!json || !strstr(json, "\"partial\": 1")) FAIL("partial not serialized");
+    if (!json || !strstr(json, "\"partial\":1")) FAIL("partial not serialized");
     p = hpplite_batch_from_json(json);
     if (!p || !p->partial) FAIL("partial not parsed");
     sqlite3_free(json);

@@ -479,7 +479,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     /* The DA limit applies to the posted bytes: leave room for the envelope */
     size_t maxBytes = node->config.maxBatchBytes;
     if (node->cipher && maxBytes > 0) {
-        size_t overhead = HPPLITE_ENVELOPE_MAGIC_LEN + 1 + node->cipher->nonceLen + node->cipher->tagLen;
+        size_t overhead = hpplite_envelope_overhead(node->cipher);
         maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;
     }
     batch = hpplite_build_batch_limited(ctx, maxBytes, withRoot, &maxId);
@@ -513,7 +513,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             uint8_t *sealed = NULL;
             if (node->cipher) {
                 sealed = hpplite_envelope_seal(node->cipher, node->encKey, height,
-                                               payload, payloadLen, &payloadLen);
+                                               HPPLITE_ENCODING_NONE, payload, payloadLen, &payloadLen);
                 payload = sealed;
             }
             if (payload) {

@@ -165,9 +165,9 @@ static size_t json_escaped_len(const char *zIn) {
 }
 
 size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn) {
-  /*    {"sql": "...", "txn": N[, "rows_affected": M]},\n   */
-  size_t n = 4 + 9 + json_escaped_len(zSql ? zSql : "") + 10 + 20 + 3;
-  if (nRowsAffected >= 0) n += 20 + 20;
+  /*    {"sql":"...","txn":N[,"rows_affected":M]},   */
+  size_t n = 1 + 7 + json_escaped_len(zSql ? zSql : "") + 8 + 20 + 2;
+  if (nRowsAffected >= 0) n += 17 + 20;
   (void)txn;
   return n;
 }
@@ -189,38 +189,34 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
 
   pStr = sqlite3_str_new(NULL);
 
-  sqlite3_str_appendf(pStr, "{\n");
-  sqlite3_str_appendf(pStr, "  \"height\": %llu,\n", (unsigned long long)pBatch->height);
-  sqlite3_str_appendf(pStr, "  \"timestamp\": %llu,\n", (unsigned long long)pBatch->timestamp);
+  /* Compact: no whitespace. Framing was 40% of a pretty-printed batch and
+  ** nobody reads it on L1 (it is sealed); the parser accepts both forms. */
+  sqlite3_str_appendf(pStr, "{\"height\":%llu,", (unsigned long long)pBatch->height);
+  sqlite3_str_appendf(pStr, "\"timestamp\":%llu,", (unsigned long long)pBatch->timestamp);
 
   if (pBatch->hasRoot) {
     /* Content hash after this batch; present only on batches that close a
     ** checkpoint interval (computing it is O(database size)) */
     hpplite_to_hex(pBatch->postStateRoot, HPPLITE_HASH_SIZE, hexBuf);
-    sqlite3_str_appendf(pStr, "  \"state_root\": \"%s\",\n", hexBuf);
+    sqlite3_str_appendf(pStr, "\"state_root\":\"%s\",", hexBuf);
   }
   if (pBatch->partial) {
-    sqlite3_str_appendf(pStr, "  \"partial\": 1,\n");
+    sqlite3_str_appendf(pStr, "\"partial\":1,");
   }
 
-  sqlite3_str_appendf(pStr, "  \"transactions\": [\n");
-
+  sqlite3_str_appendf(pStr, "\"transactions\":[");
   for (i = 0; i < pBatch->nTxns; i++) {
     char *escaped = json_escape_string(pBatch->aTxns[i].zSql);
-    sqlite3_str_appendf(pStr, "    {\"sql\": \"%s\", \"txn\": %lld", escaped ? escaped : "",
+    sqlite3_str_appendf(pStr, "{\"sql\":\"%s\",\"txn\":%lld", escaped ? escaped : "",
                         (long long)pBatch->aTxns[i].txn);
     sqlite3_free(escaped);
-
     if (pBatch->aTxns[i].nRowsAffected >= 0) {
-      sqlite3_str_appendf(pStr, ", \"rows_affected\": %lld",
+      sqlite3_str_appendf(pStr, ",\"rows_affected\":%lld",
                           (long long)pBatch->aTxns[i].nRowsAffected);
     }
-
-    sqlite3_str_appendf(pStr, "}%s\n", (i < pBatch->nTxns - 1) ? "," : "");
+    sqlite3_str_appendf(pStr, "}%s", (i < pBatch->nTxns - 1) ? "," : "");
   }
-
-  sqlite3_str_appendf(pStr, "  ]\n");
-  sqlite3_str_appendf(pStr, "}");
+  sqlite3_str_appendf(pStr, "]}");
 
   return sqlite3_str_finish(pStr);
 }

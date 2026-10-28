@@ -328,28 +328,38 @@ int hpplite_random_bytes(uint8_t *out, size_t len) {
 /* ---------------------------------------------------------------------
 ** Envelope
 */
-static void envelope_ad(uint8_t ad[9], uint8_t scheme, uint64_t height) {
-  int i;
-  ad[0] = scheme;
-  for (i = 0; i < 8; i++) ad[1 + i] = (uint8_t)(height >> (56 - 8 * i));
+/* v2 associated data: scheme | encoding | height; v1 had no encoding byte */
+static size_t envelope_ad(uint8_t ad[10], int v1, uint8_t scheme, uint8_t encoding, uint64_t height) {
+  int i, k = 0;
+  ad[k++] = scheme;
+  if (!v1) ad[k++] = encoding;
+  for (i = 0; i < 8; i++) ad[k++] = (uint8_t)(height >> (56 - 8 * i));
+  return (size_t)k;
+}
+
+size_t hpplite_envelope_overhead(const HppliteCipher *cipher) {
+  return HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen + cipher->tagLen;
 }
 
 uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32],
-                               uint64_t height, const uint8_t *payload, size_t payloadLen,
+                               uint64_t height, uint8_t encoding,
+                               const uint8_t *payload, size_t payloadLen,
                                size_t *pOutLen) {
-  size_t headLen = HPPLITE_ENVELOPE_MAGIC_LEN + 1 + cipher->nonceLen;
+  size_t headLen = HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen;
   size_t outLen = headLen + payloadLen + cipher->tagLen;
   uint8_t *out = malloc(outLen);
-  uint8_t ad[9];
+  uint8_t ad[10];
+  size_t adLen;
   if (!out) return NULL;
   memcpy(out, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN);
   out[HPPLITE_ENVELOPE_MAGIC_LEN] = cipher->id;
-  if (hpplite_random_bytes(out + HPPLITE_ENVELOPE_MAGIC_LEN + 1, cipher->nonceLen) != 0) {
+  out[HPPLITE_ENVELOPE_MAGIC_LEN + 1] = encoding;
+  if (hpplite_random_bytes(out + HPPLITE_ENVELOPE_HEADER_LEN, cipher->nonceLen) != 0) {
     free(out);
     return NULL;
   }
-  envelope_ad(ad, cipher->id, height);
-  if (cipher->seal(key, out + HPPLITE_ENVELOPE_MAGIC_LEN + 1, ad, sizeof(ad),
+  adLen = envelope_ad(ad, 0, cipher->id, encoding, height);
+  if (cipher->seal(key, out + HPPLITE_ENVELOPE_HEADER_LEN, ad, adLen,
                    payload, payloadLen, out + headLen) != 0) {
     free(out);
     return NULL;
@@ -358,30 +368,45 @@ uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32
   return out;
 }
 
+static int envelope_version(const uint8_t *data, size_t len) {
+  if (!data || len < HPPLITE_ENVELOPE_MAGIC_LEN + 1) return 0;
+  if (memcmp(data, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN) == 0) return 2;
+  if (memcmp(data, HPPLITE_ENVELOPE_MAGIC_V1, HPPLITE_ENVELOPE_MAGIC_LEN) == 0) return 1;
+  return 0;
+}
+
 int hpplite_envelope_is_sealed(const uint8_t *data, size_t len) {
-  return data && len >= HPPLITE_ENVELOPE_MAGIC_LEN + 1
-      && memcmp(data, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN) == 0;
+  return envelope_version(data, len) != 0;
+}
+
+int hpplite_envelope_encoding(const uint8_t *data, size_t len) {
+  int v = envelope_version(data, len);
+  if (v == 2) return len > HPPLITE_ENVELOPE_MAGIC_LEN + 1 ? data[HPPLITE_ENVELOPE_MAGIC_LEN + 1] : -1;
+  if (v == 1) return HPPLITE_ENCODING_NONE;
+  return -1;
 }
 
 uint8_t *hpplite_envelope_open(const uint8_t key[32], uint64_t height,
                                const uint8_t *data, size_t len, size_t *pOutLen,
                                const HppliteCipher **pScheme) {
   const HppliteCipher *cipher;
-  size_t headLen, ctLen;
-  uint8_t ad[9];
+  size_t hdr, headLen, ctLen, adLen;
+  uint8_t ad[10], encoding = HPPLITE_ENCODING_NONE;
   uint8_t *out;
-  if (!hpplite_envelope_is_sealed(data, len)) return NULL;
+  int v = envelope_version(data, len);
+  if (!v) return NULL;
   cipher = hpplite_cipher_by_id(data[HPPLITE_ENVELOPE_MAGIC_LEN]);
   if (pScheme) *pScheme = cipher;
   if (!cipher) return NULL;
-  headLen = HPPLITE_ENVELOPE_MAGIC_LEN + 1 + cipher->nonceLen;
+  hdr = (v == 2) ? HPPLITE_ENVELOPE_HEADER_LEN : HPPLITE_ENVELOPE_MAGIC_LEN + 1;
+  if (v == 2) encoding = data[HPPLITE_ENVELOPE_MAGIC_LEN + 1];
+  headLen = hdr + cipher->nonceLen;
   if (len < headLen + cipher->tagLen) return NULL;
   ctLen = len - headLen;
   out = malloc(ctLen - cipher->tagLen + 1);
   if (!out) return NULL;
-  envelope_ad(ad, cipher->id, height);
-  if (cipher->open(key, data + HPPLITE_ENVELOPE_MAGIC_LEN + 1, ad, sizeof(ad),
-                   data + headLen, ctLen, out) != 0) {
+  adLen = envelope_ad(ad, v == 1, cipher->id, encoding, height);
+  if (cipher->open(key, data + hdr, ad, adLen, data + headLen, ctLen, out) != 0) {
     free(out);
     return NULL;
   }

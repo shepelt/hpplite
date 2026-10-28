@@ -74,11 +74,13 @@ static void test_envelope(void) {
     priv[0] ^= 1; hpplite_cipher_derive_key(priv, key2);
     if (memcmp(key, key2, 32) == 0) FAIL("different private keys gave the same batch key");
 
-    uint8_t *sealed = hpplite_envelope_seal(hpplite_cipher_default(), key, 7,
+    uint8_t *sealed = hpplite_envelope_seal(hpplite_cipher_default(), key, 7, HPPLITE_ENCODING_NONE,
                                             (const uint8_t*)payload, strlen(payload), &sealedLen);
     if (!sealed) FAIL("seal");
     if (!hpplite_envelope_is_sealed(sealed, sealedLen)) FAIL("not recognized as sealed");
-    if (sealedLen != strlen(payload) + 4 + 1 + 12 + 16) FAIL("envelope size");
+    if (sealedLen != strlen(payload) + hpplite_envelope_overhead(hpplite_cipher_default())) FAIL("envelope size");
+    if (memcmp(sealed, "HPE2", 4) != 0 || sealed[5] != HPPLITE_ENCODING_NONE) FAIL("v2 header");
+    if (hpplite_envelope_encoding(sealed, sealedLen) != HPPLITE_ENCODING_NONE) FAIL("encoding byte");
     if (memmem(sealed, sealedLen, "transactions", 12)) FAIL("plaintext visible in envelope");
 
     const HppliteCipher *scheme = NULL;
@@ -88,14 +90,32 @@ static void test_envelope(void) {
     free(opened);
     if (hpplite_envelope_open(key2, 7, sealed, sealedLen, &openLen, NULL) != NULL) FAIL("wrong key accepted");
     if (hpplite_envelope_open(key, 8, sealed, sealedLen, &openLen, NULL) != NULL) FAIL("ciphertext moved to another height accepted");
+    sealed[5] ^= 1;     /* encoding byte is authenticated */
+    if (hpplite_envelope_open(key, 7, sealed, sealedLen, &openLen, NULL) != NULL) FAIL("tampered encoding byte accepted");
+    sealed[5] ^= 1;
     sealed[4] = 0x7f;   /* unknown scheme id */
     if (hpplite_envelope_open(key, 7, sealed, sealedLen, &openLen, &scheme) != NULL || scheme != NULL) FAIL("unknown scheme accepted");
     free(sealed);
 
+    /* a v1 (HPE1) envelope, as written by the v0.1 pre-release, still opens */
+    {
+        uint8_t v1[4 + 1 + 12 + 64], ad[9];
+        const char *msg = "{\"height\":3}";
+        size_t n = strlen(msg);
+        memcpy(v1, "HPE1", 4); v1[4] = 1; memset(v1 + 5, 0x42, 12);
+        ad[0] = 1; for (int i = 0; i < 8; i++) ad[1 + i] = (uint8_t)(3ULL >> (56 - 8 * i));
+        HPPLITE_CIPHER_CHACHA20POLY1305.seal(key, v1 + 5, ad, 9, (const uint8_t*)msg, n, v1 + 17);
+        if (!hpplite_envelope_is_sealed(v1, 17 + n + 16)) FAIL("v1 not recognized");
+        if (hpplite_envelope_encoding(v1, 17 + n + 16) != HPPLITE_ENCODING_NONE) FAIL("v1 encoding");
+        uint8_t *o = hpplite_envelope_open(key, 3, v1, 17 + n + 16, &openLen, NULL);
+        if (!o || openLen != n || memcmp(o, msg, n) != 0) FAIL("v1 envelope does not open");
+        free(o);
+    }
+
     if (hpplite_envelope_is_sealed((const uint8_t*)payload, strlen(payload))) FAIL("plaintext JSON mistaken for an envelope");
     /* two seals of the same payload differ (fresh nonce) */
-    uint8_t *s1 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, (const uint8_t*)payload, strlen(payload), &sealedLen);
-    uint8_t *s2 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, (const uint8_t*)payload, strlen(payload), &openLen);
+    uint8_t *s1 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, HPPLITE_ENCODING_NONE, (const uint8_t*)payload, strlen(payload), &sealedLen);
+    uint8_t *s2 = hpplite_envelope_seal(hpplite_cipher_default(), key, 1, HPPLITE_ENCODING_NONE, (const uint8_t*)payload, strlen(payload), &openLen);
     if (!s1 || !s2 || memcmp(s1, s2, sealedLen) == 0) FAIL("nonce reused");
     free(s1); free(s2);
     PASS();
