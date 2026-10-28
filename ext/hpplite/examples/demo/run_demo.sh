@@ -17,19 +17,32 @@ fi
 [ -n "$HPPLITE_PRIVATE_KEY" ] || { echo "HPPLITE_PRIVATE_KEY not set"; exit 1; }
 unset HPPLITE_CONTRACT_ADDRESS HPPLITE_FACTORY_ADDRESS HPPLITE_L1_RPC HPPLITE_DATA_DIR
 cd "$here"
-"$py" app.py "$ext" "$port" > "$here/data/app.log" 2>&1 &
-app=$!
-trap 'kill $app 2>/dev/null; wait $app 2>/dev/null' EXIT INT TERM
-# wait for the first lease claim / flush before announcing
-for i in $(seq 1 60); do
-    kill -0 $app 2>/dev/null || { cat "$here/data/app.log"; exit 1; }
-    curl -s -m 5 "http://localhost:$port/api/status" >/dev/null 2>&1 && break
-    sleep 1
-done
+start_app() {
+    "$py" app.py "$ext" "$port" >> "$here/data/app.log" 2>&1 &
+    app=$!
+    for i in $(seq 1 60); do
+        kill -0 $app 2>/dev/null || { tail -20 "$here/data/app.log"; return 1; }
+        curl -s -m 5 "http://localhost:$port/api/status" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+start_app || exit 1
 echo "app: http://localhost:$port (log: data/app.log)"
 echo "agents: $(curl -s -m 5 "http://localhost:$port/api/status" | sed -n 's/.*"writer": "\([^"]*\)".*/\1/p')"
-# the quick-tunnel API is occasionally slow to answer; keep asking
-while kill -0 $app 2>/dev/null; do
+# the tunnel in the background (the quick-tunnel API is occasionally slow: retried), the URL to stdout
+( while :; do
     cloudflared tunnel --url "http://localhost:$port" --edge-ip-version 4 --protocol http2 2>&1 | grep --line-buffered -E "trycloudflare.com|error|failed"
     sleep 5
+  done ) &
+tunnel=$!
+trap 'kill $tunnel $app 2>/dev/null; wait $app 2>/dev/null' EXIT INT TERM
+# watchdog: the app once died without a word; a public demo must not stay dark
+while :; do
+    sleep 15
+    if ! kill -0 $app 2>/dev/null || ! curl -s -m 10 "http://localhost:$port/api/status" >/dev/null 2>&1; then
+        echo "$(date -u +%FT%TZ) app not answering; restarting (the lease is re-taken at open)" | tee -a "$here/data/app.log"
+        kill $app 2>/dev/null; wait $app 2>/dev/null
+        start_app || { echo "restart failed"; exit 1; }
+    fi
 done

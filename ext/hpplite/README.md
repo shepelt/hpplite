@@ -211,19 +211,28 @@ and `HPPLITE_PRIVATE_KEY`).
 
 ## Gas Costs (HPP Sepolia)
 
-Measured on the testnet; the money columns assume mainnet-Ethereum prices
-($3,500/ETH, 10 gwei) and are an upper bound, not a quote.
+Measured on HPP Sepolia on 2026-10-28, where gas is 0.01 gwei (the chain's
+base fee; it is a testnet, so there is no dollar price). The share by
+contract, from the demo wallet's transactions: `submitBatch` 94% of all
+gas, `submitCheckpoint` 3%, lease claim/renew/release 3%.
 
-| Operation | Gas | Cost (ETH) | Cost (USD*) |
-|-----------|-----|------------|-------------|
-| Factory deploy | 3.5M | 0.000035 | $0.12 |
-| Batch submit (~1KB) | 1.3M | 0.000013 | $0.04 |
+| Operation | Gas | Cost (ETH @ 0.01 gwei) |
+|-----------|-----|------------------------|
+| Factory deploy (VERSION 5, optimizer on) | 2.8M | 0.000028 |
+| Rollup creation (`getOrCreateRollup`) | ~2.5M | 0.000025 |
+| Batch submit (~250 B sealed; ~0.7k gas per further byte) | 323k | 0.0000032 |
+| Batch submit (128 KB, the limit) | ~92M | 0.0009 |
+| Checkpoint | 50k | 0.0000005 |
+| Lease claim / renew / release | 28-37k | 0.0000003 |
 
-| Usage | Batches/day | Monthly |
-|-------|-------------|---------|
-| Light (personal) | 10 | ~$13 |
-| Medium (small app) | 100 | ~$130 |
-| Heavy (production) | 1,000 | ~$1,300 |
+| Usage | Batches/day | ETH/day on HPP Sepolia |
+|-------|-------------|------------------------|
+| Light (personal) | 10 | 0.00003 |
+| Medium (small app) | 100 | 0.0003 |
+| Heavy (production) | 1,000 | 0.003 |
+
+On a chain priced like Ethereum mainnet (10 gwei) every figure is 1000x,
+which is why on-chain storage DA is a testnet design: see #11/#33.
 
 **Cost driver**: `HPPLiteDA` keeps batch bytes in contract storage
 (`batchData[height]`), the most expensive place to put them. Posting them as

@@ -126,6 +126,7 @@ threading.Thread(target=heartbeat, daemon=True).start()
 
 last_post = {}
 verify_lock = threading.Lock()
+last_verify = {"t": 0.0}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -163,7 +164,9 @@ class H(BaseHTTPRequestHandler):
                 last_post[ip] = now
                 self.send_json({"id": rid, "status": status()})
             elif u.path == "/api/verify":
+                if time.time() - last_verify["t"] < 20: return self.send_json({"error": "verify ran less than 20 s ago; try again shortly"}, 429)
                 if not verify_lock.acquire(blocking=False): return self.send_json({"error": "a verification is already running"}, 429)
+                last_verify["t"] = time.time()
                 try:
                     p = subprocess.run([sys.executable, os.path.join(HERE, "verify_rebuild.py"), EXT], capture_output=True, text=True, timeout=900,
                                        env={**os.environ})
