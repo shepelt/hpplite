@@ -21,8 +21,12 @@ pid=$!
 trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$log"' EXIT INT TERM
 for i in $(seq 1 50); do cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 && break; sleep 0.2; done
 cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 || { echo "anvil did not start"; cat "$log"; exit 1; }
-factory=$(cd "$contracts" && HPPLITE_PRIVATE_KEY=$key0 forge script script/DeployFactory.s.sol --rpc-url "$rpc" --broadcast 2>&1 | sed -n 's/.*HPPLiteFactory deployed at: *//p' | head -1)
-[ -n "$factory" ] || { echo "factory deployment failed"; exit 1; }
+(cd "$contracts" && HPPLITE_PRIVATE_KEY=$key0 forge script script/DeployFactory.s.sol --rpc-url "$rpc" --broadcast >"$log.forge" 2>&1) \
+    || { echo "factory deployment failed"; cat "$log.forge"; exit 1; }
+# the console line's format changes between forge versions; the broadcast record does not
+factory=$(sed -n 's/.*"contractAddress": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' "$contracts/broadcast/DeployFactory.s.sol/31337/run-latest.json" | head -1)
+rm -f "$log.forge"
+[ -n "$factory" ] || { echo "factory address not found in broadcast record"; exit 1; }
 # forge script prints the simulated address even when the broadcast reverted (e.g. over the 24 KB size limit)
 [ "$(cast code "$factory" --rpc-url "$rpc" 2>/dev/null | wc -c)" -gt 10 ] || { echo "factory at $factory has no code: deployment reverted (forge build --sizes)"; exit 1; }
 echo "anvil on $rpc, factory $factory"
