@@ -13,6 +13,7 @@
 */
 
 #include "node.h"
+#include "cipher.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,8 +139,33 @@ static void bench_flush_and_replay(int rows) {
     double flushRoot = now_ms() - t0;
     record("flush with root + checkpoint", flushRoot, "ms");
 
-    size_t len = 0; uint8_t *data = hpplite_l1_get_batch(l1, 1, &len); free(data);
-    record("batch JSON size (bytes/stmt)", (double)len / rows, "B");
+    size_t len = 0; uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
+    record("posted batch size (bytes/stmt)", (double)len / rows, "B");
+    if (n->cipher && data) {
+        /* seal / open cost for the whole batch, measured on the posted bytes */
+        size_t plainLen = 0;
+        uint8_t *plain = hpplite_envelope_open(n->encKey, 1, data, len, &plainLen, NULL);
+        if (plain) {
+            double t1 = now_ms();
+            for (int i = 0; i < 5; i++) {
+                size_t sl = 0;
+                uint8_t *s = hpplite_envelope_seal(n->cipher, n->encKey, 1, plain, plainLen, &sl);
+                free(s);
+            }
+            double seal = (now_ms() - t1) / 5;
+            t1 = now_ms();
+            for (int i = 0; i < 5; i++) {
+                uint8_t *o = hpplite_envelope_open(n->encKey, 1, data, len, NULL, NULL);
+                free(o);
+            }
+            double open = (now_ms() - t1) / 5;
+            record("seal batch (chacha20poly1305)", seal, "ms");
+            record("  seal throughput", plainLen / seal / 1000.0, "MB/s");
+            record("open batch", open, "ms");
+            free(plain);
+        }
+    }
+    free(data);
     hpplite_node_destroy(n);
 
     t0 = now_ms();

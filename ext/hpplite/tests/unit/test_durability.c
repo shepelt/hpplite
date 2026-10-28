@@ -12,6 +12,7 @@
 */
 
 #include "node.h"
+#include "cipher.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,11 +146,7 @@ static void test_submit_failure_retries(void) {
     if (hpplite_node_flush_batch(n) != 1) FAIL("retry should submit at height 1");
     if (hpplite_node_pending_count(n) != 0) FAIL("pending should be empty after retry");
 
-    size_t len = 0;
-    uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
-    if (!data) FAIL("batch 1 missing on L1");
-    HppliteBatch *b = hpplite_batch_from_json((const char *)data);
-    free(data);
+    HppliteBatch *b = hpplite_node_fetch_batch(n, 1);
     if (!b || b->nTxns != 3) FAIL("batch 1 should carry all 3 statements");
     hpplite_batch_free(b);
 
@@ -185,11 +182,7 @@ static void test_replay_not_relogged(void) {
 
     hpplite_node_exec(b, "INSERT INTO t VALUES(3,'c')", NULL);
     if (hpplite_node_flush_batch(b) != 2) FAIL("batch 2");
-    size_t len = 0;
-    uint8_t *data = hpplite_l1_get_batch(l1, 2, &len);
-    if (!data) FAIL("batch 2 missing on L1");
-    HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
-    free(data);
+    HppliteBatch *batch = hpplite_node_fetch_batch(b, 2);
     if (!batch || batch->nTxns != 1) {
         printf("(nTxns=%d) ", batch ? batch->nTxns : -1);
         FAIL("batch 2 should contain exactly the new INSERT");
@@ -223,11 +216,7 @@ static void test_bound_params_expanded(void) {
     sqlite3_finalize(stmt);
 
     if (hpplite_node_flush_batch(n) != 1) FAIL("flush");
-    size_t len = 0;
-    uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
-    if (!data) FAIL("batch missing");
-    HppliteBatch *batch = hpplite_batch_from_json((const char *)data);
-    free(data);
+    HppliteBatch *batch = hpplite_node_fetch_batch(n, 1);
     if (!batch || batch->nTxns != 3) FAIL("expected 3 statements");
     if (strstr(batch->aTxns[1].zSql, "?")) FAIL("placeholders not expanded");
     if (!strstr(batch->aTxns[1].zSql, "'it''s'")) FAIL("text not expanded/escaped");
@@ -356,10 +345,7 @@ static void test_adopt_after_lost_confirmation(void) {
     /* and the normal case afterwards continues at the right height */
     hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
     if (hpplite_node_flush_batch(n) != 2) FAIL("next batch should be height 2");
-    size_t len = 0;
-    uint8_t *data = hpplite_l1_get_batch(l1, 2, &len);
-    HppliteBatch *b = data ? hpplite_batch_from_json((const char *)data) : NULL;
-    free(data);
+    HppliteBatch *b = hpplite_node_fetch_batch(n, 2);
     if (!b || b->nTxns != 1) FAIL("batch 2 should hold only the new INSERT");
     hpplite_batch_free(b);
     hpplite_node_destroy(n);
@@ -573,9 +559,10 @@ static void test_batch_size_limit(void) {
         size_t len = 0;
         uint8_t *data = hpplite_l1_get_batch(l1, h, &len);
         if (!data) FAIL("batch missing on L1");
-        if (len > 3000) FAIL("a batch exceeds the limit");
-        HppliteBatch *b = hpplite_batch_from_json((const char *)data);
+        if (len > 3000) FAIL("a batch (sealed) exceeds the limit");
+        if (!hpplite_envelope_is_sealed(data, len)) FAIL("batch should be sealed by default");
         free(data);
+        HppliteBatch *b = hpplite_node_fetch_batch(n, h);
         if (!b) FAIL("parse");
         if (h < last && !b->partial) FAIL("intermediate batch should be marked partial");
         if (h == last && b->partial) FAIL("last batch must not be partial");
@@ -671,6 +658,88 @@ static void test_replay_skips_failed_statement(void) {
     PASS();
 }
 
+/* 19. Batches are sealed by default; only the wallet key opens them */
+static void test_encryption_default(void) {
+    TEST("batches are sealed with the wallet-derived key; wrong key cannot reconstruct");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/enc_a.db", l1);
+    if (!a) FAIL("open a");
+    if (!a->cipher) FAIL("encryption should be on by default when a key exists");
+    hpplite_node_exec(a, "CREATE TABLE secrets(id INTEGER PRIMARY KEY, v TEXT)", NULL);
+    hpplite_node_exec(a, "INSERT INTO secrets VALUES(1,'the-plaintext-marker')", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("flush");
+
+    size_t len = 0;
+    uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
+    if (!raw) FAIL("batch missing");
+    if (!hpplite_envelope_is_sealed(raw, len)) FAIL("posted bytes are not an envelope");
+    if (memmem(raw, len, "the-plaintext-marker", 20)) FAIL("plaintext leaked to L1");
+    if (hpplite_batch_from_json((const char *)raw) != NULL) FAIL("sealed bytes parsed as JSON");
+    free(raw);
+    HppliteBatch *b = hpplite_node_fetch_batch(a, 1);
+    if (!b || b->nTxns != 2) FAIL("owner cannot read its own batch");
+    hpplite_batch_free(b);
+    unsigned char ra[32]; hpplite_node_get_state_root(a, ra);
+    hpplite_node_destroy(a);
+
+    /* same wallet, fresh file: reconstructs */
+    HppliteNode *r = open_node(DIR "/enc_r.db", l1);
+    if (!r) FAIL("open reader");
+    if (count_rows(r->db, "secrets") != 1) FAIL("owner reconstruction");
+    unsigned char rr[32]; hpplite_node_get_state_root(r, rr);
+    if (memcmp(ra, rr, 32) != 0) FAIL("root after reconstruction");
+    r->l1 = NULL; hpplite_node_destroy(r);
+
+    /* different wallet: sees ciphertext only, replays nothing, does not fork */
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "stranger"; memcpy(config.privkey, PRIVKEY, 32); config.privkey[31] ^= 1;
+    config.hasPrivkey = 1; config.dataDir = DIR; config.dbPath = DIR "/enc_x.db";
+    HppliteNode *x = hpplite_node_create(&config);
+    if (!x) FAIL("open stranger");
+    hpplite_node_set_l1(x, l1);
+    if (hpplite_node_sync_from_l1(x, 1) != 0) FAIL("stranger should sync nothing");
+    if (hpplite_node_get_height(x) != 1) FAIL("stranger height must not advance");
+    if (hpplite_node_fetch_batch(x, 1) != NULL) FAIL("stranger opened the batch");
+    x->l1 = NULL; hpplite_node_destroy(x);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 20. encrypt=off posts plaintext; plaintext batches replay into an encrypting node */
+static void test_encryption_off_and_legacy(void) {
+    TEST("encrypt=off posts plaintext JSON; plaintext history replays into an encrypting node");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    /* same wallet as open_node(), through the URI, with encryption switched off */
+    sqlite3 *db = hpplite_open("file:" DIR "/plain.db?hpplite=on&encrypt=off&datadir=" DIR
+        "&privkey=0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+    if (!db) FAIL("open");
+    HppliteNode *p = hpplite_get_node(db);
+    if (!p || p->cipher != NULL) FAIL("encrypt=off not honoured");
+    hpplite_node_set_l1(p, l1); hpplite_node_start(p);
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    if (hpplite_flush(db) != 1) FAIL("flush");
+    size_t len = 0;
+    uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
+    if (!raw || hpplite_envelope_is_sealed(raw, len) || !memmem(raw, len, "INSERT INTO t", 13)) FAIL("expected plaintext JSON on L1");
+    free(raw);
+    sqlite3_close(db);
+
+    HppliteNode *e = open_node(DIR "/enc.db", l1);     /* encrypting node reads the plaintext history */
+    if (!e) FAIL("open encrypting node");
+    if (count_rows(e->db, "t") != 1) FAIL("plaintext batch not replayed");
+    hpplite_node_exec(e, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(e) != 2) FAIL("flush 2");
+    raw = hpplite_l1_get_batch(l1, 2, &len);
+    if (!raw || !hpplite_envelope_is_sealed(raw, len)) FAIL("new batch should be sealed");
+    free(raw);
+    hpplite_node_destroy(e);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -691,6 +760,8 @@ int main(void) {
     test_batch_size_limit();
     test_slow_confirmation();
     test_replay_skips_failed_statement();
+    test_encryption_default();
+    test_encryption_off_and_legacy();
     system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

@@ -49,6 +49,7 @@ sqlite3_close(db);
 - **On-Demand Verification** - Anyone can verify state from L1 data
 - **State Reconstruction** - Rebuild entire database from L1 alone
 - **Stock SQLite** - No core patches; builds as a loadable extension (`.load ./hpplite`) against any SQLite >= 3.24
+- **Encrypted by default** - Batches are sealed (ChaCha20-Poly1305) with a key derived from your wallet key before they leave the process; L1 sees ciphertext
 - **Nothing to Lose** - Pending SQL lives in the database file itself, written inside your own transactions; a crash or a failed L1 submission never loses or duplicates a batch
 
 ## Why Singleton Sequencer?
@@ -84,6 +85,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`) |
 | `datadir` | No | Local data directory |
 | `interval` | No | Batch flush interval, e.g. `5s` (default) |
+| `encrypt` | No | `on` (default when a key is present) or `off` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -163,6 +165,7 @@ make bench
 | File | Description |
 |------|-------------|
 | `hpplite.c` | Statement capture into `_hpplite_pending`, content-hash state root, batch build/finalize/replay, `hpplite_status` table, transparent API, extension entry point |
+| `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
 | `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
 | `batch.c` | Batch creation and serialization |
 | `crypto.c` | secp256k1 signing |
@@ -208,18 +211,34 @@ Scope is tied to versions. The current branch is **v0.1 in progress**.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
-| **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence | per-tenant / single-tenant, up to ~100 MB | L1 calldata |
+| **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches | per-tenant / single-tenant, up to ~100 MB | L1 calldata |
 | v0.2 | `hpplite verify` CLI, per-table divergence reporting | same | same |
 | v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, batch compression | GB range | S3 + L1 commitments |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
-computation (~28 ms/MB), computed once per checkpoint interval (default 100 batches);
+computation (~9 ms/MB), computed once per checkpoint interval (default 100 batches);
 see [doc/architecture.md](doc/architecture.md#state-root).
 Beyond that, shard per tenant (the factory can create several rollups per wallet)
 until v0.3.
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
+
+## Privacy
+
+Everything posted to L1 is public, so batch payloads are **encrypted before
+posting** whenever a private key is present (`encrypt=off` or
+`HPPLITE_ENCRYPT=off` to disable). The scheme is ChaCha20-Poly1305 with a key
+derived from the wallet private key (`HKDF-SHA256`), so whoever can write the
+rollup can read it and there is no extra secret to manage; reconstruction and
+verification work from the same `privkey=`. Each batch is sealed with a fresh
+nonce and bound to its height. `SELECT encryption FROM hpplite_status` shows
+the active scheme; schemes are pluggable (`cipher.h`).
+
+What stays public on L1: heights, batch sizes and timing, batch hashes, and
+the state roots in checkpoints (content hashes that reveal *when* content
+changed, not what). Only key holders can replay and verify; sharing read
+access without the wallet key is the public-key scheme planned for v0.2.
 
 ## Durability
 

@@ -95,6 +95,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
     node->config.batchIntervalMs = config->batchIntervalMs;
     node->config.maxBatchBytes = config->maxBatchBytes ? config->maxBatchBytes : 128 * 1024;
+    node->config.noEncrypt = config->noEncrypt;
 
     /* Generate unique instance ID */
     generate_instance_id(node->instanceId);
@@ -114,6 +115,10 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         if (rc != 0) {
             return -1;
         }
+        /* Batch key: whoever can write the rollup can read it */
+        hpplite_cipher_derive_key(config->privkey, node->encKey);
+        node->hasEncKey = 1;
+        if (!config->noEncrypt) node->cipher = hpplite_cipher_default();
     }
 
     return 0;
@@ -383,17 +388,47 @@ static void node_learn_batch_limit(HppliteNode *node) {
 }
 
 /*
-** Fetch and parse the batch at `height` from L1. NULL if absent.
+** Decode batch bytes from L1: open the envelope if sealed, else plaintext JSON.
 */
-static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
-    size_t dataLen = 0;
-    uint8_t *data = hpplite_l1_get_batch(node->l1, height, &dataLen);
+static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
+                                       const uint8_t *data, size_t dataLen) {
     HppliteBatch *batch = NULL;
-    if (data && dataLen > 0) {
+    if (!data || dataLen == 0) return NULL;
+    if (hpplite_envelope_is_sealed(data, dataLen)) {
+        const HppliteCipher *scheme = NULL;
+        uint8_t *plain;
+        if (!node->hasEncKey) {
+            fprintf(stderr, "hpplite: batch %llu is encrypted and this node has no key\n",
+                    (unsigned long long)height);
+            return NULL;
+        }
+        plain = hpplite_envelope_open(node->encKey, height, data, dataLen, NULL, &scheme);
+        if (!plain) {
+            fprintf(stderr, "hpplite: batch %llu: %s\n", (unsigned long long)height,
+                    scheme ? "wrong key (authentication failed)" : "unknown encryption scheme");
+            return NULL;
+        }
+        batch = hpplite_batch_from_json((const char *)plain);
+        free(plain);
+    } else {
         batch = hpplite_batch_from_json((const char *)data);
     }
+    return batch;
+}
+
+HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
+    size_t dataLen = 0;
+    uint8_t *data;
+    HppliteBatch *batch;
+    if (!node || !node->l1) return NULL;
+    data = hpplite_l1_get_batch(node->l1, height, &dataLen);
+    batch = node_decode_batch(node, height, data, dataLen);
     free(data);
     return batch;
+}
+
+static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
+    return hpplite_node_fetch_batch(node, height);
 }
 
 /*
@@ -441,7 +476,13 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     /* The root is O(database size): compute it only on the batch that
     ** closes a checkpoint interval (the checkpoint is submitted from it) */
     int withRoot = node->batchesSinceCheckpoint + 1 >= node->config.checkpointInterval;
-    batch = hpplite_build_batch_limited(ctx, node->config.maxBatchBytes, withRoot, &maxId);
+    /* The DA limit applies to the posted bytes: leave room for the envelope */
+    size_t maxBytes = node->config.maxBatchBytes;
+    if (node->cipher && maxBytes > 0) {
+        size_t overhead = HPPLITE_ENVELOPE_MAGIC_LEN + 1 + node->cipher->nonceLen + node->cipher->tagLen;
+        maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;
+    }
+    batch = hpplite_build_batch_limited(ctx, maxBytes, withRoot, &maxId);
     if (!batch) return 0;
     height = batch->height;
     *pMore = batch->partial;
@@ -454,15 +495,26 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
 
         char *json = hpplite_batch_to_json(batch);
         if (json) {
-            char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height,
-                                    (const uint8_t *)json, strlen(json));
-            if (txHash) {
-                confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
-                if (confirmed && node->onBatchPosted) {
-                    node->onBatchPosted(node->callbackArg, height, txHash);
-                }
-                free(txHash);
+            const uint8_t *payload = (const uint8_t *)json;
+            size_t payloadLen = strlen(json);
+            uint8_t *sealed = NULL;
+            if (node->cipher) {
+                sealed = hpplite_envelope_seal(node->cipher, node->encKey, height,
+                                               payload, payloadLen, &payloadLen);
+                payload = sealed;
             }
+            if (payload) {
+                char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height,
+                                        payload, payloadLen);
+                if (txHash) {
+                    confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
+                    if (confirmed && node->onBatchPosted) {
+                        node->onBatchPosted(node->callbackArg, height, txHash);
+                    }
+                    free(txHash);
+                }
+            }
+            free(sealed);
             sqlite3_free(json);
         }
         if (!confirmed) {
@@ -950,7 +1002,8 @@ char *hpplite_node_get_stats(HppliteNode *node) {
         "\"logErrors\":%llu,"
         "\"batchesProduced\":%llu,"
         "\"batchesSinceCheckpoint\":%d,"
-        "\"lastCheckpointHeight\":%llu"
+        "\"lastCheckpointHeight\":%llu,"
+        "\"encryption\":\"%s\""
         "}",
         node->config.nodeId ? node->config.nodeId : "",
         stateStr,
@@ -963,6 +1016,7 @@ char *hpplite_node_get_stats(HppliteNode *node) {
         (unsigned long long)(node->ctx ? node->ctx->nLogErrors : 0),
         (unsigned long long)node->batchesProduced,
         node->batchesSinceCheckpoint,
-        (unsigned long long)node->lastCheckpointHeight
+        (unsigned long long)node->lastCheckpointHeight,
+        node->cipher ? node->cipher->name : "none"
     );
 }

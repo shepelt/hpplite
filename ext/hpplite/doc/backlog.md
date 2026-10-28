@@ -34,6 +34,14 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Encrypted batches (issue #14)
+- `cipher.c`: ChaCha20-Poly1305 (RFC 8439 vectors in `test_cipher`), HMAC/HKDF-SHA256,
+  binary envelope bound to height; key derived from the wallet key; on by default,
+  `encrypt=off` / `HPPLITE_ENCRYPT=off`; plaintext history still replays
+- Reads go through `hpplite_node_fetch_batch()` (opens the envelope); a node
+  without the key sees ciphertext and syncs nothing
+- Release build type is now the CMake default
+
 ### Microbenchmark
 - `tests/bench/bench_hpplite.c` (`make bench`), reference numbers in
   `doc/performance.md`; found the O(n^2) size-limit cut and the

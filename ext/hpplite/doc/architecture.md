@@ -202,6 +202,36 @@ wallet owns its rollup). After a crash the old lease blocks submission until
 it expires (5 minutes); writes keep accumulating in `_hpplite_pending` and
 flush once the lease is free.
 
+### Privacy: encrypted batches
+
+L1 is public, so a batch is sealed before it is posted whenever the node has
+a private key:
+
+```
+"HPE1" | scheme id | nonce (12) | ChaCha20-Poly1305(key, nonce, ad = scheme || height, batch JSON) || tag (16)
+key = HKDF-SHA256(ikm = wallet private key, salt = "hpplite", info = "hpplite/batch-encryption/v1")
+```
+
+- The key is derived, not stored: whoever can write the rollup can read it,
+  and reconstruction/verification need only the same `privkey=`.
+- The height is associated data, so a ciphertext cannot be presented at
+  another height. Each batch gets a fresh random nonce.
+- Payloads that do not start with `HPE1` are plaintext JSON (history written
+  before encryption, or `encrypt=off`); a node reads both, writes sealed.
+- The scheme is pluggable (`HppliteCipher` in `cipher.h`); the envelope
+  names it, so new schemes can be added without touching batch or replay
+  code. The v0.1 scheme is vendored ChaCha20-Poly1305 (RFC 8439): ~400
+  lines of constant-time plain C, no platform crypto dependency, which
+  matters for the loadable extension.
+- The DA size limit applies to the posted bytes, so the batch cut leaves
+  room for the 33-byte envelope.
+
+What remains visible on L1: heights, sizes, timing, batch hashes, and the
+checkpoint roots (content hashes: they show that content changed, not what).
+Consequence for verification: only key holders can replay. Per-reader
+access without the wallet key (encrypt to public keys, grant/revoke) is the
+v0.2 public-key scheme.
+
 ### State Root
 
 The state root is a **content hash** of all user tables: SHA-256 over the
@@ -214,7 +244,7 @@ databases with the same content have the same root whatever statements
 built them, and anyone holding a reconstructed database can recompute it
 (`hpplite_db_hash()`) and compare with what the sequencer posted.
 
-Computing it is O(database size) (~28 ms/MB), so it is computed at
+Computing it is O(database size) (~9 ms/MB in a Release build), so it is computed at
 **checkpoint cadence**, not per batch: only the batch that closes a
 checkpoint interval (`checkpointInterval`, default 100) carries
 `"state_root"`, and the checkpoint submitted right after it anchors that

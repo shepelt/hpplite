@@ -4,6 +4,11 @@ project(hpplite VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Optimized by default (single-config generators); -DCMAKE_BUILD_TYPE=Debug to override
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # Options
 option(HPPLITE_BUILD_TESTS "Build test executables" ON)
 option(HPPLITE_USE_REAL_L1 "Use real Ethereum L1 (vs mock)" OFF)
@@ -62,6 +67,7 @@ set(HPPLITE_SOURCES
     node.c
     da_uri.c
     config.c
+    cipher.c
     # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
     eth/keccak256.c
@@ -148,6 +154,9 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_simple_open tests/unit/test_simple_open.c)
     target_link_libraries(test_simple_open hpplite)
 
+    add_executable(test_cipher tests/unit/test_cipher.c)
+    target_link_libraries(test_cipher hpplite)
+
     # Tests that use mock L1 - only build when not using real L1
     if(NOT HPPLITE_USE_REAL_L1)
         add_executable(test_l1_mock tests/unit/test_l1_mock.c)
@@ -199,6 +208,7 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_node COMMAND test_node)
     add_test(NAME test_da_uri COMMAND test_da_uri)
     add_test(NAME test_simple_open COMMAND test_simple_open)
+    add_test(NAME test_cipher COMMAND test_cipher)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)

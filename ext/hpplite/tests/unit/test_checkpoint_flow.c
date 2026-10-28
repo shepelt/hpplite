@@ -41,12 +41,8 @@ static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
     return node;
 }
 
-static HppliteBatch *l1_batch(HppliteL1 *l1, uint64_t h) {
-    size_t len = 0;
-    uint8_t *data = hpplite_l1_get_batch(l1, h, &len);
-    HppliteBatch *b = data ? hpplite_batch_from_json((const char *)data) : NULL;
-    free(data);
-    return b;
+static HppliteBatch *l1_batch(HppliteNode *node, uint64_t h) {
+    return hpplite_node_fetch_batch(node, h);
 }
 
 /* Roots appear only on interval-closing batches; the checkpoint follows automatically */
@@ -68,7 +64,7 @@ static void test_checkpoint_auto(void) {
     if (hpplite_node_submit_checkpoint(node) != NULL) FAIL("nothing to checkpoint manually");
 
     for (uint64_t h = 1; h <= 3; h++) {
-        HppliteBatch *b = l1_batch(l1, h);
+        HppliteBatch *b = l1_batch(node, h);
         if (!b) FAIL("batch missing");
         if (h < 3 && b->hasRoot) FAIL("non-closing batch must not carry a root");
         if (h == 3 && !b->hasRoot) FAIL("closing batch must carry the root");

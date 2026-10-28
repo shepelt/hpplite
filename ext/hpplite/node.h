@@ -13,6 +13,7 @@
 #include "batch.h"
 #include "crypto.h"
 #include "l1_interface.h"
+#include "cipher.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -54,6 +55,7 @@ typedef struct HppliteNodeConfig {
     int checkpointInterval;         /* Batches between L1 checkpoints */
     int batchIntervalMs;            /* Auto-flush interval (0 = disabled) */
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
+    int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
 } HppliteNodeConfig;
 
 /*
@@ -81,6 +83,11 @@ typedef struct HppliteNode {
     /* Crypto */
     HppliteCrypto *crypto;
     HppliteKeypair keypair;
+
+    /* Batch encryption: key derived from the wallet key, NULL cipher = plaintext */
+    const HppliteCipher *cipher;
+    unsigned char encKey[HPPLITE_CIPHER_KEY_SIZE];
+    int hasEncKey;
 
     /* Checkpoint tracking */
     uint64_t lastCheckpointHeight;
@@ -183,6 +190,14 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg);
 ** batch could not be confirmed on L1 (pending rows are kept and retried).
 */
 uint64_t hpplite_node_flush_batch(HppliteNode *node);
+
+/*
+** Fetch the batch at `height` from L1 and decode it: opens the envelope
+** with this node's key when the batch is sealed, parses plaintext JSON
+** otherwise. NULL if absent, if sealed and this node has no key, or if the
+** key does not open it. Replay, adoption and tests all go through this.
+*/
+HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height);
 
 /*
 ** Bring the local database up to date with L1: batches already on L1 that

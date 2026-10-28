@@ -45,6 +45,13 @@ static int hex_to_bytes(const char *hex, unsigned char *out, int len) {
 /*
 ** Helper: parse duration string (e.g., "5s", "100ms", "1m")
 */
+/* on/off, true/false, yes/no, 1/0 */
+static int parse_bool(const char *z) {
+    if (!z) return 1;
+    if (!sqlite3_stricmp(z, "off") || !sqlite3_stricmp(z, "false") || !sqlite3_stricmp(z, "no") || !strcmp(z, "0")) return 0;
+    return 1;
+}
+
 static int parse_duration_ms(const char *str) {
     if (!str) return -1;
 
@@ -94,6 +101,7 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->dataDir = strdup(HPPLITE_DEFAULT_DATA_DIR);
     cfg->role = HPPLITE_CFG_ROLE_OBSERVER;  /* Safe default */
     cfg->batchIntervalMs = 5000;  /* 5 seconds default */
+    cfg->encrypt = 1;             /* everything posted is public otherwise */
 
     return cfg;
 }
@@ -182,6 +190,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         int ms = parse_duration_ms(val);
         if (ms > 0) cfg->batchIntervalMs = ms;
     }
+
+    /* Encryption */
+    val = getenv(HPPLITE_ENV_ENCRYPT);
+    if (val) cfg->encrypt = parse_bool(val);
 
     return 0;
 }
@@ -355,6 +367,11 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (ms > 0) cfg->batchIntervalMs = ms;
     }
 
+    /* Encryption */
+    if (get_uri_param(uri, HPPLITE_URI_ENCRYPT, buf, sizeof(buf))) {
+        cfg->encrypt = parse_bool(buf);
+    }
+
     return 0;
 }
 
@@ -464,6 +481,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         if (ms > 0) cfg->batchIntervalMs = ms;
     }
 
+    /* Encryption */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
+    if (val) cfg->encrypt = parse_bool(val);
+
     return 0;
 }
 
@@ -546,4 +567,5 @@ void hpplite_config_print(const HppliteConfig *cfg) {
     printf("  dbPath:     %s\n", cfg->dbPath ? cfg->dbPath : "(not set)");
     printf("  privkey:    %s\n", cfg->hasPrivkey ? "(set)" : "(not set)");
     printf("  interval:   %dms\n", cfg->batchIntervalMs);
+    printf("  encrypt:    %s\n", cfg->encrypt ? "on" : "off");
 }
