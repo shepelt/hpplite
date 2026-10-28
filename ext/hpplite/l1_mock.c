@@ -254,6 +254,9 @@ int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     int rc = hpplite_crypto_keypair_from_privkey(l1->crypto, &kp, privkey);
     if (rc == 0) {
         memcpy(l1->myAddress, kp.address, 20);
+        /* the factory hands the rollup to the wallet that created it */
+        unsigned char zero[20] = {0};
+        if (memcmp(l1->owner, zero, 20) == 0) memcpy(l1->owner, kp.address, 20);
     }
 
     return 0;
@@ -371,6 +374,35 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
     (void)l1;
     contractHex[0] = daHex[0] = 0;
     return -1;
+}
+
+int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
+    if (!l1 || !l1->hasPrivkey) return -1;
+    memcpy(out, l1->myAddress, 20);
+    return 0;
+}
+
+void hpplite_l1_mock_claim_foreign(HppliteL1 *l1, const unsigned char *wallet,
+                                   const unsigned char instanceId[32], uint64_t seconds) {
+    if (!l1) return;
+    l1->hasSequencer = 1;
+    if (wallet) memcpy(l1->sequencerWallet, wallet, 20);
+    else memset(l1->sequencerWallet, 0x55, 20);          /* nobody we know */
+    memcpy(l1->sequencerInstance, instanceId, 32);
+    l1->leaseExpiry = l1->currentTimestamp + seconds;
+    mockSaveState(l1);
+}
+
+void hpplite_l1_mock_inject_batch(HppliteL1 *l1, const uint8_t *data, size_t len) {
+    if (!l1 || !data || l1->nBatches >= MAX_BATCHES) return;
+    size_t idx = l1->nBatches;
+    l1->batchData[idx] = malloc(len);
+    if (!l1->batchData[idx]) return;
+    memcpy(l1->batchData[idx], data, len);
+    l1->batchLen[idx] = len;
+    l1->nBatches++;
+    mockSaveBatch(l1, l1->nBatches);
+    mockSaveState(l1);
 }
 
 int hpplite_l1_is_lease_active(HppliteL1 *l1) {

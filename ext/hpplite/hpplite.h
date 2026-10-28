@@ -76,6 +76,7 @@ struct HppliteCtx {
   size_t maxStmtBytes;        /* Longest statement the DA can carry (0 = unlimited) */
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
+  uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
   uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */
 
   /* Callbacks for external integration */
@@ -243,6 +244,14 @@ void hpplite_block_hash(const struct HppliteBatch *pBatch, const unsigned char *
 ** Persist checkpoint progress.
 */
 int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRoot);
+
+/*
+** Step past a height whose L1 batch fails our authentication: it was posted
+** under a lease we do not hold and no key holder can read it, so every key
+** holder skips it the same way. prev_block_hash becomes the hash of the
+** raw bytes, which keeps the chain of hashes deterministic for all of them.
+*/
+int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash);
 
 /*
 ** Register HPPLite as a loadable extension.

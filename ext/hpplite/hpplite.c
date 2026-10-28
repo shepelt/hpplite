@@ -1202,6 +1202,34 @@ void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut) {
   }
 }
 
+int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash) {
+  sqlite3_stmt *pStmt;
+  int rc;
+  if (!pCtx || !pRawHash) return SQLITE_MISUSE;
+  if (height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  rc = bkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  {
+    int saved = bkEnter(pCtx);
+    rc = sqlite3_prepare_v2(pCtx->bkDb,
+      "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2 WHERE id=1", -1, &pStmt, NULL);
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
+      sqlite3_bind_blob(pStmt, 2, pRawHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+      rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      sqlite3_finalize(pStmt);
+    }
+    bkLeave(pCtx, saved);
+  }
+  rc = bkEnd(pCtx, rc);
+  if (rc == SQLITE_OK) {
+    pCtx->blockHeight = height + 1;
+    memcpy(pCtx->prevBlockHash, pRawHash, HPPLITE_HASH_SIZE);
+    pCtx->nForeignBatches++;
+  }
+  return rc;
+}
+
 int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRoot) {
   sqlite3_stmt *pStmt;
   int rc;
@@ -1315,7 +1343,7 @@ static void hpplite_on_close(sqlite3 *db);
 **
 ** One row: height, pending, state_root, prev_block_hash,
 ** last_checkpoint_height, lease, log_errors, replay_skipped, encryption,
-** keyed, nondeterministic, contract, da_contract, last_batch_tx.
+** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches.
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -1346,6 +1374,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_CONTRACT         11
 #define STATUS_COL_DA_CONTRACT      12
 #define STATUS_COL_LAST_BATCH_TX    13
+#define STATUS_COL_FOREIGN_BATCHES  14
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1356,7 +1385,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
-        " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT)");
+        " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
+        " foreign_batches INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1492,6 +1522,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             }
             break;
         }
+        case STATUS_COL_FOREIGN_BATCHES:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignBatches);
+            break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);
             else sqlite3_result_null(ctx);

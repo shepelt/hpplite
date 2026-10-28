@@ -208,16 +208,26 @@ still usable, and that `xDisconnect` flushes, releases the lease and frees
 the node. The same code builds as a loadable extension against stock
 SQLite.
 
-Before every submission the node reads the lease from L1: it renews its
-own lease once past half its life, claims a free one, and never posts into
-someone else's (the batch stays pending and is retried after expiry).
-Failed submissions back off exponentially, up to the lease length. On
-graceful close the lease is released (`forceExpireLease`, the wallet owns
-its rollup). After a crash the old lease blocks submission until it expires
-(5 minutes); writes keep accumulating in `_hpplite_pending` and flush once
-the lease is free. Until #17 lands, an expired lease can be claimed by any
-wallet; the node detects a foreign holder and stops posting rather than
-revert every interval.
+The lease is taken at open and read from L1 before every submission: the
+node renews its own once past half its life, claims a free one, and never
+posts into a sibling instance's (another process of the same wallet: the
+batch stays pending and is retried after expiry - there is no takeover
+between instances of one wallet). A claim is a transaction; it counts only
+once the receipt is in and `getState()` names our instance. Failed
+submissions back off exponentially, up to the lease length. On graceful
+close the lease is released (`releaseLease` by the instance itself on
+VERSION 5 rollups, `forceExpireLease` by the owner on older ones). After a
+crash the old lease blocks submission until it expires (5 minutes); writes
+keep accumulating in `_hpplite_pending` and flush once the lease is free.
+
+Only the owner-set sequencer wallet can claim a VERSION 5 rollup's lease.
+Rollups created by the previous factory still allow any wallet to claim an
+expired lease; for them the node, as owner, expires a stranger's lease and
+reclaims, and a batch a stranger managed to post is stepped over: it fails
+our authentication tag, so it is provably not ours, every key holder skips
+that height identically, and its raw bytes are hashed into the chain of
+block hashes (`hpplite_status.foreign_batches`). A tag failure at height 1
+with no history is the wrong key, never an intruder, and is an error.
 
 ### Determinism
 

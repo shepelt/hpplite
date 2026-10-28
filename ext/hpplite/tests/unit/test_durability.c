@@ -1099,6 +1099,76 @@ static void test_close_during_timer_flush(void) {
     PASS();
 }
 
+/* 29. A batch posted by someone else at our height is skipped, by writer and reader alike (issue #39) */
+static void test_foreign_batch_is_skipped(void) {
+    TEST("foreign batch at our height: sequencer steps over it, rebuild skips it the same way");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/fb.db", l1);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("batch 1");
+    /* an intruder held the lease for a while and left junk at height 2 */
+    static const uint8_t junk[] = "HPE2\x01\x00junk-sealed-with-another-key-0123456789abcdef0123456789abcdef";
+    hpplite_l1_mock_inject_batch(l1, junk, sizeof(junk) - 1);
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+    uint64_t h = hpplite_node_flush_batch(w);
+    if (h != 3) { printf("(h=%llu) ", (unsigned long long)h); FAIL("our next batch should land at height 3, after the foreign one"); }
+    if (w->ctx->nForeignBatches != 1 || w->state == HPPLITE_STATE_ERROR) FAIL("writer counts the skipped height and stays healthy");
+    if (hpplite_node_pending_count(w) != 0) FAIL("pending drained");
+    unsigned char rootW[32]; hpplite_node_get_state_root(w, rootW);
+    hpplite_node_destroy(w);
+
+    HppliteNode *r = open_node(DIR "/fb_r.db", l1);
+    if (!r) FAIL("reader open");
+    if (r->state == HPPLITE_STATE_ERROR) FAIL("reader must not stop at the foreign batch");
+    if (r->ctx->nForeignBatches != 1) FAIL("reader counts the skipped height");
+    if (count_rows(r->db, "t") != 2) FAIL("reader rows");
+    unsigned char rootR[32]; hpplite_node_get_state_root(r, rootR);
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("roots differ");
+    if (memcmp(r->ctx->prevBlockHash, w->ctx ? rootR : rootR, 0) != 0) { } /* prev hashes compared below */
+    r->l1 = NULL; hpplite_node_destroy(r);
+    /* both followed the same rule: a fresh reader's chain of block hashes equals the writer's */
+    HppliteNode *w2 = open_node(DIR "/fb.db", l1);
+    HppliteNode *r2 = open_node(DIR "/fb_r.db", l1);
+    if (!w2 || !r2) FAIL("reopen");
+    if (memcmp(w2->ctx->prevBlockHash, r2->ctx->prevBlockHash, 32) != 0) FAIL("block hash chain differs after the skip");
+    r2->l1 = NULL; hpplite_node_destroy(r2);
+    hpplite_node_destroy(w2);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 30. A stranger's lease on our rollup is expired by the owner; a sibling instance is not touched */
+static void test_stranger_lease_evicted_sibling_not(void) {
+    TEST("stranger holding our rollup's lease is evicted; a sibling of our wallet is left alone");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/ev.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("batch 1");
+    unsigned char other[32]; memset(other, 0xAB, 32);
+    /* a stranger (unknown wallet) grabbed the lease (pre-VERSION-5 contract) */
+    hpplite_l1_mock_claim_foreign(l1, NULL, other, 300);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(n) != 2) FAIL("owner should expire the stranger's lease, reclaim and post");
+    if (!n->hasLease) FAIL("lease back with us");
+    /* a sibling: our own wallet, another instance - we must not take over */
+    unsigned char me[20]; hpplite_l1_get_my_address(l1, me);
+    hpplite_l1_mock_claim_foreign(l1, me, other, 300);
+    n->leaseRecheckAt = 0;
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(n) != 0) FAIL("must not post into a sibling's lease");
+    if (hpplite_node_pending_count(n) != 1) FAIL("kept pending");
+    if (hpplite_l1_get_lease_time_remaining(l1) == 0) FAIL("sibling's lease must be untouched");
+    hpplite_l1_mock_advance_time(l1, 301);
+    if (hpplite_node_flush_batch(n) != 3) FAIL("posts once the sibling's lease lapses");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1129,6 +1199,8 @@ int main(void) {
     test_no_commit_under_app_read();
     test_second_connection_is_follower();
     test_close_during_timer_flush();
+    test_foreign_batch_is_skipped();
+    test_stranger_lease_evicted_sibling_not();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

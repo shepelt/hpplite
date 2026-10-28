@@ -391,9 +391,13 @@ under a lease, roots are anchored, and anyone holding the key can rebuild
 from the chain alone and compare. Nothing in v0.1 punishes a divergent
 sequencer - there are no funds, bonds or fraud proofs here - it makes the
 divergence detectable, and a lost disk recoverable. The lease keeps two
-copies of your process from posting at once; a lease that expired (5 min)
-can be claimed by any wallet until the owner-set sequencer address lands
-with #17.
+copies of your process from posting at once, and only the rollup's
+sequencer wallet (the owner, unless set apart) can take it - a rollup can
+sleep for days and nobody else can claim it. Rollups from the previous
+factory keep the old permissionless claim; there the node evicts a
+stranger's lease as owner, and a batch posted by someone else (it fails our
+authentication, so it is provably not ours) is stepped over by every key
+holder the same way instead of stopping reconstruction.
 
 See [doc/architecture.md](doc/architecture.md) for details.
 

@@ -457,6 +457,11 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
     return 0;
 }
 
+int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
+    if (!l1 || !l1->has_privkey) return -1;
+    return eth_address_from_privkey(l1->privkey, out);
+}
+
 int hpplite_l1_is_lease_active(HppliteL1 *l1) {
     if (!l1) return 0;
 

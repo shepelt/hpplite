@@ -219,6 +219,8 @@ static void node_learn_batch_limit(HppliteNode *node);
 /*
 ** Auto-connect to L1 and sync state.
 */
+static int node_ensure_lease(HppliteNode *node);
+
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (node->follower) return;
     if (!config->rpcUrl) return;
@@ -280,11 +282,15 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         }
     }
 
-    /* Catch up with whatever is already on L1 */
+    /* Catch up with whatever is already on L1, then take the lease now
+    ** rather than at the first write: a restart has no window in which the
+    ** rollup is unclaimed, and lease trouble shows at open */
     if (node->l1) {
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
+        } else if (!node->follower && (node->cipher || node->config.noEncrypt)) {
+            node_ensure_lease(node);
         }
     }
 }
@@ -463,6 +469,7 @@ static void node_learn_batch_limit(HppliteNode *node) {
 static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
                                        const uint8_t *data, size_t dataLen) {
     HppliteBatch *batch = NULL;
+    node->lastFetchForeign = 0;
     if (!data || dataLen == 0) return NULL;
     if (hpplite_envelope_is_sealed(data, dataLen)) {
         const HppliteCipher *scheme = NULL;
@@ -474,8 +481,11 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         }
         plain = hpplite_envelope_open(node->encKey, height, data, dataLen, NULL, &scheme);
         if (!plain) {
+            /* A known scheme that fails our tag was sealed with another key:
+            ** posted under a lease we did not hold. Provably not ours. */
+            node->lastFetchForeign = (scheme != NULL);
             fprintf(stderr, "hpplite: batch %llu: %s\n", (unsigned long long)height,
-                    scheme ? "wrong key (authentication failed)" : "unknown encryption scheme");
+                    scheme ? "not sealed with our key (posted by another sequencer)" : "unknown encryption scheme");
             return NULL;
         }
         batch = hpplite_batch_from_json((const char *)plain);
@@ -488,6 +498,36 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
                 (unsigned long long)height, dataLen);
     }
     return batch;
+}
+
+/*
+** The batch at our next height is not ours (fails our authentication): it was
+** posted by whoever held the lease. Nobody with our key can read it, so every
+** key holder skips the height the same way and reconstruction goes on. The
+** raw bytes are hashed into the chain of block hashes so the skip is part of
+** the history, not an omission.
+*/
+static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
+    size_t len = 0;
+    uint8_t *raw;
+    unsigned char h[32];
+    int rc;
+    /* Every batch failing our tag from height 1 on is not an intruder, it is
+    ** the wrong key on our side (or someone else's rollup): never skip that. */
+    if (height <= 1) {
+        fprintf(stderr, "hpplite: batch 1 is not sealed with our key: wrong key or wrong rollup\n");
+        return -1;
+    }
+    raw = hpplite_l1_get_batch(node->l1, height, &len);
+    if (!raw) return -1;
+    hpplite_sha256(raw, len, h);
+    free(raw);
+    rc = hpplite_skip_height(node->ctx, height, h);
+    if (rc == SQLITE_OK) {
+        fprintf(stderr, "hpplite: batch %llu was posted by another sequencer; skipped (%llu so far)\n",
+                (unsigned long long)height, (unsigned long long)node->ctx->nForeignBatches);
+    }
+    return rc == SQLITE_OK ? 0 : -1;
 }
 
 HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
@@ -521,7 +561,11 @@ static int node_adopt_existing(HppliteNode *node) {
     if (lastBatch < node->ctx->blockHeight) return 0;
 
     batch = node_fetch_batch(node, node->ctx->blockHeight);
-    if (!batch) return 0;
+    if (!batch) {
+        /* someone else's batch sits at our height: step over it and post after it */
+        if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) return 1;
+        return 0;
+    }
     rc = hpplite_adopt_batch(node->ctx, batch);
     hpplite_batch_free(batch);
     if (rc == SQLITE_OK) {
@@ -566,7 +610,28 @@ static int node_ensure_lease(HppliteNode *node) {
     remaining = st->leaseExpiry > chainNow ? st->leaseExpiry - chainNow : 0;
     ours = remaining > 0 && memcmp(st->sequencerInstance, node->instanceId, 32) == 0;
     if (st->leaseDuration > 0) node->leaseDuration = st->leaseDuration;
-    hpplite_l1_state_free(st);
+    {
+        /* A stranger's lease on a rollup we own (possible on rollups from the
+        ** pre-VERSION-5 factory): the owner expires it and takes it back. A
+        ** sibling instance of our own wallet is left alone - no takeover. */
+        unsigned char me[20];
+        int stranger = remaining > 0 && !ours && hpplite_l1_get_my_address(node->l1, me) == 0
+                       && memcmp(st->sequencerWallet, me, 20) != 0;
+        int weOwn = stranger && memcmp(st->owner, me, 20) == 0;
+        hpplite_l1_state_free(st);
+        if (stranger && weOwn) {
+            char *tx = hpplite_l1_release_lease(node->l1, NULL);   /* forceExpireLease: owner only */
+            fprintf(stderr, "hpplite: another wallet holds the lease of our rollup; %s\n",
+                    tx ? "expiring it as owner" : "could not expire it");
+            if (tx) {
+                hpplite_l1_wait_for_tx(node->l1, tx, 30);
+                sqlite3_free(tx);
+                remaining = 0;                                     /* free now: claim below */
+            }
+        } else if (stranger) {
+            fprintf(stderr, "hpplite: another wallet holds the lease and we are not the owner\n");
+        }
+    }
 
     if (remaining > 0 && !ours) {
         if (!node->warnedForeignLease) {
@@ -811,6 +876,10 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
         int rc;
         if (!batch) {
+            if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) {
+                synced++;
+                continue;
+            }
             fprintf(stderr, "hpplite: sync stopped at height %llu of %llu on L1\n",
                     (unsigned long long)node->ctx->blockHeight, (unsigned long long)lastBatch);
             node->state = HPPLITE_STATE_ERROR;

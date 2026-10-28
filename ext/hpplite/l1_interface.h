@@ -190,6 +190,9 @@ uint64_t hpplite_l1_default_chain_id(void);
 */
 int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]);
 
+/* The wallet this connection signs with (needs a private key). 0 on success. */
+int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]);
+
 /*
 ** Check if we are the current sequencer.
 ** pubkey: our public key (33 bytes)
@@ -389,6 +392,12 @@ uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
 ** Make hpplite_l1_submit_batch() fail (for testing retry behaviour)
 */
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
+
+/* A lease held by someone else: wallet (NULL = a stranger) with instanceId, for `seconds` */
+void hpplite_l1_mock_claim_foreign(HppliteL1 *l1, const unsigned char *wallet,
+                                   const unsigned char instanceId[32], uint64_t seconds);
+/* Append raw bytes as the next batch, bypassing the lease (a foreign poster) */
+void hpplite_l1_mock_inject_batch(HppliteL1 *l1, const uint8_t *data, size_t len);
 
 /* Make hpplite_l1_wait_for_tx() take this long (a flush that is in flight) */
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms);

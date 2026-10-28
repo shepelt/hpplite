@@ -75,6 +75,7 @@ typedef struct HppliteNode {
     int64_t leaseRecheckAt;         /* Next time to read the lease from L1 (ms, monotonic) */
     uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
     int warnedForeignLease;         /* "someone else holds the lease" said once */
+    int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */
     int64_t retryAt;                /* Timer does not retry before this (ms, monotonic) */
 
