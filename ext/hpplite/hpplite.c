@@ -474,6 +474,36 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
 }
 
 /*
+** Replay re-executes SQL text, so a statement whose result depends on
+** anything but the database (random values, the clock, the connection) is
+** not reproducible: the sequencer's rows and a verifier's rows differ and
+** the root check fails. Spot the usual suspects and count them, so a user
+** can see why verification would fail (hpplite_status.nondeterministic).
+*/
+static int isNondeterministicSql(const char *z) {
+  /* z is lowercased by the caller */
+  static const char *aFn[] = {
+    "random(", "randomblob(", "current_time", "current_date", "current_timestamp",
+    "last_insert_rowid(", "changes(", "total_changes(", "sqlite_version(",
+    "load_extension(", "'now'", NULL
+  };
+  int i;
+  for (i = 0; aFn[i]; i++) {
+    if (strstr(z, aFn[i])) return 1;
+  }
+  return 0;
+}
+
+static void lowercaseCopy(const char *z, char *out, size_t n) {
+  size_t i;
+  for (i = 0; i + 1 < n && z[i]; i++) {
+    char c = z[i];
+    out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+  }
+  out[i] = 0;
+}
+
+/*
 ** Trace callback. SQLITE_TRACE_STMT runs at the start of every statement on
 ** the application connection: the statement text is written into
 ** _hpplite_pending through the same connection, so the row is part of
@@ -496,6 +526,17 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
   if (!isTrackedSql(zSql)) return 0;
   if (strstr(zSql, "_hpplite_")) return 0;  /* never log our own tables */
+  {
+    char lower[512];
+    lowercaseCopy(zSql, lower, sizeof(lower));
+    if (isNondeterministicSql(lower)) {
+      if (pCtx->nNondeterministic == 0) {
+        fprintf(stderr, "hpplite: statement uses a non-deterministic function; replay cannot "
+                        "reproduce it and verification will report a mismatch: %.80s\n", zSql);
+      }
+      pCtx->nNondeterministic++;
+    }
+  }
 
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
@@ -762,8 +803,10 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
 
   if (pBatch) {
     pBatch->timestamp = (uint64_t)time(NULL);
-    if (withRoot) {
-      /* State root is taken in the same snapshot as the pending rows */
+    /* State root is taken in the same snapshot as the pending rows. A cut
+    ** batch carries no root (the series' last one does), so do not pay for
+    ** the O(database) hash on chunks that will drop it anyway. */
+    if (withRoot && !pBatch->partial) {
       unsigned char root[HPPLITE_HASH_SIZE];
       if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
         hpplite_batch_set_post_state(pBatch, root);
@@ -1140,6 +1183,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_REPLAY_SKIPPED 7
 #define STATUS_COL_ENCRYPTION 8
 #define STATUS_COL_KEYED 9
+#define STATUS_COL_NONDETERMINISTIC 10
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1149,7 +1193,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
     rc = sqlite3_declare_vtab(db,
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
-        " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER)");
+        " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
+        " nondeterministic INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1249,6 +1294,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_KEYED:
             sqlite3_result_int(ctx, node->config.hasPrivkey ? 1 : 0);
+            break;
+        case STATUS_COL_NONDETERMINISTIC:
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nNondeterministic);
             break;
         default:
             sqlite3_result_null(ctx);
@@ -1357,6 +1405,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->hasContract = cfg->hasContract;
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
+    nc->checkpointInterval = cfg->checkpointInterval;
 
     /* Role removed - always sequencer in simplified model */
 }

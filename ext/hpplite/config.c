@@ -197,6 +197,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
 
+    /* Checkpoint interval */
+    val = getenv(HPPLITE_ENV_CHECKPOINT);
+    if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
+
     return 0;
 }
 
@@ -374,6 +378,11 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->encrypt = parse_bool(buf);
     }
 
+    /* Checkpoint interval */
+    if (get_uri_param(uri, HPPLITE_URI_CHECKPOINT, buf, sizeof(buf)) && atoi(buf) > 0) {
+        cfg->checkpointInterval = atoi(buf);
+    }
+
     return 0;
 }
 
@@ -486,6 +495,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     /* Encryption */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
+
+    /* Checkpoint interval */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT);
+    if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
 
     return 0;
 }

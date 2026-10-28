@@ -261,6 +261,24 @@ static void test_statement_classification(void) {
     PASS();
 }
 
+static void test_nondeterminism_detected(void) {
+    sqlite3 *db; HppliteCtx *ctx;
+    TEST("non-deterministic statements are counted");
+    if (!open_ctx(&db, &ctx)) FAIL("open");
+    exec(db, "CREATE TABLE t(x, ts)");
+    exec(db, "INSERT INTO t VALUES(1, 'fixed')");
+    if (ctx->nNondeterministic != 0) FAIL("deterministic SQL flagged");
+    exec(db, "INSERT INTO t VALUES(random(), 'r')");
+    exec(db, "INSERT INTO t VALUES(2, datetime('now'))");
+    exec(db, "INSERT INTO t VALUES(3, CURRENT_TIMESTAMP)");
+    exec(db, "INSERT INTO t VALUES(RANDOMBLOB(4), 'b')");
+    if (ctx->nNondeterministic != 4) { printf("(count=%llu) ", (unsigned long long)ctx->nNondeterministic); FAIL("expected 4 flagged statements"); }
+    exec(db, "UPDATE t SET x = 9 WHERE ts = 'fixed'");
+    if (ctx->nNondeterministic != 4) FAIL("deterministic UPDATE flagged");
+    close_ctx(db, ctx);
+    PASS();
+}
+
 static void test_callbacks(void) {
     sqlite3 *db; HppliteCtx *ctx;
     TEST("commit and rollback callbacks fire per transaction");
@@ -303,6 +321,7 @@ int main(void) {
     test_root_covers_schema_kinds_and_types();
     test_root_ignores_hpplite_tables();
     test_statement_classification();
+    test_nondeterminism_detected();
     test_callbacks();
     test_txn_groups();
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);

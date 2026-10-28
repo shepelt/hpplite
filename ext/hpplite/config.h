@@ -17,6 +17,7 @@
 **   HPPLITE_DATA_DIR          - Local data directory
 **   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m)
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
+**   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
 **   HPPLITE_ROLE              - sequencer|observer
 **   HPPLITE_NODE_ID           - Node identifier (status output only)
 */
@@ -44,6 +45,7 @@ extern "C" {
 #define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
 #define HPPLITE_ENV_BATCH_INTERVAL "HPPLITE_BATCH_INTERVAL"
 #define HPPLITE_ENV_ENCRYPT       "HPPLITE_ENCRYPT"
+#define HPPLITE_ENV_CHECKPOINT    "HPPLITE_CHECKPOINT_INTERVAL"
 
 /*
 ** URI parameter names (same as env vars but lowercase, no prefix)
@@ -58,6 +60,7 @@ extern "C" {
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_ENCRYPT       "encrypt"
+#define HPPLITE_URI_CHECKPOINT    "checkpoint"
 #define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
 
@@ -102,6 +105,7 @@ typedef struct HppliteConfig {
     /* Batching */
     int batchIntervalMs;             /* Batch interval in milliseconds */
     int encrypt;                     /* Seal batches before posting (default 1) */
+    int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */

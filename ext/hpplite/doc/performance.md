@@ -57,6 +57,34 @@ not per batch, so at the v0.1 size bound (~100 MB) it costs under a second
 every few minutes of continuous writing. Issue #9 (incremental per-table
 roots) is the plan beyond that.
 
+## Stress test: 100 MB end to end
+
+`tests/stress/stress_hpplite.c` (`make stress`): writes through HPPLite with
+encryption on, the 128 KB DA limit (so batches are cut into series), a
+checkpoint every 20 batches (roots computed and checkpoints submitted), then
+rebuilds a fresh database from the mock L1 and compares content roots.
+
+| | |
+|---|---:|
+| rows / size | 1 729 000 rows, 100 MB on disk, ~500 rows per transaction |
+| batches | 2 075 (1 729 partial, largest 112 805 B sealed), 86 with a root |
+| checkpoints | 86, last root == live content root |
+| write | 5.2 s (333 000 rows/s) |
+| flush total | 50 s, of which ~45 s is the 86 root computations (one root at 100 MB: 1.04 s) |
+| reconstruct from L1 | 50 s for 2 075 batches; dominated by verifying the root at each of the 86 checkpoints |
+| result | row count, height and content root identical; 0 statements skipped |
+
+Two things this run established: the root is the cost at this size (with the
+default interval of 100 batches it would be ~10 s of the flush total instead
+of ~45 s), and replay verification costs the same hashes again. Both are the
+#9 incremental-root item; nothing else in the pipeline is size-sensitive.
+
+It also caught two defects before the numbers above: a series of chunks
+computed and discarded the root on every partial chunk once an interval was
+reached (flush 232 s instead of 50 s), and a generator using `randomblob()`
+showed that SQL-text replay cannot reproduce non-deterministic statements
+(now detected and counted, #19).
+
 ## What the benchmark has caught
 
 - `hpplite_build_batch_limited` cut over-limit batches by re-serializing

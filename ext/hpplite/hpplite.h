@@ -69,6 +69,7 @@ struct HppliteCtx {
 
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
+  uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */
 
   /* Callbacks for external integration */
   void *pCallbackArg;

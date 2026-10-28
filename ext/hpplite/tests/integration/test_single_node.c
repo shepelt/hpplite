@@ -19,6 +19,7 @@
 */
 
 #include "hpplite.h"
+#include "batch.h"
 #include "l1_interface.h"
 #include "test_util.h"
 #include "sqlite3.h"
@@ -59,8 +60,10 @@ static int test_open(sqlite3 **pDb) {
     printf("\n=== Phase 1: Open with Transparent API ===\n");
 
     char uri[1024];
+    /* checkpoint=1: every batch closes an interval, so the flush below computes
+    ** the state root and submits a real checkpoint to the coordinator contract */
     snprintf(uri, sizeof(uri),
-        "file:%s/test.db?hpplite=on&rpc=%s&factory=%s&privkey=%s&datadir=%s",
+        "file:%s/test.db?hpplite=on&rpc=%s&factory=%s&privkey=%s&datadir=%s&checkpoint=1",
         g_datadir, RPC_URL, FACTORY_ADDRESS, g_privkey_hex, g_datadir);
 
     printf("  URI: %s\n", uri);
@@ -132,7 +135,20 @@ static int test_flush(sqlite3 *db) {
 
     if (total == 0) FAIL("No batches on L1");
 
-    printf("  PASS: Batch submitted to L1\n");
+    /* The batch closed a checkpoint interval: a checkpoint with the content
+    ** root must now be on the coordinator contract and match our root */
+    HppliteL1State *state = hpplite_l1_get_state(l1);
+    if (!state) FAIL("Could not get L1 coordinator state");
+    unsigned char root[32];
+    hpplite_state_root(db, root);
+    char hex[65]; hpplite_to_hex(root, 32, hex);
+    printf("  L1 checkpoint: height=%llu root=0x%.16s...\n",
+           (unsigned long long)state->lastCheckpointHeight, hex);
+    if (state->lastCheckpointHeight != 1) { hpplite_l1_state_free(state); FAIL("Checkpoint not submitted at height 1"); }
+    if (memcmp(state->lastStateRoot, root, 32) != 0) { hpplite_l1_state_free(state); FAIL("On-chain checkpoint root != local content root"); }
+    hpplite_l1_state_free(state);
+
+    printf("  PASS: Batch submitted to L1, checkpoint root anchored\n");
     return 0;
 }
 

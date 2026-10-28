@@ -173,6 +173,11 @@ if(HPPLITE_BUILD_TESTS)
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
         target_link_libraries(bench_hpplite hpplite)
         add_custom_target(bench COMMAND bench_hpplite DEPENDS bench_hpplite USES_TERMINAL)
+
+        # Stress test (not a test): 100 MB through encryption, DA chunking, checkpoints, reconstruction
+        add_executable(stress_hpplite tests/stress/stress_hpplite.c)
+        target_link_libraries(stress_hpplite hpplite)
+        add_custom_target(stress COMMAND stress_hpplite DEPENDS stress_hpplite USES_TERMINAL)
     endif()
 
     # Loadable extension against stock SQLite: links only the amalgamation,

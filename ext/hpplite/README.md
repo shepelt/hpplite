@@ -86,6 +86,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `datadir` | No | Local data directory |
 | `interval` | No | Batch flush interval, e.g. `5s` (default) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
+| `checkpoint` | No | Batches per checkpoint / state root (default 100) |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -139,6 +140,9 @@ export HPPLITE_PRIVATE_KEY=0x...
 
 # Microbenchmark (write overhead, flush, replay, root hash); see doc/performance.md
 make bench
+
+# Stress: 100 MB through encryption, DA chunking, checkpoints with roots, reconstruction
+make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYTES]
 ```
 
 ## Gas Costs (HPP Sepolia)
@@ -223,6 +227,18 @@ Beyond that, shard per tenant (the factory can create several rollups per wallet
 until v0.3.
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
+
+## Determinism
+
+HPPLite replays SQL *text*, so a statement must produce the same rows wherever
+it runs. Values that depend on anything but the database are not reproducible
+and will make verification report a mismatch - correctly, because the data
+really differs: `random()`, `randomblob()`, `datetime('now')`,
+`CURRENT_TIMESTAMP` (also as a column `DEFAULT`), `last_insert_rowid()`,
+`changes()`. Compute such values in the application and **bind** them:
+bound parameters are expanded into the captured statement and replay exactly.
+Capture warns once and counts offenders in `hpplite_status.nondeterministic`.
+Row-level capture, which removes the restriction, is tracked in #19.
 
 ## Keys
 

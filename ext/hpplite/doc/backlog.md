@@ -34,6 +34,15 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Stress test and determinism
+- `tests/stress/stress_hpplite.c` (`make stress`): 100 MB through encryption,
+  DA chunking, checkpoints with roots, reconstruction compared by root
+- Capture counts non-deterministic statements (`random()`, `'now'`, ...);
+  row-level capture is #19 (v0.3)
+- `checkpoint=` URI / `HPPLITE_CHECKPOINT_INTERVAL`; the integration test now
+  anchors a real checkpoint root on HPP Sepolia and compares it with the
+  local content root
+
 ### Keys in v0.1 (issue #16)
 - Key file loader refuses group/world-readable or non-regular files, accepts
   `0x`/bare hex with whitespace; a node without a key never posts (plaintext
