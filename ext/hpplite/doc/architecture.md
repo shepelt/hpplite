@@ -84,7 +84,7 @@ Rebuild and compare, today:
 ```bash
 sqlite3> .load ./hpplite
 sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
-sqlite3> SELECT height, hex(state_root), replay_skipped FROM hpplite_status;
+sqlite3> SELECT height, state_root, replay_skipped FROM hpplite_status;
 ```
 
 `hpplite verify` (v0.2, #5) packages this without writing a file and with
@@ -292,7 +292,7 @@ excluded; a database with no user schema has the zero root.
 It is a function of the file, not of the history that produced it. Two
 databases with the same content have the same root whatever statements
 built them, and anyone holding a reconstructed database can recompute it
-(`hpplite_db_hash()` in C, `SELECT hex(state_root) FROM hpplite_status` in
+(`hpplite_db_hash()` in C, `SELECT state_root FROM hpplite_status` in
 SQL) and compare with what the sequencer posted.
 
 Computing it is O(database size) (~9 ms/MB in a Release build), so it is computed at

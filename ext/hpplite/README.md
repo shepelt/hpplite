@@ -249,13 +249,13 @@ same key and `l1=`/`contract=`; every batch is fetched, opened and replayed,
 and after each batch that carries a state root the content hash of the
 rebuilt database is compared with the posted one (`hpplite: state root
 mismatch after replaying batch N` on stderr when they differ). The live root
-of any database is `SELECT hex(state_root) FROM hpplite_status` (or
+of any database is `SELECT state_root FROM hpplite_status` (or
 `hpplite_db_hash()` from C).
 
 ```bash
 sqlite3> .load ./hpplite
 sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
-sqlite3> SELECT height, hex(state_root), replay_skipped FROM hpplite_status;
+sqlite3> SELECT height, state_root, replay_skipped FROM hpplite_status;
 ```
 
 A `hpplite verify` command that does this without writing a file, reports
