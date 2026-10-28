@@ -92,7 +92,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f` | Creates rollups (one per wallet); built into the `hpp-sepolia` alias |
+| HPPLiteFactory | `0x9c6abd030e61bcc5146db942b1dd4f705ba81897` | Creates rollups (one per wallet); built into the `hpp-sepolia` alias. Contract VERSION 5 (sequencer-only lease claim); rollups from the previous factory `0x9cfacba5…` keep working but keep the permissionless claim |
 | HPPLite | *(per wallet)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per wallet)* | Your rollup's data-availability contract: batch data |
 

@@ -107,7 +107,7 @@ Configuration can also be set via environment (URI params take priority):
 
 ```bash
 export HPPLITE_L1_RPC=https://sepolia.hpp.io
-export HPPLITE_FACTORY_ADDRESS=0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f
+export HPPLITE_FACTORY_ADDRESS=0x9c6abd030e61bcc5146db942b1dd4f705ba81897
 export HPPLITE_PRIVATE_KEY=0x...
 export HPPLITE_DATA_DIR=/var/lib/hpplite
 export HPPLITE_BATCH_INTERVAL=60s
@@ -118,7 +118,7 @@ export HPPLITE_BATCH_INTERVAL=60s
 **HPP Sepolia** (recommended for testing):
 - Chain ID: 181228
 - RPC: https://sepolia.hpp.io
-- Factory: `0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f`
+- Factory: `0x9c6abd030e61bcc5146db942b1dd4f705ba81897`
 - Alias: `hpp-sepolia` (use `l1=hpp-sepolia` for auto-config)
 
 ## Verification
