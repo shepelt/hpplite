@@ -93,7 +93,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 | Contract | Address | Description |
 |----------|---------|-------------|
 | HPPLiteFactory | `0x9cfacba505ee281f1f6b0bd5bef8073a21f1519f` | Creates rollups (one per wallet); built into the `hpp-sepolia` alias |
-| HPPLite | *(per wallet)* | Your rollup's coordination contract: sequencer lease, checkpoints |
+| HPPLite | *(per wallet)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per wallet)* | Your rollup's data-availability contract: batch data |
 
 The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`); `ctest` fails if this README disagrees with it.

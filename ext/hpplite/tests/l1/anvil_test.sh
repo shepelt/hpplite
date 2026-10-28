@@ -23,5 +23,7 @@ for i in $(seq 1 50); do cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 && break
 cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 || { echo "anvil did not start"; cat "$log"; exit 1; }
 factory=$(cd "$contracts" && HPPLITE_PRIVATE_KEY=$key0 forge script script/DeployFactory.s.sol --rpc-url "$rpc" --broadcast 2>&1 | sed -n 's/.*HPPLiteFactory deployed at: *//p' | head -1)
 [ -n "$factory" ] || { echo "factory deployment failed"; exit 1; }
+# forge script prints the simulated address even when the broadcast reverted (e.g. over the 24 KB size limit)
+[ "$(cast code "$factory" --rpc-url "$rpc" 2>/dev/null | wc -c)" -gt 10 ] || { echo "factory at $factory has no code: deployment reverted (forge build --sizes)"; exit 1; }
 echo "anvil on $rpc, factory $factory"
 HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 "$bin"

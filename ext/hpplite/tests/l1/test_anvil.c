@@ -157,7 +157,8 @@ static void test_stranger_after_expiry(void) {
     char *tx = hpplite_l1_claim_sequencer(stranger, inst);
     int claimed = tx && hpplite_l1_wait_for_tx(stranger, tx, 30) == 1;
     sqlite3_free(tx);
-    printf("(stranger claim %s) ", claimed ? "ACCEPTED by the current contract" : "rejected");
+    printf("(stranger claim %s) ", claimed ? "ACCEPTED (old contract)" : "rejected");
+    if (claimed) FAIL("the contract let a stranger claim the lease (#48)");
     sqlite3_exec(a, "INSERT INTO t VALUES(5)", NULL, NULL, NULL);
     uint64_t h = (uint64_t)scalar(a, "SELECT hpplite_flush()");
     if (claimed) {

@@ -381,7 +381,8 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
 /*
 ** Release the lease (owner expires it)
 */
-char *hpplite_l1_release_lease(HppliteL1 *l1) {
+char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    (void)instanceId;
     if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
     l1->leaseExpiry = l1->currentTimestamp;
     mockSaveState(l1);

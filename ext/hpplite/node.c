@@ -987,7 +987,7 @@ int hpplite_node_release_lease(HppliteNode *node) {
             return -1;
         }
     }
-    char *txHash = hpplite_l1_release_lease(node->l1);
+    char *txHash = hpplite_l1_release_lease(node->l1, node->instanceId);
     if (!txHash) {
         fprintf(stderr, "hpplite: lease release transaction could not be sent\n");
         return -1;

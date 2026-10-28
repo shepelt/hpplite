@@ -3,18 +3,21 @@ pragma solidity ^0.8.19;
 
 /**
  * @title HPPLite
- * @notice HPPLite L2 System Contract - Singleton Sequencer Model
- * @dev Manages sequencer lease, checkpoints, and coordinates with DA contract.
- *      Security model: same as Optimism/Arbitrum - centralized sequencer,
- *      decentralized verification via L1 data availability.
+ * @notice HPPLite coordinator - singleton sequencer
+ * @dev Manages the sequencer lease and checkpoints, and names the DA contract.
+ *      One wallet (the owner, or the address it sets with setSequencer) may
+ *      hold the lease; a lease that lapses can only be re-taken by it. The
+ *      chain holds the ordered, encrypted history and the state roots; the
+ *      key holder rebuilds and compares. No fraud proofs, no challenge period.
  */
 contract HPPLite {
     // ============ Constants ============
     uint256 public constant LEASE_DURATION = 5 minutes;
-    uint256 public constant VERSION = 4;
+    uint256 public constant VERSION = 5;
 
     // ============ State ============
     address public owner;
+    address public sequencer;          // The one wallet allowed to claim the lease (owner by default)
 
     // Sequencer lease - ensures singleton even with same private key on multiple instances
     address public sequencerWallet;
@@ -33,6 +36,8 @@ contract HPPLite {
 
     // ============ Events ============
     event SequencerClaimed(address indexed wallet, bytes32 indexed instanceId, uint256 leaseExpiry);
+    event LeaseReleased(address indexed wallet, bytes32 indexed instanceId);
+    event SequencerChanged(address indexed oldSequencer, address indexed newSequencer);
     event LeaseRenewed(address indexed wallet, bytes32 indexed instanceId, uint256 leaseExpiry);
     event CheckpointSubmitted(uint256 indexed fromHeight, uint256 indexed toHeight, bytes32 stateRoot);
     event ConfigUpdated(string indexed key, bytes value);
@@ -57,6 +62,7 @@ contract HPPLite {
         address _daContract
     ) {
         owner = msg.sender;
+        sequencer = msg.sender;
         checkpointInterval = _checkpointInterval > 0 ? _checkpointInterval : 100;
         daScheme = bytes(_daScheme).length > 0 ? _daScheme : "hppda";
         daContract = _daContract;
@@ -70,6 +76,10 @@ contract HPPLite {
      * @param instanceId Unique identifier for this process instance
      */
     function claimSequencer(bytes32 instanceId) external {
+        // Permissionless claiming was a leftover of the witness design: any
+        // wallet could take an expired lease and post a batch nobody else can
+        // decrypt, stopping every rebuild at that height for good.
+        require(msg.sender == sequencer, "Not the sequencer");
         require(
             sequencerWallet == address(0) || block.timestamp >= leaseExpiry,
             "Lease still active"
@@ -139,7 +149,33 @@ contract HPPLite {
 
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Invalid owner");
+        // The factory creates the rollup and hands it to the wallet: the
+        // sequencer follows the owner unless it was set apart explicitly
+        if (sequencer == owner) {
+            emit SequencerChanged(sequencer, newOwner);
+            sequencer = newOwner;
+        }
         owner = newOwner;
+    }
+
+    /**
+     * @notice Name the wallet allowed to claim the lease (hot key), distinct from the owner
+     */
+    function setSequencer(address newSequencer) external onlyOwner {
+        require(newSequencer != address(0), "Invalid sequencer");
+        emit SequencerChanged(sequencer, newSequencer);
+        sequencer = newSequencer;
+    }
+
+    /**
+     * @notice Give the lease up now (graceful close) - the active instance itself, no owner needed
+     */
+    function releaseLease(bytes32 instanceId) external {
+        require(msg.sender == sequencerWallet, "Not sequencer wallet");
+        require(instanceId == sequencerInstance, "Wrong instance");
+        require(block.timestamp < leaseExpiry, "Lease expired");
+        leaseExpiry = block.timestamp;
+        emit LeaseReleased(msg.sender, instanceId);
     }
 
     function setDAConfig(string calldata _scheme, address _da) external onlyOwner {

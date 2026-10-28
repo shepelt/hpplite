@@ -27,6 +27,8 @@ contract HPPLiteTest is Test {
             "hppda",        // daScheme
             address(0)      // daContract (set later)
         );
+        // the owner (this test) delegates the lease to a separate hot wallet
+        hpplite.setSequencer(sequencer);
 
         // Deploy DA contract with HPPLite as coordinator
         da = new HPPLiteDA(address(hpplite), 128 * 1024);
@@ -41,7 +43,7 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 4);
+        assertEq(hpplite.VERSION(), 5);
     }
 
     function test_ClaimSequencer() public {
@@ -57,9 +59,8 @@ contract HPPLiteTest is Test {
         vm.prank(sequencer);
         hpplite.claimSequencer(instanceId1);
 
-        // Another instance tries to claim while lease active
-        address other = address(0x999);
-        vm.prank(other);
+        // Another instance of the sequencer wallet tries to claim while lease active
+        vm.prank(sequencer);
         vm.expectRevert("Lease still active");
         hpplite.claimSequencer(instanceId2);
     }
@@ -72,13 +73,66 @@ contract HPPLiteTest is Test {
         vm.warp(block.timestamp + 6 minutes);
         assertFalse(hpplite.isLeaseActive());
 
-        // Now another can claim
-        address newSequencer = address(0x999);
-        vm.prank(newSequencer);
+        // Only the sequencer wallet can re-take it (a new instance of the same wallet)
+        vm.prank(sequencer);
         hpplite.claimSequencer(instanceId2);
 
-        assertEq(hpplite.sequencerWallet(), newSequencer);
+        assertEq(hpplite.sequencerWallet(), sequencer);
         assertEq(hpplite.sequencerInstance(), instanceId2);
+    }
+
+    function test_ClaimSequencer_StrangerRejected() public {
+        address stranger = address(0x999);
+        // before any claim
+        vm.prank(stranger);
+        vm.expectRevert("Not the sequencer");
+        hpplite.claimSequencer(instanceId2);
+        // while active
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId1);
+        vm.prank(stranger);
+        vm.expectRevert("Not the sequencer");
+        hpplite.claimSequencer(instanceId2);
+        // and after expiry - the hole external review found
+        vm.warp(block.timestamp + 6 minutes);
+        vm.prank(stranger);
+        vm.expectRevert("Not the sequencer");
+        hpplite.claimSequencer(instanceId2);
+        assertEq(hpplite.sequencerWallet(), sequencer);
+    }
+
+    function test_SetSequencer_AndOwnerFollows() public {
+        HPPLite fresh = new HPPLite(100, "hppda", address(0));
+        assertEq(fresh.sequencer(), address(this));          // owner by default
+        address newOwner = address(0xABCD);
+        fresh.transferOwnership(newOwner);
+        assertEq(fresh.sequencer(), newOwner);               // follows the owner when not set apart
+        vm.prank(newOwner);
+        fresh.setSequencer(sequencer);
+        vm.prank(newOwner);
+        fresh.transferOwnership(address(0xBEEF));
+        assertEq(fresh.sequencer(), sequencer);              // explicit sequencer stays
+        vm.prank(address(0x999));
+        vm.expectRevert("Not owner");
+        fresh.setSequencer(address(0x999));
+    }
+
+    function test_ReleaseLease() public {
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId1);
+        assertTrue(hpplite.isLeaseActive());
+        // wrong instance cannot release
+        vm.prank(sequencer);
+        vm.expectRevert("Wrong instance");
+        hpplite.releaseLease(instanceId2);
+        // the holder can, without the owner
+        vm.prank(sequencer);
+        hpplite.releaseLease(instanceId1);
+        assertFalse(hpplite.isLeaseActive());
+        // and claim again at once
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId2);
+        assertTrue(hpplite.isLeaseActive());
     }
 
     function test_RenewLease() public {
@@ -199,7 +253,7 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 4);
+        assertEq(version, 5);
         assertEq(checkpointInterval, 100);
         assertEq(leaseDuration, 5 minutes);
     }
@@ -224,6 +278,7 @@ contract HPPLiteDATest is Test {
         hpplite = new HPPLite(100, "hppda", address(0));
         da = new HPPLiteDA(address(hpplite), 128 * 1024);
         hpplite.setDAConfig("hppda", address(da));
+        hpplite.setSequencer(sequencer);
 
         // Claim sequencer
         vm.prank(sequencer);

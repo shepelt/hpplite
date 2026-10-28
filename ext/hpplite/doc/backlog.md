@@ -25,7 +25,6 @@
 ### M1: Single-Process State Tracking
 - Core state tracking (`hpplite.c`)
 - Batch serialization (`batch.c`)
-- File storage (`fs_storage.c`)
 - Crypto signing with secp256k1 (`crypto.c`)
 - Node module (`node.c`)
 - L1 mock implementation (`l1_mock.c`)
@@ -146,7 +145,7 @@ After evaluating distributed witness models, we settled on **singleton sequencer
 - Single sequencer serves all clients (strong consistency)
 - All data on L1 (verifiable, reconstructable)
 - On-demand verification (no 24/7 watchers needed)
-- Same security model as Optimism/Arbitrum
+- The chain is a witness, not a judge: ordered encrypted history + roots; key holder rebuilds and compares
 
 See [architecture.md](architecture.md) for details.
 
@@ -171,7 +170,7 @@ Rebase, never merge, so `git log version-X..hpplite` always answers "what did we
 
 ## Versions (GitHub milestones)
 
-- **v0.1 — Small databases, on-chain DA** (current, complete): scope: databases up to ~100 MB, L1 calldata DA.
+- **v0.1 — Small databases, on-chain DA** (current, complete): scope: databases up to ~100 MB, batches in contract storage on L1 (the cost driver; #11/#33).
 - **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting; #17 key roles and #15 viewing keys so someone without the wallet key can verify; #12 batch compression.
 - **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #19 row-level capture. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
@@ -228,7 +227,6 @@ ext/hpplite/
 ├── hpplite.c/h          # Core state tracking, transparent API
 ├── batch.c/h            # Batch serialization
 ├── crypto.c/h           # secp256k1 signing
-├── fs_storage.c/h       # File-based storage
 ├── node.c/h             # Node lifecycle, timer
 ├── config.c/h           # URI parsing, configuration
 ├── l1_interface.h       # L1 contract interface

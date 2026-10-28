@@ -168,7 +168,7 @@ char *hpplite_l1_renew_lease(
 ** expires the lease immediately so the next instance can claim it without
 ** waiting for LEASE_DURATION. Returns transaction hash on success, NULL on failure.
 */
-char *hpplite_l1_release_lease(HppliteL1 *l1);
+char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]);
 
 /*
 ** Check if lease is active for the given instance.

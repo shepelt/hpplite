@@ -3,6 +3,9 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc = "0.8.20"
+# size over speed: the factory embeds both contracts and sits near the 24 KB limit
+optimizer = true
+optimizer_runs = 1
 
 [rpc_endpoints]
 hpp_sepolia = "https://sepolia.hpp.io"

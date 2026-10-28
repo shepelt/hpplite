@@ -19,6 +19,7 @@ struct HppliteL1 {
     EthClient *eth;
     uint8_t contract[20];      /* Main HPPLite contract */
     uint8_t da_contract[20];   /* HPPLiteDA contract (for on-chain DA) */
+    uint64_t version;          /* Coordinator VERSION, learned from getSystemConfig() */
     int has_da_contract;
     uint8_t privkey[32];
     int has_privkey;
@@ -54,6 +55,7 @@ static uint8_t SEL_GET_DA_STATE[4];
 static uint8_t SEL_GET_ROLLUP[4];
 static uint8_t SEL_HAS_ROLLUP[4];
 static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
+static uint8_t SEL_RELEASE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
 static uint8_t SEL_CREATE_SIMPLE_ROLLUP[4];
 
@@ -79,6 +81,7 @@ static void init_selectors(void) {
     abi_function_selector("submitCheckpoint(bytes32,uint256,uint256,bytes32)", SEL_SUBMIT_CHECKPOINT);
     abi_function_selector("isLeaseActive()", SEL_IS_LEASE_ACTIVE);
     abi_function_selector("forceExpireLease()", SEL_FORCE_EXPIRE_LEASE);
+    abi_function_selector("releaseLease(bytes32)", SEL_RELEASE_LEASE);
     abi_function_selector("getSystemConfig()", SEL_GET_SYSTEM_CONFIG);
 
     /* HPPLiteDA selectors (data availability) */
@@ -297,6 +300,7 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
 
     /* Parse remaining uint256 values */
     config->version = abi_decode_uint64(result + 64);
+    l1->version = config->version;
     config->chainId = abi_decode_uint64(result + 96);
     config->batchSizeLimit = 128 * 1024;  /* Default, DA contract has actual limit */
 
@@ -412,17 +416,26 @@ char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     return hash_hex;
 }
 
-char *hpplite_l1_release_lease(HppliteL1 *l1) {
+char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
     if (!l1 || !l1->has_privkey) return NULL;
     init_selectors();
 
-    /* Build calldata: forceExpireLease() - owner only */
-    uint8_t calldata[4];
-    memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
-
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+    /* releaseLease(instanceId): the active instance gives the lease up (VERSION >= 5).
+    ** Rollups created by the older factory only have the owner-only
+    ** forceExpireLease(); the version is read on connect. */
+    uint8_t *tx_hash;
+    if (l1->version >= 5 && instanceId) {
+        uint8_t calldata[36];
+        memcpy(calldata, SEL_RELEASE_LEASE, 4);
+        memcpy(calldata + 4, instanceId, 32);
+        tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+    } else {
+        uint8_t calldata[4];
+        memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
+        tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+    }
     if (!tx_hash) {
-        fprintf(stderr, "hpplite: forceExpireLease: %s\n", eth_client_error(l1->eth));
+        fprintf(stderr, "hpplite: lease release: %s\n", eth_client_error(l1->eth));
         return NULL;
     }
 
