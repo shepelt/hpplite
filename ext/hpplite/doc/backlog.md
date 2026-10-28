@@ -2,6 +2,26 @@
 
 ## Completed
 
+### v0.1 hardening (issues #20-#23, #29, #30; persona reviews)
+- Lost captures under the bookkeeping thread (#20): the flag that hides
+  HPPLite's own statements from the trace is never touched from the timer
+  thread; bookkeeping and replay run on their own connection
+- Capture is fail-closed: a statement whose log row cannot be written, that
+  is too long for one DA batch, or whose parameters cannot be expanded is
+  refused with `SQLITE_INTERRUPT`; `_hpplite_` inside a string literal is
+  data; `without rowid` in any spelling hashes
+- Lease (#21, client side): read before every submit, renewed past half
+  life, never posted into a foreign lease, exponential backoff on failures
+- Checkpoint cadence survives restarts (#22); registry mutex, node-lifetime
+  flush mutex, once-only curl/secp256k1 init (#23); undecodable batches and
+  halted sync are reported (#29); envelope truncation OOB read (#30)
+- `hpplite=on` that cannot be honoured fails the open; a second copy of
+  HPPLite in one connection is refused; `:memory:` never gets a timer; a
+  configured-but-unreachable L1 keeps batches pending
+- `tools/linux_test.sh`: build + ctest on Ubuntu in a container (plain,
+  asan, tsan, stress); first run found the malloc/sqlite3_free mismatch on
+  tx hashes that macOS tolerated
+
 ### M1: Single-Process State Tracking
 - Core state tracking (`hpplite.c`)
 - Batch serialization (`batch.c`)
@@ -136,8 +156,8 @@ Rebase, never merge, so `git log version-X..hpplite` always answers "what did we
 ## Versions (GitHub milestones)
 
 - **v0.1 — Small databases, on-chain DA** (current, complete): scope: databases up to ~100 MB, L1 calldata DA.
-- **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting.
-- **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #12 batch compression. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
+- **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting; #17 key roles and #15 viewing keys so someone without the wallet key can verify; #12 batch compression.
+- **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #19 row-level capture. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
 
 ---
@@ -212,8 +232,8 @@ ext/hpplite/
 │   ├── unit/            # Mock L1 tests
 │   └── integration/     # Real L1 tests
 ├── examples/            # Usage examples
-├── patches/             # The one SQLite core patch + UPSTREAM_BASE
-├── tools/               # sync_upstream.sh
+├── patches/             # UPSTREAM_BASE (no core patches)
+├── tools/               # sync_upstream.sh, check_docs.sh, linux_test.sh + linux/Dockerfile
 └── doc/                 # Documentation
     ├── architecture.md
     └── backlog.md

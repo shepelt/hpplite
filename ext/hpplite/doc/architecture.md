@@ -1,22 +1,29 @@
 # HPPLite Architecture
 
-**Singleton Sequencer with L1 Data Availability**
+**One writer, a chain for the history, a hash for the state**
 
 ## Overview
 
-HPPLite is an L2/L3 rollup that brings SQLite to the blockchain. It uses a **singleton sequencer** model with full data availability on L1, matching the security model of production L2s like Optimism and Arbitrum.
+HPPLite is a SQLite extension that keeps a statement-level write log inside
+the database file, posts it to a chain in encrypted batches, and anchors a
+content hash of the database at a fixed cadence. The shape is the one L2
+rollups use - a single sequencer, data availability on L1, periodic state
+commitments - borrowed because it is the simplest shape that gives a SQLite
+application an ordered, durable, checkable history without changing how the
+application talks to SQLite. The comparison stops there: there are no
+funds, no fraud proofs and no challenge period in HPPLite.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         HPPLite                             │
 │                                                             │
-│   Clients ──────► Sequencer ──────► L1 Contract             │
-│                      │               - Batch DA             │
-│                      │               - Checkpoints          │
-│                      ▼               - State roots          │
+│   App ──────► Sequencer (your process) ──► L1 contracts     │
+│                      │                     - batch DA       │
+│                      │                     - checkpoints    │
+│                      ▼                     - state roots    │
 │                   SQLite                                    │
 │                                                             │
-│   Anyone can verify: hpplite verify <contract>              │
+│   Rebuild and compare: open an empty file with the key      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,71 +43,52 @@ sqlite3_exec(db, "SELECT * FROM users WHERE id=1", ...);
 
 Distributed writes break this. Solutions like multi-master (AergoLite) require append-only restrictions. HPPLite keeps full SQL by using a single sequencer.
 
-**This is the same model as major L2s:**
-- Optimism: centralized sequencer
-- Arbitrum: centralized sequencer
-- Base: centralized sequencer
-- zkSync: centralized sequencer
+The same choice every production L2 makes (Optimism, Arbitrum, Base, zkSync
+all run one sequencer), for the same reason.
 
-### What Makes It Secure?
+### What the chain gives you
 
 | Layer | What It Provides |
 |-------|------------------|
-| **L1 Data Availability** | All batch data on-chain, anyone can reconstruct |
-| **Checkpoints** | State roots anchored to L1 |
-| **Verifiability** | Anyone can replay and verify |
-| **Challenge Period** | Time window to detect fraud |
+| **Data availability** | Every batch on-chain; a second machine with the key rebuilds the database from nothing else |
+| **Checkpoints** | Content hashes anchored at a fixed cadence; a rebuilt database is compared against them |
+| **Lease** | One posting instance at a time; a crashed instance's lease expires in 5 minutes |
 
-The sequencer cannot:
-- **Corrupt state** - all data is on L1, verifiable
-- **Steal funds** - invalid state transitions detectable
-- **Hide fraud** - full history on L1
-
-The sequencer can only:
-- **Order transactions** (MEV possible)
-- **Censor temporarily** (but not permanently with forced inclusion)
-- **Go offline** (liveness, not safety)
+What it does not give you in v0.1: public verifiability (batches are
+encrypted, so replay needs the key - viewing keys are v0.2), a penalty for
+a sequencer that diverges (nothing is at stake on-chain), or a verifier
+that runs without you (checking is on demand, by the key holder).
 
 ---
 
-## Security Model: "Trust But Verify"
+## Trust model
 
-### The Honest Reality
-
-This is the same "optimistic" security as billion-dollar L2s:
+The sequencer is the application's own process and is trusted to execute
+SQL. The chain is a witness, not a judge:
 
 ```
-Sequencer posts batches to L1
+Sequencer executes SQL, logs it in the same transaction
     ↓
-Assumed valid (optimistic)
+Batches posted in order under the lease; roots anchored every N batches
     ↓
-Challenge period (anyone can verify)
-    ↓
-Finalized
+Key holder rebuilds from the chain whenever they like, compares the roots
 ```
 
-**If no one verifies during the challenge period, fraud becomes canonical.**
+A sequencer that lost its disk recovers from the chain. A sequencer whose
+file was tampered with produces a root that does not match the chain's and
+the next rebuild says so. That is the whole guarantee; it is the one a
+single-operator database can honestly make.
 
-This works because:
-1. Sequencer has reputation/bond at stake
-2. The *capability* to verify is the deterrent
-3. Actual fraud proofs are like nukes - exist to never be used
-
-### Who Watches the Sequencer?
-
-In Optimism/Arbitrum: permissioned validator sets, mostly run by the teams.
-
-In HPPLite: **anyone can verify on-demand**.
+Rebuild and compare, today:
 
 ```bash
-# One-click verification from L1 data
-hpplite verify 0x1234...
-
-# Or programmatically
-sqlite3_open("file:db.db?hpplite=...&mode=verify")
+sqlite3> .load ./hpplite
+sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
+sqlite3> SELECT height, hex(state_root), replay_skipped FROM hpplite_status;
 ```
 
-No need for 24/7 witness nodes. The ability to launch verification at any time is the deterrent.
+`hpplite verify` (v0.2, #5) packages this without writing a file and with
+per-table reporting.
 
 ---
 
@@ -174,11 +162,22 @@ Flushing a batch:
 The DA contract caps a batch at `batchSizeLimit` (128 KB by default, read
 from the contract's system config on connect). Pending SQL beyond that is
 submitted as a series of batches, each cut at a transaction boundary when
-possible and marked `"partial": 1` except the last. A partial batch carries
-the state root of the end of its series, so verification compares roots at
-non-partial batches only. The timer flushes early once pending SQL reaches
-half the limit, so series are the exception. A single statement that cannot
-fit on its own is left pending and reported (`hpplite_status.log_errors`).
+possible and marked `"partial": 1` except the last. Only the last batch of
+a series carries a state root, so verification compares roots at non-partial
+batches only. The timer flushes early once pending SQL reaches half the
+limit, so series are the exception. A single statement that could not fit
+on its own is refused when it runs (see below) rather than left to block
+every later batch.
+
+Capture is fail-closed. If the log row for a statement cannot be written
+(disk full), if the statement text is longer than one DA batch can carry,
+or if its bound parameters cannot be expanded, the statement itself is
+refused: HPPLite calls `sqlite3_interrupt()` from the trace callback and the
+statement fails with `SQLITE_INTERRUPT` before it changes anything (inside
+an explicit transaction SQLite rolls the transaction back). The count is in
+`hpplite_status.log_errors` and the reason on stderr. The alternative -
+apply the write and lose the log row - is the one thing the design must
+never do.
 
 Bookkeeping (steps 1, 2, 4) runs on a second connection to the same file,
 so the background flush never touches the application's transaction state.
@@ -197,10 +196,16 @@ still usable, and that `xDisconnect` flushes, releases the lease and frees
 the node. The same code builds as a loadable extension against stock
 SQLite.
 
-On graceful close the sequencer lease is released (`forceExpireLease`, the
-wallet owns its rollup). After a crash the old lease blocks submission until
-it expires (5 minutes); writes keep accumulating in `_hpplite_pending` and
-flush once the lease is free.
+Before every submission the node reads the lease from L1: it renews its
+own lease once past half its life, claims a free one, and never posts into
+someone else's (the batch stays pending and is retried after expiry).
+Failed submissions back off exponentially, up to the lease length. On
+graceful close the lease is released (`forceExpireLease`, the wallet owns
+its rollup). After a crash the old lease blocks submission until it expires
+(5 minutes); writes keep accumulating in `_hpplite_pending` and flush once
+the lease is free. Until #17 lands, an expired lease can be claimed by any
+wallet; the node detects a foreign holder and stops posting rather than
+revert every interval.
 
 ### Determinism
 
@@ -240,7 +245,7 @@ L1 is public, so a batch is sealed before it is posted whenever the node has
 a private key:
 
 ```
-"HPE1" | scheme id | nonce (12) | ChaCha20-Poly1305(key, nonce, ad = scheme || height, batch JSON) || tag (16)
+"HPE2" | scheme id | encoding | nonce (12) | ChaCha20-Poly1305(key, nonce, ad = scheme || encoding || height, batch JSON) || tag (16)
 key = HKDF-SHA256(ikm = wallet private key, salt = "hpplite", info = "hpplite/batch-encryption/v1")
 ```
 
@@ -248,8 +253,9 @@ key = HKDF-SHA256(ikm = wallet private key, salt = "hpplite", info = "hpplite/ba
   and reconstruction/verification need only the same `privkey=`.
 - The height is associated data, so a ciphertext cannot be presented at
   another height. Each batch gets a fresh random nonce.
-- Payloads that do not start with `HPE1` are plaintext JSON (history written
-  before encryption, or `encrypt=off`); a node reads both, writes sealed.
+- Payloads that do not start with `HPE` are plaintext JSON (history written
+  before encryption, or `encrypt=off`); a node reads both (and the earlier
+  `HPE1` envelope without the encoding byte), writes `HPE2`.
 - The scheme is pluggable (`HppliteCipher` in `cipher.h`); the envelope
   names it, so new schemes can be added without touching batch or replay
   code. The v0.1 scheme is vendored ChaCha20-Poly1305 (RFC 8439): ~400
@@ -274,7 +280,8 @@ excluded; a database with no user schema has the zero root.
 It is a function of the file, not of the history that produced it. Two
 databases with the same content have the same root whatever statements
 built them, and anyone holding a reconstructed database can recompute it
-(`hpplite_db_hash()`) and compare with what the sequencer posted.
+(`hpplite_db_hash()` in C, `SELECT hex(state_root) FROM hpplite_status` in
+SQL) and compare with what the sequencer posted.
 
 Computing it is O(database size) (~9 ms/MB in a Release build), so it is computed at
 **checkpoint cadence**, not per batch: only the batch that closes a
@@ -305,33 +312,33 @@ interface IHPPLite {
 
 ### Verification
 
-Anyone can verify the entire chain:
+A key holder checks the whole history by rebuilding it:
 
 ```
-1. Fetch all batches from L1
+1. Fetch all batches from L1 and open them (the key)
 2. Replay SQL in order (each batch's transaction groups as transactions)
-3. Compute the content hash after each batch
-4. Compare against the batch's posted root and checkpointed roots
-5. If mismatch → fraud detected
+3. After each batch that carries a root, compute the content hash
+4. Compare against the posted root; report any mismatch
 ```
 
-Replay already does step 3-4 and warns on mismatch; `hpplite verify`
-packages it as a command.
-
-This doesn't require running a node 24/7. It's an on-demand audit.
+Opening an empty file with `hpplite=on` and the key does all four and
+reports on stderr; `hpplite verify` (v0.2) packages it as a command with
+per-table reporting. It is an on-demand audit, not a running node.
 
 ---
 
 ## Comparison with Other Systems
 
-| System | Sequencer | Verification | Finality |
-|--------|-----------|--------------|----------|
-| **HPPLite** | Singleton | On-demand | Checkpoint + challenge |
-| **Optimism** | Singleton | Permissioned watchers | 7-day challenge |
-| **Arbitrum** | Singleton | Validator whitelist | ~7-day challenge |
-| **AergoLite** | None (multi-master) | VRF consensus | Block votes |
+| System | Writers | History | Check |
+|--------|---------|---------|-------|
+| **HPPLite** | One process | Encrypted SQL batches on-chain + content-hash roots | Rebuild with the key, compare roots |
+| **Litestream** | One process | WAL pages to S3 | Restore; no content commitment |
+| **cr-sqlite** | Many (CRDT) | Per-row versions | Convergence, not verification |
+| **AergoLite** | Many (multi-master) | Blocks with VRF consensus | Consensus |
+| **Optimism / Arbitrum** | One sequencer | Calldata/blobs on L1 | Fraud proofs, challenge period |
 
-HPPLite matches the proven L2 model: centralized sequencer, decentralized verification.
+Closest in spirit to Litestream, with the log at the statement level, a
+content hash committed on-chain, and encryption as the default.
 
 ---
 
@@ -353,22 +360,21 @@ Future optimization: read replicas (explicit opt-in for stale reads) if needed f
 
 ---
 
-## Finality Levels
+## Where a write is
 
 ```
-┌─────────────┬────────────────────────────────────────────┐
-│ Level       │ Description                                │
-├─────────────┼────────────────────────────────────────────┤
-│ SEQUENCED   │ SQL executed by sequencer                  │
-│ L1          │ Batch submitted to L1 (data available)     │
-│ FINALIZED   │ Challenge period passed                    │
-└─────────────┴────────────────────────────────────────────┘
+┌──────────────┬─────────────────────────────────────────────────────┐
+│ Stage        │ Meaning                                             │
+├──────────────┼─────────────────────────────────────────────────────┤
+│ COMMITTED    │ In the local file, with its log row (SQLite's ACID) │
+│ ON L1        │ In a confirmed batch; survives losing the disk      │
+│ CHECKPOINTED │ Covered by an anchored state root; checkable        │
+└──────────────┴─────────────────────────────────────────────────────┘
 ```
 
-Typical latencies:
-- SEQUENCED: immediate
-- L1: seconds to minutes (batch interval)
-- FINALIZED: challenge period (configurable, e.g., hours to days)
+Typical latencies: COMMITTED immediately; ON L1 within the batch interval
+(5 s default) plus L1 confirmation; CHECKPOINTED after `checkpoint`
+batches (100 default).
 
 ---
 
@@ -376,27 +382,20 @@ Typical latencies:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `batchInterval` | Time between batch submissions | 60s |
-| `checkpointInterval` | Batches between checkpoints | 100 |
-| `challengePeriod` | Time window for fraud detection | 1 hour |
+| `interval` | Time between batch submissions | 5s |
+| `checkpoint` | Batches between checkpoints / state roots | 100 |
+| `batchSizeLimit` | Largest batch the DA contract accepts (read from the contract) | 128 KB |
+| lease | Sequencer lease length (contract constant) | 5 min |
 
 ---
 
 ## Summary
 
-HPPLite implements a practical L2/L3 for SQLite:
-
-1. **Singleton sequencer** - strong consistency, full SQL support
-2. **L1 data availability** - all data on-chain, reconstructable
-3. **On-demand verification** - anyone can verify, no 24/7 nodes needed
-4. **Same security as major L2s** - if it's good enough for Optimism, it's good enough
+1. **One writer** - strong consistency, full SQL, nothing changes for the app
+2. **The chain holds the history** - encrypted batches, reconstructable with the key
+3. **A hash holds the state** - content roots at a fixed cadence, compared on rebuild
+4. **On demand** - no node to run; open an empty file when you want to check
 
 ```
-"Centralized sequencer, decentralized verification"
-```
-
-Or more honestly:
-
-```
-"Your data on-chain, one server, verify anytime"
+"Your write log on-chain, encrypted; rebuild and compare when you like"
 ```

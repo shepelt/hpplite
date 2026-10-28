@@ -1,8 +1,22 @@
 # HPPLite
 
-A lightweight L2/L3 rollup for SQLite with L1 data availability.
+**A crash-safe, encrypted, replayable write log for SQLite, mirrored to a chain.**
 
-HPPLite enables verifiable SQL with checkpoint finality on Ethereum-compatible L1 chains. It uses the same security model as Optimism and Arbitrum: singleton sequencer with on-chain data availability.
+HPPLite is a SQLite extension. It captures every write statement inside the
+transaction that runs it, cuts the log into batches, seals them with a key
+derived from your wallet key and posts them to an Ethereum-compatible chain
+for data availability. Every N batches it anchors a SHA-256 of the whole
+database (the *state root*) on the same chain. Open an empty file with the
+same key and the database rebuilds itself from the chain; replay compares
+every posted root with what it computes and says so when they differ.
+
+Stock SQLite, loadable extension, no patches. One process writes; the chain
+keeps the history; whoever holds the key can rebuild and check it.
+
+What v0.1 is **not**: not a multi-writer database, not a public verifier
+(batches are encrypted, so only key holders can replay; viewing keys are
+v0.2), not cheap DA (batches live in contract storage on a testnet today),
+and not for databases much beyond 100 MB. See [Versions](#versions).
 
 ## Quick Start
 
@@ -24,42 +38,53 @@ sqlite3_close(db);
 
 `l1=hpp-sepolia` selects the RPC endpoint and factory contract for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). All writes are batched and submitted to L1 for data availability.
 
-## Architecture
+The same works from the stock `sqlite3` shell after `.load ./hpplite`, and
+from any language whose SQLite binding can load extensions.
+
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         HPPLite                                 │
-│                                                                 │
-│   App ──► sqlite3_open() ──► Sequencer ──► L1 Contract          │
-│                                  │          - Batch DA          │
-│                                  ▼          - Checkpoints       │
-│                              SQLite         - State roots       │
-│                                                                 │
-│   Verify anytime: hpplite verify <contract>                     │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  your process                                                        │
+│                                                                      │
+│  app ──► SQLite ──► _hpplite_pending (SQL text, inside your txn)     │
+│                           │                                          │
+│            timer / close  ▼                                          │
+│                     batch = JSON ──► ChaCha20-Poly1305 ──► L1 DA     │
+│                     every N batches: SHA-256(database) ──► L1 root   │
+└──────────────────────────────────────────────────────────────────────┘
+      rebuild: open empty file + same key ──► fetch, open, replay, compare roots
 ```
 
-**Security model:** Same as Optimism/Arbitrum - centralized sequencer, decentralized verification. All data is on L1, anyone can verify.
+- **Transparent** - `sqlite3_open_v2()` with URI parameters, or `.load`
+- **Stock SQLite** - no core patches; loadable extension against any SQLite >= 3.24
+- **Nothing to lose** - the log row is written inside your own transaction;
+  it commits and rolls back with your statement. A crash or a failed
+  submission never loses or duplicates a batch. A statement that *cannot*
+  be logged is refused (`SQLITE_INTERRUPT`) rather than applied unlogged
+- **Encrypted by default** - batches are sealed before they leave the
+  process with a key derived from your wallet key; the chain sees ciphertext
+- **Factory deploy** - one wallet, one rollup, created on first open
+- **Rebuild and check** - an empty file with the same key reconstructs from
+  the chain and compares every posted state root along the way
 
-## Features
+## Why one writer?
 
-- **Transparent API** - Just use `sqlite3_open_v2()` with URI parameters
-- **Factory Deploy** - One-click rollup creation, no manual contract deployment
-- **On-Chain DA** - Full batch data stored on L1 for reconstruction
-- **On-Demand Verification** - Anyone can verify state from L1 data
-- **State Reconstruction** - Rebuild entire database from L1 alone
-- **Stock SQLite** - No core patches; builds as a loadable extension (`.load ./hpplite`) against any SQLite >= 3.24
-- **Encrypted by default** - Batches are sealed (ChaCha20-Poly1305) with a key derived from your wallet key before they leave the process; L1 sees ciphertext
-- **Nothing to Lose** - Pending SQL lives in the database file itself, written inside your own transactions; a crash or a failed L1 submission never loses or duplicates a batch
+SQLite apps expect read-your-writes. Distributed writes would need write
+forwarding, eventual consistency or append-only restrictions; HPPLite keeps
+full SQL by having one sequencer process per database. The chain is the
+history, not a consensus layer: it makes the log durable, ordered and
+checkable, and it is what a second machine rebuilds from.
 
-## Why Singleton Sequencer?
+## What is HPP?
 
-SQLite apps expect strong consistency (read-your-writes). Distributed writes break this - you'd either need:
-- Write forwarding (complex routing)
-- Eventual consistency (breaks app expectations)
-- Append-only restrictions (limits SQL)
-
-HPPLite keeps full SQL semantics by using a single sequencer. This is the same trade-off made by every major L2.
+HPP is the Ethereum-compatible network HPPLite is built for; its Sepolia
+testnet is chain id **181228**, RPC `https://sepolia.hpp.io`, explorer
+`https://sepolia-explorer.hpp.io`. The `hpp-sepolia` alias bakes those in
+together with the factory below. Any EVM chain works with `rpc=` plus
+`factory=` (or `contract=`) once the contracts in `contracts/` are deployed
+there. You need a funded wallet for gas; the integration runner derives a
+fresh test wallet from the key in `.env` for each run.
 
 ## Contracts
 
@@ -82,9 +107,9 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `rpc` | Yes* | L1 RPC URL (if no `l1`) |
 | `factory` | Yes* | Factory contract address (if no `l1`) |
 | `contract` | No | Connect to an existing rollup instead of using the factory |
-| `privkey` | Yes | Private key for signing (or `keyfile=/path`) |
+| `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `datadir` | No | Local data directory |
-| `interval` | No | Batch flush interval, e.g. `5s` (default) |
+| `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h` |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint / state root (default 100) |
 
@@ -117,7 +142,11 @@ sqlite> SELECT hpplite_flush();            -- or just wait for the interval / cl
 ```
 
 Programs call `sqlite3_load_extension()` once; every later connection in the
-process that opens with `?hpplite=on` is handled automatically.
+process that opens with `?hpplite=on` is handled automatically. Open **one**
+`hpplite=on` connection per database file per process in v0.1 (a connection
+pool is #24); other connections to the same file should open it plainly.
+Loading HPPLite twice into one connection (static library plus module) is
+refused.
 
 **Statically linked** with the SQLite built in this tree (what the tests use):
 
@@ -131,8 +160,13 @@ cmake --build ext/hpplite/build_real
 
 ```bash
 # Unit tests (mock L1, fast, no network)
-ctest                    # 13 suites, ~6s: core, batch, node, open API,
-                         # durability (16 cases), loadable extension, docs check
+ctest                    # 15 suites, ~5s: core, batch, node, open API, cipher, keys,
+                         # durability (24 cases), loadable extension, docs check
+
+# The same on Linux, in a container (Docker or Podman; needs nothing else installed)
+ext/hpplite/tools/linux_test.sh          # Ubuntu 24.04, Release, ctest
+ext/hpplite/tools/linux_test.sh asan     # AddressSanitizer + UBSan
+ext/hpplite/tools/linux_test.sh stress   # + the 100 MB stress test
 
 # Integration tests (real L1, requires funded wallet); also runs the examples
 export HPPLITE_PRIVATE_KEY=0x...
@@ -147,22 +181,25 @@ make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYT
 
 ## Gas Costs (HPP Sepolia)
 
+Measured on the testnet; the money columns assume mainnet-Ethereum prices
+($3,500/ETH, 10 gwei) and are an upper bound, not a quote.
+
 | Operation | Gas | Cost (ETH) | Cost (USD*) |
 |-----------|-----|------------|-------------|
 | Factory deploy | 3.5M | 0.000035 | $0.12 |
 | Batch submit (~1KB) | 1.3M | 0.000013 | $0.04 |
 
-*At $3,500/ETH, 10 gwei gas price
-
-### Monthly Projections
-
-| Usage | Batches/day | Monthly Cost |
-|-------|-------------|--------------|
+| Usage | Batches/day | Monthly |
+|-------|-------------|---------|
 | Light (personal) | 10 | ~$13 |
 | Medium (small app) | 100 | ~$130 |
 | Heavy (production) | 1,000 | ~$1,300 |
 
-**Cost driver**: 97% of cost is on-chain DA storage. Consider compression for high-volume apps.
+**Cost driver**: `HPPLiteDA` keeps batch bytes in contract storage
+(`batchData[height]`), the most expensive place to put them. Posting them as
+calldata or blobs behind an event, plus compression (#12), is the v0.2/v0.3
+cost work; the timer only flushes when something is pending, so an idle
+database costs nothing.
 
 ## Components
 
@@ -195,19 +232,24 @@ function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 
 
 ## Verification
 
-Anyone can verify the chain state from L1 data:
+What exists in v0.1 is **rebuild and compare**: open an empty file with the
+same key and `l1=`/`contract=`; every batch is fetched, opened and replayed,
+and after each batch that carries a state root the content hash of the
+rebuilt database is compared with the posted one (`hpplite: state root
+mismatch after replaying batch N` on stderr when they differ). The live root
+of any database is `SELECT hex(state_root) FROM hpplite_status` (or
+`hpplite_db_hash()` from C).
 
 ```bash
-# Verify a rollup (fetches all batches from L1, replays, checks state roots)
-hpplite verify 0xYOUR_CONTRACT_ADDRESS --rpc https://sepolia.hpp.io
+sqlite3> .load ./hpplite
+sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
+sqlite3> SELECT height, hex(state_root), replay_skipped FROM hpplite_status;
 ```
 
-Or programmatically:
-```c
-sqlite3_open_v2("file:verify.db?hpplite=on&mode=verify&contract=0x...", &db, ...);
-```
-
-No need to run 24/7 nodes. The ability to verify is the security guarantee.
+A `hpplite verify` command that does this without writing a file, reports
+per-table differences, and works with a viewing key instead of the wallet key
+is v0.2 (#5, #15). There is no fraud proof or challenge period: the chain
+holds the log and the roots, the key holder is the one who checks them.
 
 ## Versions
 
@@ -215,9 +257,9 @@ Scope is tied to versions. The current branch is **v0.1 in progress**.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
-| **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches | per-tenant / single-tenant, up to ~100 MB | L1 calldata |
-| v0.2 | `hpplite verify` CLI, per-table divergence reporting | same | same |
-| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, batch compression | GB range | S3 + L1 commitments |
+| **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches, one writer process | per-tenant / single-tenant, up to ~100 MB | on-chain (contract storage) |
+| v0.2 | `hpplite verify` CLI, per-table divergence reporting, key roles and viewing keys (#17, #15), batch compression (#12) | same | same |
+| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, row-level capture (#19) | GB range | S3 + L1 commitments |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
@@ -238,7 +280,17 @@ really differs: `random()`, `randomblob()`, `datetime('now')`,
 `changes()`. Compute such values in the application and **bind** them:
 bound parameters are expanded into the captured statement and replay exactly.
 Capture warns once and counts offenders in `hpplite_status.nondeterministic`.
-Row-level capture, which removes the restriction, is tracked in #19.
+
+Two more consequences of replaying text, until row-level capture (#19):
+
+- **Bound `REAL` values** are expanded with 15 significant digits
+  (`sqlite3_expanded_sql`), so `0.1 + 0.2` replays as `0.3`. Store exact
+  decimals as `INTEGER` or `TEXT`, or write the literal yourself.
+- **`TEXT` with an embedded NUL** is cut at the NUL in the captured text.
+- **Connection state is not captured**: `PRAGMA foreign_keys=ON` cascades,
+  `recursive_triggers`, and writes to `ATTACH`ed databases are applied at the
+  sequencer but not reproduced on replay (#28). Keep the schema's behaviour
+  in the schema (triggers, constraints) and one database per file.
 
 ## Keys
 
@@ -253,8 +305,12 @@ reaches HPPLite before open, in order of precedence:
 | `privkey=0x...` in the URI | **development only**: SQLite keeps the query string next to the filename, so anyone with the `sqlite3*` can read it back via `sqlite3_uri_parameter()`, and URIs end up in logs |
 
 Without a key the database works and keeps capturing, but nothing is posted
-(`hpplite_status.keyed = 0`); `encrypt=off` is the only way to post plaintext
-and must be explicit. v0.2 splits the roles (owner / sequencer / data /
+(`hpplite_status.keyed = 0`): with an L1 configured the batches stay pending
+until a key arrives; with no L1 configured at all (`hpplite=on` alone) batches
+are finalized locally, which is a development mode, not a backup. `encrypt=off`
+is the only way to post plaintext and must be explicit. A URI with
+`hpplite=on` that cannot be honoured (unreadable key file, malformed key)
+makes `sqlite3_open_v2()` fail rather than open without capture. v0.2 splits the roles (owner / sequencer / data /
 viewing keys), accepts keys at runtime (`hpplite_key()`), Ethereum keystore V3
 files and KMS-held signers - see issues #17 and #15.
 
@@ -285,19 +341,29 @@ not confirm stays pending and is retried at the same height.
 
 File databases are switched to WAL mode on open (bookkeeping runs on a
 second connection) and get a 5 s busy timeout. In-memory databases work
-too, with bookkeeping on the same connection.
+through the C API (`hpplite_node_create` with `:memory:`), with bookkeeping
+on the same connection and no timer: flush explicitly or on close.
+
+Three things a statement can be refused for, all with `SQLITE_INTERRUPT`
+and a line on stderr, so the log never silently disagrees with the data:
+its log row could not be written (disk full), its text is longer than one
+DA batch can carry (a 64 KB blob literal is ~128 KB of hex), or its bound
+parameters could not be expanded. Inside an explicit transaction SQLite
+rolls the transaction back, as it would for a disk-full error.
 
 See [doc/architecture.md](doc/architecture.md#local-durability).
 
-## Security Model
+## Trust model
 
-| What Sequencer Can Do | What Sequencer Cannot Do |
-|-----------------------|--------------------------|
-| Order transactions | Corrupt state (verifiable) |
-| Censor temporarily | Steal funds (detectable) |
-| Go offline | Hide fraud (full DA on L1) |
-
-This is "trust but verify" - the same model securing billions on Optimism and Arbitrum.
+The sequencer is your process; it is trusted to execute SQL. What the chain
+adds is a history it cannot quietly rewrite: batches are posted in order
+under a lease, roots are anchored, and anyone holding the key can rebuild
+from the chain alone and compare. Nothing in v0.1 punishes a divergent
+sequencer - there are no funds, bonds or fraud proofs here - it makes the
+divergence detectable, and a lost disk recoverable. The lease keeps two
+copies of your process from posting at once; a lease that expired (5 min)
+can be claimed by any wallet until the owner-set sequencer address lands
+with #17.
 
 See [doc/architecture.md](doc/architecture.md) for details.
 
