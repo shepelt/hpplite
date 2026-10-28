@@ -331,6 +331,13 @@ int hpplite_l1_get_da_state(
 HppliteL1 *hpplite_l1_create_mock(void);
 
 /*
+** Mock L1 whose state lives in a directory (batches, lease, checkpoints,
+** clock), reloaded on create: survives the process, for crash tests and
+** chain-free use. The directory must exist.
+*/
+HppliteL1 *hpplite_l1_create_mock_dir(const char *dir);
+
+/*
 ** Set mock sequencer (for testing)
 */
 void hpplite_l1_mock_set_sequencer(HppliteL1 *l1, const unsigned char *pubkey);

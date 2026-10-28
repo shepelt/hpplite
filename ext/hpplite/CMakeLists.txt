@@ -84,6 +84,7 @@ if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backend: Real Ethereum (l1_eth.c)")
 else()
     list(APPEND HPPLITE_SOURCES l1_mock.c)
+    add_compile_definitions(HPPLITE_TEST_HOOKS)   # HPPLITE_TEST_CRASH_AT crash points
     message(STATUS "L1 backend: Mock (l1_mock.c)")
 endif()
 
@@ -180,6 +181,9 @@ if(HPPLITE_BUILD_TESTS)
         add_executable(stress_hpplite tests/stress/stress_hpplite.c)
         target_link_libraries(stress_hpplite hpplite)
         add_custom_target(stress COMMAND stress_hpplite DEPENDS stress_hpplite USES_TERMINAL)
+        # Crash injection: kill -9 at deterministic and random points, reopen, check (issue #26)
+        add_executable(crash_hpplite tests/stress/crash_hpplite.c)
+        target_link_libraries(crash_hpplite hpplite)
     endif()
 
     # Loadable extension against stock SQLite: links only the amalgamation,
@@ -227,6 +231,10 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME smoke_python_cli
                  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
         set_tests_properties(smoke_python_cli PROPERTIES SKIP_RETURN_CODE 77)
+        if(CMAKE_C_FLAGS MATCHES "sanitize")
+            # an instrumented module cannot be loaded into a stock python/sqlite3 process
+            set_tests_properties(smoke_python_cli PROPERTIES DISABLED TRUE)
+        endif()
     endif()
 
     # Mock L1 tests - only register when not using real L1
@@ -235,6 +243,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
         add_test(NAME test_durability COMMAND test_durability)
         add_test(NAME test_keys COMMAND test_keys)
+        add_test(NAME test_crash COMMAND crash_hpplite)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address

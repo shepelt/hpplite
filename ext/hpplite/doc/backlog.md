@@ -54,6 +54,15 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Crash harness and chain-free mock (issue #26)
+- `l1_mock` can live in a directory (`hpplite_l1_create_mock_dir`): batches,
+  lease, checkpoints and clock survive the process (atomic rename); the seed
+  of the `file://` DA backend (#35)
+- `crash_hpplite` (ctest `test_crash`): the writer dies at
+  `HPPLITE_TEST_CRASH_AT=after_submit|after_finalize|mid_series` and at random
+  moments under the timer; a fresh process reopens and checks every statement
+  is on L1 or pending exactly once, flushes, rebuilds from L1 and compares roots
+
 ### Stress test and determinism
 - `tests/stress/stress_hpplite.c` (`make stress`): 100 MB through encryption,
   DA chunking, checkpoints with roots, reconstruction compared by root

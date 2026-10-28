@@ -1,0 +1,208 @@
+/*
+** Crash injection (issue #26): a writer process is killed at deterministic
+** points of a flush (HPPLITE_TEST_CRASH_AT) and at random moments while its
+** timer thread flushes; a fresh process then reopens the same file against
+** the same directory-backed mock L1 and checks the invariants:
+**
+**   - reopen never errors and refuses nothing;
+**   - every captured statement is in L1 or pending, exactly once, after sync;
+**   - after a final flush nothing is pending, heights are contiguous, and a
+**     reader rebuilt from L1 alone has the same content root as the writer.
+**
+** Runs as `test_crash` in ctest (a few seconds). ./crash_hpplite --rounds N
+** for more random rounds.
+*/
+#include "hpplite.h"
+#include "node.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+
+#define DIR "/tmp/hpplite_crash"
+#define L1DIR DIR "/l1"
+
+static const unsigned char PRIVKEY[32] = {
+    0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+    0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20
+};
+static int failures = 0;
+#define CHECK(cond, ...) do { if (!(cond)) { printf("    FAIL: " __VA_ARGS__); printf("\n"); failures++; } } while (0)
+
+static void reset_dir(void) {
+    (void)!system("rm -rf " DIR);
+    mkdir(DIR, 0755);
+    mkdir(L1DIR, 0755);
+}
+
+static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *s; sqlite3_int64 v = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
+    sqlite3_finalize(s);
+    return v;
+}
+
+static HppliteNode *open_node(const char *path, HppliteL1 *l1, int intervalMs, size_t limit) {
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "crash";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = (char *)path;
+    config.checkpointInterval = 2;
+    config.batchIntervalMs = intervalMs;
+    config.maxBatchBytes = limit;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (n) {
+        hpplite_node_set_l1(n, l1);
+        if (hpplite_node_sync_from_l1(n, 1) < 0) { hpplite_node_destroy(n); return NULL; }
+        hpplite_node_start(n);
+    }
+    return n;
+}
+
+/* The writer: CREATE once, then rows with unique ids; never closes. */
+static void writer(const char *mode, int rows, int intervalMs, size_t limit) {
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    hpplite_l1_mock_set_batch_size_limit(l1, limit);
+    HppliteNode *n = open_node(DIR "/w.db", l1, intervalMs, limit);
+    if (!n) _exit(2);
+    sqlite3_exec(n->db, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v)", NULL, NULL, NULL);
+    sqlite3_int64 next = scalar(n->db, "SELECT COALESCE(MAX(id),0)+1 FROM t");
+    char sql[256];
+    for (int i = 0; i < rows; i++) {
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s')", (long long)(next + i), (long long)(next + i), mode);
+        if (i % 7 == 3) {
+            sqlite3_exec(n->db, "BEGIN", NULL, NULL, NULL);
+            sqlite3_exec(n->db, sql, NULL, NULL, NULL);
+            snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s')", (long long)(next + i + 1), (long long)(next + i + 1), mode);
+            sqlite3_exec(n->db, sql, NULL, NULL, NULL);
+            sqlite3_exec(n->db, "COMMIT", NULL, NULL, NULL);
+            i++;
+        } else {
+            sqlite3_exec(n->db, sql, NULL, NULL, NULL);
+        }
+        if (!intervalMs && i % 10 == 9) hpplite_node_flush_batch(n);   /* deterministic mode */
+        else if (intervalMs) usleep(1000);
+    }
+    if (!intervalMs) hpplite_node_flush_batch(n);
+    _exit(0);   /* deterministic runs die inside a flush above; otherwise plain exit, no close */
+}
+
+/* The checker: reopen, sync, count, flush, rebuild, compare. */
+static void check(const char *what) {
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    hpplite_l1_mock_advance_time(l1, 600);           /* the dead writer's lease expires */
+    HppliteNode *n = open_node(DIR "/w.db", l1, 0, 0);
+    CHECK(n != NULL, "%s: reopen after crash failed", what);
+    if (!n) { hpplite_l1_disconnect(l1); return; }
+    CHECK(n->state != HPPLITE_STATE_ERROR, "%s: node in error state after reopen", what);
+
+    /* every captured statement exactly once in L1 (after adopt) or pending */
+    sqlite3_int64 rows = scalar(n->db, "SELECT count(*) FROM t");
+    uint64_t height = hpplite_node_get_height(n);
+    sqlite3_int64 onL1 = 0;
+    for (uint64_t h = 1; h < height; h++) {
+        HppliteBatch *b = hpplite_node_fetch_batch(n, h);
+        CHECK(b != NULL, "%s: batch %llu missing or unreadable (heights not contiguous)", what, (unsigned long long)h);
+        if (!b) break;
+        onL1 += b->nTxns;
+        hpplite_batch_free(b);
+    }
+    sqlite3_int64 pending = hpplite_node_pending_count(n);
+    /* statements = CREATE TABLE (captured once, in the first run) + one per row */
+    CHECK(onL1 + pending == rows + 1, "%s: statements on L1 (%lld) + pending (%lld) != rows (%lld) + CREATE",
+          what, (long long)onL1, (long long)pending, (long long)rows);
+
+    /* a final flush drains pending; a reader rebuilt from L1 matches */
+    while (hpplite_node_pending_count(n) > 0) {
+        if (hpplite_node_flush_batch(n) == 0) { CHECK(0, "%s: flush after reopen made no progress", what); break; }
+    }
+    CHECK(hpplite_node_pending_count(n) == 0, "%s: pending after final flush", what);
+    unsigned char rootW[32], rootR[32];
+    hpplite_node_get_state_root(n, rootW);
+    height = hpplite_node_get_height(n);
+    hpplite_node_destroy(n);
+
+    HppliteL1 *l1r = hpplite_l1_create_mock_dir(L1DIR);
+    unlink(DIR "/r.db"); unlink(DIR "/r.db-wal"); unlink(DIR "/r.db-shm");
+    HppliteNode *r = open_node(DIR "/r.db", l1r, 0, 0);
+    CHECK(r != NULL, "%s: reader open", what);
+    if (r) {
+        hpplite_node_get_state_root(r, rootR);
+        CHECK(hpplite_node_get_height(r) == height, "%s: reader height %llu != %llu", what,
+              (unsigned long long)hpplite_node_get_height(r), (unsigned long long)height);
+        CHECK(scalar(r->db, "SELECT count(*) FROM t") == rows, "%s: reader rows", what);
+        CHECK(memcmp(rootW, rootR, 32) == 0, "%s: content root differs after rebuild from L1", what);
+        CHECK(r->ctx->nReplaySkipped == 0, "%s: statements skipped on replay", what);
+        hpplite_node_destroy(r);          /* releases the lease it claimed on start */
+    }
+    hpplite_l1_disconnect(l1r);
+    hpplite_l1_disconnect(l1);
+}
+
+static int run_child(const char *crashAt, int rows, int intervalMs, size_t limit, int killAfterMs) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (crashAt) setenv("HPPLITE_TEST_CRASH_AT", crashAt, 1);
+        else unsetenv("HPPLITE_TEST_CRASH_AT");
+        writer(crashAt ? crashAt : "random", rows, intervalMs, limit);
+        _exit(0);
+    }
+    if (killAfterMs > 0) {
+        usleep(killAfterMs * 1000);
+        kill(pid, SIGKILL);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+int main(int argc, char **argv) {
+    int rounds = 6;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = atoi(argv[++i]);
+    }
+    srand((unsigned)getpid());
+
+    /* --- deterministic crash points --- */
+    static const struct { const char *at; size_t limit; } points[] = {
+        { "after_submit",   64 * 1024 },   /* on L1, not finalized locally: must be adopted */
+        { "after_finalize", 64 * 1024 },   /* finalized, checkpoint never submitted */
+        { "mid_series",     1024 },        /* first chunk of a size-limited series finalized */
+    };
+    for (size_t p = 0; p < sizeof(points) / sizeof(points[0]); p++) {
+        reset_dir();
+        printf("  crash at %-15s ", points[p].at);
+        int rc = run_child(points[p].at, 40, 0, points[p].limit, 0);
+        CHECK(rc == 137, "%s: writer should have died at the crash point (rc=%d)", points[p].at, rc);
+        check(points[p].at);
+        /* and again on the same file: a second crash on top of the recovered state */
+        rc = run_child(points[p].at, 40, 0, points[p].limit, 0);
+        CHECK(rc == 137, "%s (2nd): writer should have died (rc=%d)", points[p].at, rc);
+        check(points[p].at);
+        printf("%s\n", failures ? "FAIL" : "ok");
+    }
+
+    /* --- random kill -9 while the timer thread flushes --- */
+    reset_dir();
+    for (int r = 0; r < rounds; r++) {
+        int after = 15 + rand() % 120;
+        printf("  kill -9 after %3d ms (round %d) ", after, r + 1);
+        int rc = run_child(NULL, 100000, 1, 2048, after);
+        CHECK(rc == 137, "random: writer should have been killed (rc=%d)", rc);
+        int before = failures;
+        check("random");
+        printf("%s\n", failures == before ? "ok" : "FAIL");
+    }
+
+    (void)!system("rm -rf " DIR);
+    printf("\n=== crash harness: %s ===\n", failures ? "FAILED" : "PASSED");
+    return failures ? 1 : 0;
+}

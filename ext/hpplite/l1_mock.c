@@ -64,7 +64,127 @@ struct HppliteL1 {
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
+
+    char *dir;                   /* Directory-backed: every change is written here */
 };
+
+/*
+** Directory persistence. A mock that survives the process is what the crash
+** harness needs (the writer is kill -9'd, the checker reopens), and it is the
+** seed of a chain-free DA backend (issue #35). Layout:
+**   <dir>/state          text: block, time, lease, checkpoint summary, batch count
+**   <dir>/batch-<N>.bin  raw posted bytes of batch N
+**   <dir>/cp-<I>.bin     checkpoint I (binary struct fields)
+** Every file is written to a temporary name and renamed into place, so a
+** crash leaves either the old or the new content, never a torn file. The
+** batch file is written before the state that announces it.
+*/
+#include <stdio.h>
+#include <unistd.h>
+static int mockWriteFile(const char *path, const void *data, size_t len) {
+    char tmp[1024];
+    FILE *f;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) return -1;
+    if (len && fwrite(data, 1, len, f) != len) { fclose(f); unlink(tmp); return -1; }
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) { fclose(f); unlink(tmp); return -1; }
+    fclose(f);
+    return rename(tmp, path);
+}
+static uint8_t *mockReadFile(const char *path, size_t *pLen) {
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf;
+    long n;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return NULL; }
+    buf = malloc((size_t)n + 1);
+    if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); buf = NULL; }
+    fclose(f);
+    if (buf) { buf[n] = 0; *pLen = (size_t)n; }
+    return buf;
+}
+static void mockHex(const unsigned char *in, int n, char *out) {
+    static const char *h = "0123456789abcdef";
+    for (int i = 0; i < n; i++) { out[2*i] = h[in[i] >> 4]; out[2*i+1] = h[in[i] & 15]; }
+    out[2*n] = 0;
+}
+static void mockUnhex(const char *in, unsigned char *out, int n) {
+    for (int i = 0; i < n; i++) {
+        unsigned v = 0;
+        sscanf(in + 2*i, "%2x", &v);
+        out[i] = (unsigned char)v;
+    }
+}
+static void mockSaveState(HppliteL1 *l1) {
+    char path[1024], inst[65], wallet[41], root[65], buf[640];
+    if (!l1->dir) return;
+    mockHex(l1->sequencerInstance, 32, inst);
+    mockHex(l1->sequencerWallet, 20, wallet);
+    mockHex(l1->lastStateRoot, 32, root);
+    snprintf(buf, sizeof(buf), "block %llu\ntime %llu\nbatches %llu\nsequencer %d %s %s %llu\n"
+             "checkpoints %d %llu %llu %s\n",
+             (unsigned long long)l1->currentBlock, (unsigned long long)l1->currentTimestamp,
+             (unsigned long long)l1->nBatches, l1->hasSequencer, wallet, inst,
+             (unsigned long long)l1->leaseExpiry, l1->nCheckpoints,
+             (unsigned long long)l1->lastCheckpointHeight, (unsigned long long)l1->lastCheckpointTime, root);
+    snprintf(path, sizeof(path), "%s/state", l1->dir);
+    mockWriteFile(path, buf, strlen(buf));
+}
+static void mockSaveBatch(HppliteL1 *l1, uint64_t height) {
+    char path[1024];
+    if (!l1->dir) return;
+    snprintf(path, sizeof(path), "%s/batch-%llu.bin", l1->dir, (unsigned long long)height);
+    mockWriteFile(path, l1->batchData[height - 1], l1->batchLen[height - 1]);
+}
+static void mockSaveCheckpoint(HppliteL1 *l1, int i) {
+    char path[1024];
+    if (!l1->dir) return;
+    snprintf(path, sizeof(path), "%s/cp-%d.bin", l1->dir, i);
+    mockWriteFile(path, l1->checkpoints[i], sizeof(HppliteCheckpoint));
+}
+static void mockLoad(HppliteL1 *l1) {
+    char path[1024], inst[65] = {0}, wallet[41] = {0}, root[65] = {0};
+    size_t len = 0;
+    unsigned long long block = 0, tm = 0, nb = 0, exp = 0, cph = 0, cpt = 0;
+    int hasSeq = 0, ncp = 0;
+    uint8_t *txt;
+    snprintf(path, sizeof(path), "%s/state", l1->dir);
+    txt = mockReadFile(path, &len);
+    if (!txt) return;                                   /* fresh directory */
+    if (sscanf((char *)txt, "block %llu\ntime %llu\nbatches %llu\nsequencer %d %40s %64s %llu\n"
+               "checkpoints %d %llu %llu %64s",
+               &block, &tm, &nb, &hasSeq, wallet, inst, &exp, &ncp, &cph, &cpt, root) >= 10) {
+        l1->currentBlock = block;
+        l1->currentTimestamp = tm;
+        l1->hasSequencer = hasSeq;
+        mockUnhex(wallet, l1->sequencerWallet, 20);
+        mockUnhex(inst, l1->sequencerInstance, 32);
+        l1->leaseExpiry = exp;
+        l1->lastCheckpointHeight = cph;
+        l1->lastCheckpointTime = cpt;
+        mockUnhex(root, l1->lastStateRoot, 32);
+        for (unsigned long long h = 1; h <= nb && h <= MAX_BATCHES; h++) {
+            snprintf(path, sizeof(path), "%s/batch-%llu.bin", l1->dir, h);
+            l1->batchData[h - 1] = mockReadFile(path, &l1->batchLen[h - 1]);
+            if (!l1->batchData[h - 1]) break;           /* announced but missing: history ends here */
+            l1->nBatches = h;
+        }
+        for (int i = 0; i < ncp && i < MAX_CHECKPOINTS; i++) {
+            size_t n = 0;
+            snprintf(path, sizeof(path), "%s/cp-%d.bin", l1->dir, i);
+            uint8_t *raw = mockReadFile(path, &n);
+            if (!raw || n != sizeof(HppliteCheckpoint)) { free(raw); break; }
+            HppliteCheckpoint *cp = hpplite_checkpoint_new(0, 0);
+            if (!cp) { free(raw); break; }
+            memcpy(cp, raw, sizeof(HppliteCheckpoint));
+            free(raw);
+            l1->checkpoints[l1->nCheckpoints++] = cp;
+        }
+    }
+    free(txt);
+}
 
 /*
 ** Create a new mock L1
@@ -91,6 +211,14 @@ HppliteL1 *hpplite_l1_create_mock(void) {
     l1->currentTimestamp = (uint64_t)time(NULL);
     l1->lastCheckpointTime = l1->currentTimestamp;
 
+    return l1;
+}
+
+HppliteL1 *hpplite_l1_create_mock_dir(const char *dir) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    if (!l1 || !dir) return l1;
+    l1->dir = strdup(dir);
+    mockLoad(l1);
     return l1;
 }
 
@@ -153,6 +281,7 @@ void hpplite_l1_disconnect(HppliteL1 *l1) {
         hpplite_crypto_free(l1->crypto);
     }
 
+    free(l1->dir);
     sqlite3_free(l1);
 }
 
@@ -244,6 +373,7 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
 char *hpplite_l1_release_lease(HppliteL1 *l1) {
     if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
     l1->leaseExpiry = l1->currentTimestamp;
+    mockSaveState(l1);
     return sqlite3_mprintf("0x%08x%08x",
         (unsigned int)(l1->currentBlock),
         (unsigned int)(l1->currentTimestamp));
@@ -290,6 +420,7 @@ char *hpplite_l1_claim_sequencer(
     memcpy(l1->sequencerWallet, l1->myAddress, 20);
     memcpy(l1->sequencerInstance, instanceId, 32);
     l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    mockSaveState(l1);
 
     /* Generate mock transaction hash */
     char *txHash = sqlite3_mprintf("0x%08x%08x",
@@ -324,6 +455,7 @@ char *hpplite_l1_renew_lease(
 
     /* Renew */
     l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    mockSaveState(l1);
 
     /* Generate mock transaction hash */
     char *txHash = sqlite3_mprintf("0x%08xrenew%08x",
@@ -370,10 +502,13 @@ char *hpplite_l1_submit_checkpoint(
     l1->lastCheckpointTime = l1->currentTimestamp;
     l1->lastCheckpointHeight = checkpoint->toHeight;
     memcpy(l1->lastStateRoot, checkpoint->postStateRoot, 32);
+    mockSaveCheckpoint(l1, l1->nCheckpoints - 1);
+    mockSaveState(l1);
 
     /* Auto-renew lease on checkpoint */
     if (l1->hasSequencer && hpplite_l1_is_lease_active(l1)) {
         l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+        mockSaveState(l1);
     }
 
     /* Generate mock transaction hash */
@@ -445,6 +580,7 @@ void hpplite_l1_mock_set_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
     memcpy(l1->sequencerWallet, pubkey, 20);
     memset(l1->sequencerInstance, 0, 32);
     l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    mockSaveState(l1);
 }
 
 void hpplite_l1_mock_advance_blocks(HppliteL1 *l1, uint64_t blocks) {
@@ -592,6 +728,8 @@ char *hpplite_l1_submit_batch(
     if (height > l1->nBatches) {
         l1->nBatches = height;
     }
+    mockSaveBatch(l1, height);
+    mockSaveState(l1);
 
     if (l1->loseConfirmation) return NULL;  /* stored, but the caller never hears */
     return sqlite3_mprintf("0x%016llx", (unsigned long long)height);

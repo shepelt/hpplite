@@ -577,6 +577,21 @@ static int node_ensure_lease(HppliteNode *node) {
     return 1;
 }
 
+/*
+** Deterministic crash points for the crash harness (tests/stress/crash_hpplite.c):
+** HPPLITE_TEST_CRASH_AT=after_submit|after_finalize|mid_series makes the
+** process die (like kill -9) at that point of a flush. Compiled only into
+** mock-L1 builds.
+*/
+#ifdef HPPLITE_TEST_HOOKS
+static void test_crash_point(const char *zName) {
+    const char *z = getenv("HPPLITE_TEST_CRASH_AT");
+    if (z && strcmp(z, zName) == 0) _exit(137);
+}
+#else
+#define test_crash_point(zName) ((void)0)
+#endif
+
 static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
     HppliteBatch *batch;
@@ -656,6 +671,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             free(sealed);
             sqlite3_free(json);
         }
+        if (confirmed) test_crash_point("after_submit");
         if (!confirmed) {
             /* The transaction may have landed despite the error */
             confirmed = (node_adopt_existing(node) == 1);
@@ -692,6 +708,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         node->batchesSinceCheckpoint++;
         node->failStreak = 0;
         node->retryAt = 0;
+        test_crash_point(*pMore ? "mid_series" : "after_finalize");
     }
 
     hpplite_batch_free(batch);

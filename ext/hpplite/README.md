@@ -161,7 +161,8 @@ cmake --build ext/hpplite/build_real
 ```bash
 # Unit tests (mock L1, fast, no network)
 ctest                    # 15 suites, ~5s: core, batch, node, open API, cipher, keys,
-                         # durability (24 cases), loadable extension, docs check
+                         # durability (26 cases), loadable extension, crash harness,
+                         # Python/CLI smoke, docs check
 
 # The same on Linux, in a container (Docker or Podman; needs nothing else installed)
 ext/hpplite/tools/linux_test.sh          # Ubuntu 24.04, Release, ctest
@@ -177,6 +178,10 @@ make bench
 
 # Stress: 100 MB through encryption, DA chunking, checkpoints with roots, reconstruction
 make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYTES]
+
+# Crash injection (also in ctest): kill -9 at deterministic flush points and at random
+# moments while the timer flushes; reopen, check nothing is lost or duplicated
+./crash_hpplite --rounds 20
 ```
 
 ## Gas Costs (HPP Sepolia)
