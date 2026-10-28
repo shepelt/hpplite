@@ -223,6 +223,10 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_abi COMMAND test_abi)
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)
+        # Python's sqlite3 module and the sqlite3 shell driving the module (issue #27)
+        add_test(NAME smoke_python_cli
+                 COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
+        set_tests_properties(smoke_python_cli PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # Mock L1 tests - only register when not using real L1

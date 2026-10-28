@@ -1,0 +1,51 @@
+#!/bin/sh
+# Real-app smoke test (issue #27): drive the loadable module from Python's
+# sqlite3 and from the sqlite3 command-line shell, the two ways people who
+# are not us will first touch HPPLite. Exit 77 = skipped (no usable tool).
+#
+#   tests/smoke/smoke.sh /path/to/hpplite.dylib
+set -eu
+ext=$1
+here=$(cd "$(dirname "$0")" && pwd)
+dir=${TMPDIR:-/tmp}/hpplite_smoke.$$
+mkdir -p "$dir"
+trap 'rm -rf "$dir"' EXIT
+ran=0
+
+# Python: needs a build with enable_load_extension (macOS system python lacks it)
+for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    command -v "$py" >/dev/null 2>&1 || continue
+    "$py" -c 'import sqlite3; sqlite3.connect(":memory:").enable_load_extension(True)' >/dev/null 2>&1 || continue
+    "$py" "$here/smoke_py.py" "$ext" "$dir"
+    ran=1
+    break
+done
+
+# sqlite3 shell: .load, URI open, status, flush, close, reopen
+if command -v sqlite3 >/dev/null 2>&1; then
+    key=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+    uri="file:$dir/cli.db?hpplite=on&privkey=0x$key&datadir=$dir"
+    mod=${ext%.*}
+    out=$(sqlite3 -batch -bail <<SQL
+.load $mod
+.open '$uri'
+CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+INSERT INTO t(v) VALUES('a'),('b'),('c');
+SELECT 'pending=' || pending FROM hpplite_status;
+SELECT 'flush=' || hpplite_flush();
+SELECT 'height=' || height || ',pending=' || pending FROM hpplite_status;
+INSERT INTO t(v) VALUES('d');
+.quit
+SQL
+)
+    echo "$out" | tr '\n' ' '
+    echo "$out" | grep -q '^pending=2$' || { echo "cli: expected pending=2"; exit 1; }
+    echo "$out" | grep -q '^flush=1$' || { echo "cli: expected flush=1"; exit 1; }
+    echo "$out" | grep -q '^height=2,pending=0$' || { echo "cli: expected height 2"; exit 1; }
+    again=$(sqlite3 -batch "$uri" ".load $mod" "SELECT height || ',' || pending || ',' || (SELECT count(*) FROM t) FROM hpplite_status;")
+    [ "$again" = "3,0,4" ] || { echo "cli: reopen expected 3,0,4 got $again"; exit 1; }
+    echo "cli smoke: ok"
+    ran=1
+fi
+
+[ "$ran" = 1 ] || { echo "smoke: no python3 with load_extension and no sqlite3 shell; skipped"; exit 77; }

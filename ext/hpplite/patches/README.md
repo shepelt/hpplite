@@ -22,6 +22,10 @@ version-3.54.1            <- upstream release tag (current base)
   ...                     <- ext/hpplite/ only; never conflicts with upstream
 ```
 
+Two files outside `ext/hpplite/` are ours as well, because GitHub needs them
+at the repository root: `.gitignore` additions and `.github/workflows/ci.yml`.
+Upstream has neither, so they never conflict either.
+
 ## Moving to a new upstream release
 
 ```bash

@@ -1,0 +1,100 @@
+# HPPLite CI (issue #25). Only ext/hpplite/** is ours; the rest of the tree is
+# upstream SQLite and is not built or tested here beyond the amalgamation.
+name: hpplite
+on:
+  push:
+    branches: [hpplite]
+    paths: ['ext/hpplite/**', '.github/workflows/ci.yml']
+  pull_request:
+    paths: ['ext/hpplite/**', '.github/workflows/ci.yml']
+  workflow_dispatch:
+
+env:
+  # keep the job environment free of HPPLITE_* so URI/env precedence tests are meaningful
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  linux:
+    name: linux (${{ matrix.os }}, ${{ matrix.mode }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, mode: release,  type: Release,        flags: "" }
+          - { os: ubuntu-22.04, mode: release,  type: Release,        flags: "" }
+          - { os: ubuntu-24.04, mode: asan,     type: RelWithDebInfo, flags: "-fsanitize=address,undefined -fno-omit-frame-pointer" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl \
+            libsecp256k1-dev libcurl4-openssl-dev sqlite3 python3
+      - name: SQLite amalgamation
+        run: |
+          mkdir -p build && cd build
+          ../configure >/dev/null
+          make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: configure
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build \
+            -DHPPLITE_SQLITE_SRC=$PWD/build -DCMAKE_BUILD_TYPE=${{ matrix.type }} \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration ${{ matrix.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}" -DCMAKE_SHARED_LINKER_FLAGS="${{ matrix.flags }}"
+      - name: build
+        run: cmake --build ext/hpplite/build -j"$(nproc)"
+      - name: ctest
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: cd ext/hpplite/build && ctest
+      - name: stress (10 MB)
+        if: matrix.mode == 'release'
+        run: cd ext/hpplite/build && ./stress_hpplite --mb 10
+
+  macos:
+    name: macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: brew install libsecp256k1 curl pkg-config tcl-tk
+      - name: SQLite amalgamation
+        run: |
+          mkdir -p build && cd build
+          ../configure --with-tclsh="$(brew --prefix tcl-tk)/bin/tclsh" >/dev/null
+          make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: configure
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cmake -S ext/hpplite -B ext/hpplite/build -DHPPLITE_SQLITE_SRC=$PWD/build \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
+      - name: build
+        run: cmake --build ext/hpplite/build -j4
+      - name: ctest
+        run: cd ext/hpplite/build && ctest
+
+  # Real HPP Sepolia run: manual only, spends testnet ETH from the HPPLITE_PRIVATE_KEY secret.
+  integration:
+    name: integration (manual, real L1)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl \
+            libsecp256k1-dev libcurl4-openssl-dev
+      - name: SQLite amalgamation
+        run: mkdir -p build && cd build && ../configure >/dev/null && make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: build (real L1)
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_SQLITE_SRC=$PWD/build -DHPPLITE_USE_REAL_L1=ON
+          cmake --build ext/hpplite/build_real -j"$(nproc)"
+      - name: run
+        env:
+          HPPLITE_PRIVATE_KEY: ${{ secrets.HPPLITE_PRIVATE_KEY }}
+          HPPLITE_MNEMONIC: ${{ secrets.HPPLITE_MNEMONIC }}
+        run: ext/hpplite/tests/integration/run_integration.sh

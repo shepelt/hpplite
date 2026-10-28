@@ -5,6 +5,6 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake pkg-config git ca-certificates \
-        libsecp256k1-dev libcurl4-openssl-dev tcl sqlite3 valgrind \
+        libsecp256k1-dev libcurl4-openssl-dev tcl sqlite3 python3 valgrind \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
