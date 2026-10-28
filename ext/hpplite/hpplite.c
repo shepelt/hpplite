@@ -585,6 +585,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   int rc;
 
   if (!pCtx || !pCtx->bEnabled || pCtx->bInternal) return 0;
+  if (pCtx->bStatusGone && mask == SQLITE_TRACE_STMT) {
+    /* A close that failed (SQLITE_BUSY) disconnected hpplite_status; the
+    ** next successful close must flush again, which needs the instance back */
+    pCtx->bStatusGone = 0;
+    internalExec(pCtx, pCtx->db, "SELECT * FROM hpplite_status LIMIT 0");
+  }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
     return 0;
@@ -709,15 +715,39 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   return SQLITE_OK;
 }
 
-void hpplite_shutdown(HppliteCtx *pCtx) {
-  if (!pCtx) return;
-
-  sqlite3_commit_hook(pCtx->db, NULL, NULL);
-  sqlite3_rollback_hook(pCtx->db, NULL, NULL);
-  sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
+/*
+** Finalize the statements HPPLite keeps prepared on the application
+** connection. They are re-prepared on demand, so this is safe at any time;
+** it is needed before a close, which fails while any statement is live.
+*/
+static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pLogStmt) sqlite3_finalize(pCtx->pLogStmt);
   if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
   if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
+  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = NULL;
+  pCtx->pLastLogged = NULL;
+}
+
+/* Statements of the application that are still open (ours do not count);
+** with bBusyOnly, only those in the middle of being stepped */
+static int applicationStatementsOpen(HppliteCtx *pCtx, int bBusyOnly) {
+  sqlite3_stmt *pStmt = NULL;
+  while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
+    if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt) continue;
+    if (!bBusyOnly || sqlite3_stmt_busy(pStmt)) return 1;
+  }
+  return 0;
+}
+
+void hpplite_shutdown(HppliteCtx *pCtx) {
+  if (!pCtx) return;
+
+  if (!pCtx->bDbClosed) {
+    sqlite3_commit_hook(pCtx->db, NULL, NULL);
+    sqlite3_rollback_hook(pCtx->db, NULL, NULL);
+    sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
+    finalizeOwnStatements(pCtx);
+  }
   sqlite3_free(pCtx);
 }
 
@@ -798,8 +828,22 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
 ** never touch the application's transaction. On the shared (:memory:)
 ** connection they are only possible while the application is in autocommit.
 */
+static int applicationStatementsOpen(HppliteCtx *pCtx, int bBusyOnly);
 static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   if (pCtx->bkDb == pCtx->db && !sqlite3_get_autocommit(pCtx->db)) {
+    return SQLITE_BUSY;
+  }
+  /* In WAL mode a connection that is inside a read transaction cannot
+  ** start a write once another connection has committed (SQLITE_BUSY_SNAPSHOT,
+  ** which the busy handler does not retry). A bookkeeping commit while the
+  ** application is in the middle of a SELECT would make its next write on
+  ** the same connection fail with "database is locked". So bookkeeping
+  ** does not commit while an application statement is being stepped; the
+  ** batch stays on L1 unfinalized and is adopted by a later flush. The
+  ** application's own hpplite_flush() is exempt: that statement is the
+  ** flush. */
+  if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing
+      && applicationStatementsOpen(pCtx, 1)) {
     return SQLITE_BUSY;
   }
   return internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1318,6 +1362,27 @@ static int statusDisconnect(sqlite3_vtab *pVtab) {
     return SQLITE_OK;
 }
 
+/*
+** Destructor of the sentinel SQL function: SQLite calls it only when the
+** connection really closes (after the unfinalized-statement check that
+** xDisconnect runs before). A node still registered here belongs to a
+** connection whose earlier close attempt failed with SQLITE_BUSY; tear it
+** down now, without touching the dead connection.
+*/
+static void closeSentinelDestroy(void *pArg) {
+    sqlite3 *db = (sqlite3 *)pArg;
+    HppliteNode *node = findNode(db);
+    if (!node) return;
+    removeNode(db);
+    node->ownsDb = 0;
+    if (node->ctx) node->ctx->bDbClosed = 1;
+    hpplite_node_destroy(node);
+}
+static void closeSentinelFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    sqlite3_result_null(ctx);
+}
+
 static int statusBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     (void)pVtab;
     pInfo->estimatedCost = 1;
@@ -1466,6 +1531,8 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_sync_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
                             hpplite_flush_func, NULL, NULL);
+    sqlite3_create_function_v2(db, "_hpplite_close_sentinel", 0, SQLITE_UTF8, db,
+                               closeSentinelFunc, NULL, NULL, closeSentinelDestroy);
 
     /* Status table; touch it once so its instance lives until close */
     if (sqlite3_create_module(db, "hpplite_status", &hpplite_status_module, NULL) == SQLITE_OK) {
@@ -1482,6 +1549,21 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
 static void hpplite_on_close(sqlite3 *db) {
     HppliteNode *node = findNode(db);
     if (!node) return;
+
+    /* Our own prepared statements would make the close fail; the trace
+    ** callback re-prepares them if the connection lives on */
+    if (node->ctx) finalizeOwnStatements(node->ctx);
+
+    /* SQLite disconnects virtual tables before it checks for unfinalized
+    ** statements. If the application still has one, this close is about to
+    ** fail with SQLITE_BUSY and the connection stays in use: flush what is
+    ** pending but keep capturing. The sentinel destructor finishes the
+    ** teardown when the connection really closes (issue #31). */
+    if (node->ctx && applicationStatementsOpen(node->ctx, 0)) {
+        hpplite_node_flush_batch(node);
+        node->ctx->bStatusGone = 1;
+        return;
+    }
 
     /* Unregister first: the teardown below closes connections and must not
     ** find this node again. */
@@ -1656,7 +1738,9 @@ static void hpplite_sync_func(
 
     /* Running inside a statement on this connection: replay without
     ** wrapping each batch transaction in BEGIN/COMMIT. */
+    if (node->ctx) node->ctx->bAppFlushing = 1;
     int synced = hpplite_node_sync_from_l1(node, 0);
+    if (node->ctx) node->ctx->bAppFlushing = 0;
     sqlite3_result_int(ctx, synced < 0 ? 0 : synced);
 }
 
@@ -1680,7 +1764,9 @@ static void hpplite_flush_func(
         return;
     }
 
+    if (node->ctx) node->ctx->bAppFlushing = 1;
     uint64_t height = hpplite_node_flush_batch(node);
+    if (node->ctx) node->ctx->bAppFlushing = 0;
     sqlite3_result_int64(ctx, (sqlite3_int64)height);
 }
 

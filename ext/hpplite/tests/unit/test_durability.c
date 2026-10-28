@@ -935,6 +935,86 @@ static void test_memory_no_timer(void) {
     PASS();
 }
 
+/* 25. A close that fails with SQLITE_BUSY must not end capture (issue #31) */
+static void test_close_busy_keeps_capturing(void) {
+    TEST("sqlite3_close() -> SQLITE_BUSY: capture continues, the real close flushes");
+    reset_dir();
+    sqlite3 *db = NULL;
+    sqlite3_stmt *leak = NULL;
+    const char *uri = "file:" DIR "/busy.db?hpplite=on&privkey=0x" PRIVKEY_HEX "&datadir=" DIR;
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("open");
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db, "SELECT x FROM t", -1, &leak, NULL);
+    sqlite3_step(leak);
+    if (sqlite3_close(db) != SQLITE_BUSY) FAIL("close with a live statement should be BUSY");
+    if (!hpplite_context(db)) FAIL("HPPLite must survive a failed close");
+    /* the statement is still unfinalized (close would fail again) but its
+    ** read transaction is over, so the connection can write */
+    sqlite3_reset(leak);
+    int before = hpplite_pending_count(hpplite_context(db));
+    if (sqlite3_exec(db, "INSERT INTO t VALUES(2)", NULL, NULL, NULL) != SQLITE_OK) FAIL("write after failed close");
+    if (hpplite_pending_count(hpplite_context(db)) != before + 1) FAIL("write after the failed close must be captured");
+    sqlite3_finalize(leak);
+    if (sqlite3_close(db) != SQLITE_OK) FAIL("close after finalize");
+
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("reopen");
+    sqlite3_stmt *s;
+    sqlite3_prepare_v2(db, "SELECT height, pending, (SELECT count(*) FROM t) FROM hpplite_status", -1, &s, NULL);
+    if (sqlite3_step(s) != SQLITE_ROW) FAIL("status");
+    int height = sqlite3_column_int(s, 0), pending = sqlite3_column_int(s, 1), rows = sqlite3_column_int(s, 2);
+    sqlite3_finalize(s);
+    if (rows != 2 || pending != 0 || height < 2) {
+        printf("(height=%d pending=%d rows=%d) ", height, pending, rows);
+        sqlite3_close(db);
+        FAIL("everything should have been flushed by the time the close succeeded");
+    }
+    int heightBefore = height;
+    /* variant: nothing runs between the failed close and the real one; the
+    ** sentinel destructor tears the node down on the real close */
+    sqlite3_exec(db, "INSERT INTO t VALUES(3)", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db, "SELECT x FROM t", -1, &leak, NULL);
+    if (sqlite3_close(db) != SQLITE_BUSY) FAIL("second BUSY close");
+    sqlite3_finalize(leak);
+    if (sqlite3_close(db) != SQLITE_OK) FAIL("final close");
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("reopen 2");
+    sqlite3_prepare_v2(db, "SELECT height, pending FROM hpplite_status", -1, &s, NULL);
+    sqlite3_step(s);
+    height = sqlite3_column_int(s, 0); pending = sqlite3_column_int(s, 1);
+    sqlite3_finalize(s);
+    sqlite3_close(db);
+    if (height != heightBefore + 1 || pending != 0) { printf("(height=%d pending=%d) ", height, pending); FAIL("row 3 flushed by one of the two closes; nothing left over"); }
+    PASS();
+}
+
+/* 26. Bookkeeping never commits under an application SELECT (BUSY_SNAPSHOT) */
+static void test_no_commit_under_app_read(void) {
+    TEST("flush while the app is mid-SELECT: no bookkeeping commit, app's next write succeeds");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/snap.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2)", NULL);
+    sqlite3_stmt *sel = NULL;
+    sqlite3_prepare_v2(n->db, "SELECT x FROM t", -1, &sel, NULL);
+    sqlite3_step(sel);                               /* read transaction open on the app connection */
+    uint64_t h = hpplite_node_flush_batch(n);       /* as the timer thread would */
+    if (h != 0) FAIL("finalize must be deferred while the app reads");
+    if (hpplite_l1_get_batch(l1, 1, NULL) == NULL) FAIL("the batch should still have been posted");
+    /* the app continues its read/write loop on the same connection: no "database is locked" */
+    if (sqlite3_exec(n->db, "INSERT INTO t VALUES(3)", NULL, NULL, NULL) != SQLITE_OK) FAIL("app write failed (BUSY_SNAPSHOT)");
+    while (sqlite3_step(sel) == SQLITE_ROW) { }
+    sqlite3_finalize(sel);
+    /* read finished: the next flush adopts the posted batch and goes on */
+    if (hpplite_node_flush_batch(n) == 0) FAIL("adopt + next batch");
+    if (hpplite_node_get_height(n) != 3 || hpplite_node_pending_count(n) != 0) {
+        printf("(height=%llu pending=%d) ", (unsigned long long)hpplite_node_get_height(n), hpplite_node_pending_count(n));
+        FAIL("batch 1 adopted and batch 2 (row 3) flushed");
+    }
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -961,6 +1041,8 @@ int main(void) {
     test_capture_corner_cases();
     test_open_failure_is_loud();
     test_memory_no_timer();
+    test_close_busy_keeps_capturing();
+    test_no_commit_under_app_read();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

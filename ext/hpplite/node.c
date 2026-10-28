@@ -353,8 +353,10 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* Stop timer thread first */
     hpplite_node_stop_timer(node);
 
-    /* Flush any pending data before cleanup */
-    if (node->ctx && hpplite_pending_count(node->ctx) > 0) {
+    /* Flush any pending data before cleanup (not when bookkeeping shared a
+    ** connection that is already closed: nothing can run there any more) */
+    if (node->ctx && !(node->ctx->bDbClosed && node->ctx->bkDb == node->ctx->db)
+        && hpplite_pending_count(node->ctx) > 0) {
         hpplite_node_flush_batch(node);
     }
 
@@ -674,9 +676,17 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     }
 
     if (hpplite_finalize_batch(ctx, batch, maxId) != SQLITE_OK) {
-        fprintf(stderr, "hpplite: could not finalize batch %llu locally\n",
-                (unsigned long long)height);
+        /* Typically: an application statement is mid-step, so bookkeeping
+        ** must not commit now (see bkBegin). The batch is on L1 (when there
+        ** is one) and the next flush adopts it; locally nothing changed. */
+        if (node->l1) {
+            node->retryAt = 0;    /* not an L1 failure: try again next tick */
+        } else {
+            fprintf(stderr, "hpplite: could not finalize batch %llu locally\n",
+                    (unsigned long long)height);
+        }
         height = 0;
+        *pMore = 0;
     } else {
         node->batchesProduced++;
         node->batchesSinceCheckpoint++;

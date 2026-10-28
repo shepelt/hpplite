@@ -47,6 +47,9 @@ struct HppliteCtx {
   sqlite3 *bkDb;              /* Bookkeeping connection (== db for :memory:) */
   int bEnabled;               /* Tracking enabled flag */
   int bInternal;              /* Set while HPPLite runs its own statements */
+  int bDbClosed;              /* db is a zombie: no SQLite calls on it any more */
+  int bAppFlushing;           /* hpplite_flush() is running on the application thread */
+  int bStatusGone;            /* hpplite_status was disconnected by a close that failed */
   uint64_t txnSeq;            /* Groups pending SQL by transaction */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
