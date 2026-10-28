@@ -488,6 +488,19 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     *pMore = batch->partial;
 
     if (node->l1) {
+        /* No key means no encryption key: never post plaintext by accident.
+        ** encrypt=off is the only way to post in the clear, and it is explicit. */
+        if (!node->cipher && !node->config.noEncrypt) {
+            if (!node->warnedNoKey) {
+                fprintf(stderr, "hpplite: no private key: batches are kept pending and not posted "
+                                "(set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)\n");
+                node->warnedNoKey = 1;
+            }
+            hpplite_batch_free(batch);
+            *pMore = 0;
+            return 0;
+        }
+
         /* Ensure we have an active lease before submitting */
         if (!hpplite_l1_is_lease_active(node->l1)) {
             hpplite_node_claim_lease(node);

@@ -34,6 +34,15 @@
 - `HPPLITE_SQLITE_SRC` to build against any amalgamation; `test_loadable`
   links only stock SQLite and loads the module
 
+### Keys in v0.1 (issue #16)
+- Key file loader refuses group/world-readable or non-regular files, accepts
+  `0x`/bare hex with whitespace; a node without a key never posts (plaintext
+  requires explicit `encrypt=off`); `hpplite_status.keyed`
+- `test_keys`: URI / env / keyfile on both open paths, precedence, rejections,
+  no-key behaviour, encrypt=off
+- v0.2: #17 key roles, runtime `hpplite_key()`, keystore V3, KMS signer,
+  SQLCipher page-key passthrough; v1.0: #18 shadow tables + defensive mode
+
 ### Encrypted batches (issue #14)
 - `cipher.c`: ChaCha20-Poly1305 (RFC 8439 vectors in `test_cipher`), HMAC/HKDF-SHA256,
   binary envelope bound to height; key derived from the wallet key; on by default,

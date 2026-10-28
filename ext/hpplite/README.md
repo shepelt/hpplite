@@ -224,6 +224,24 @@ until v0.3.
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
 
+## Keys
+
+One wallet key does everything in v0.1: it owns the rollup contracts, posts
+batches (sequencer), and the batch encryption key is derived from it. It
+reaches HPPLite before open, in order of precedence:
+
+| How | Use for |
+|-----|---------|
+| `keyfile=/path` or `HPPLITE_PRIVATE_KEY_FILE` | **production**: a file with the hex key, mode `0600`; group/world-readable files are refused (like ssh) |
+| `HPPLITE_PRIVATE_KEY` | containers / process managers |
+| `privkey=0x...` in the URI | **development only**: SQLite keeps the query string next to the filename, so anyone with the `sqlite3*` can read it back via `sqlite3_uri_parameter()`, and URIs end up in logs |
+
+Without a key the database works and keeps capturing, but nothing is posted
+(`hpplite_status.keyed = 0`); `encrypt=off` is the only way to post plaintext
+and must be explicit. v0.2 splits the roles (owner / sequencer / data /
+viewing keys), accepts keys at runtime (`hpplite_key()`), Ethereum keystore V3
+files and KMS-held signers - see issues #17 and #15.
+
 ## Privacy
 
 Everything posted to L1 is public, so batch payloads are **encrypted before

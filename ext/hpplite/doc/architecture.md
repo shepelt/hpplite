@@ -202,6 +202,25 @@ wallet owns its rollup). After a crash the old lease blocks submission until
 it expires (5 minutes); writes keep accumulating in `_hpplite_pending` and
 flush once the lease is free.
 
+### Keys
+
+v0.1 uses a single wallet key for four roles: contract **owner**, **sequencer**
+(the hot key that claims the lease and posts), the derived batch **encryption**
+key, and **identity** (the factory maps one wallet to one rollup). It is
+provided before open via key file (`0600` enforced), environment or URI
+(development only). A node without a key captures locally and never posts.
+
+That is the single-key shortcut every L2 avoids in production: the key that
+must be online (poster) should not be the key that can change the rules
+(owner), and hot-key compromise should be survivable by rotation. The
+contract already separates `owner` from `sequencerWallet`. v0.2 (#17, #15)
+introduces the split, with the TDE two-tier structure for data: a random
+data key per rollup wrapped to each reader's public key (owner, sequencer,
+and **viewing keys** that can read but not sign), runtime key injection
+through SQL functions as SQLite encryption extensions do, Ethereum keystore
+V3 for human-held keys, and a signer callback so the sequencer key can live
+in a KMS.
+
 ### Privacy: encrypted batches
 
 L1 is public, so a batch is sealed before it is posted whenever the node has

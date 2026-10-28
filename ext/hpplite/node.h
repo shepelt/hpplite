@@ -88,6 +88,7 @@ typedef struct HppliteNode {
     const HppliteCipher *cipher;
     unsigned char encKey[HPPLITE_CIPHER_KEY_SIZE];
     int hasEncKey;
+    int warnedNoKey;                /* "no key, not posting" said once */
 
     /* Checkpoint tracking */
     uint64_t lastCheckpointHeight;

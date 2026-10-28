@@ -5,6 +5,8 @@
 */
 
 #include "config.h"
+#include <sys/stat.h>
+#include <errno.h>
 #include "da_uri.h"
 #include "hpplite_sqlite.h"
 #include <stdlib.h>
@@ -504,21 +506,48 @@ HppliteConfig *hpplite_config_load(const char *uri) {
 }
 
 int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path) {
+    struct stat st;
+    FILE *f;
+    char buf[160];
+    size_t n;
+
     if (!cfg || !path) return -1;
 
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-
-    char buf[128];
-    if (fgets(buf, sizeof(buf), f)) {
-        /* Remove newline */
-        buf[strcspn(buf, "\r\n")] = '\0';
-        fclose(f);
-        return hpplite_config_parse_privkey(cfg, buf);
+    /* Like ssh: a key file readable by anyone else is not a key file */
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "hpplite: key file %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "hpplite: key file %s is not a regular file\n", path);
+        return -1;
+    }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr, "hpplite: key file %s is accessible by others (mode %03o); refusing to use it\n",
+                path, (unsigned)(st.st_mode & 0777));
+        return -1;
     }
 
+    f = fopen(path, "r");
+    if (!f) return -1;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
-    return -1;
+    buf[n] = '\0';
+    /* first token: 0x-prefixed or bare hex, surrounding whitespace ignored */
+    {
+        char *z = buf, *e;
+        while (*z == ' ' || *z == '\t' || *z == '\r' || *z == '\n') z++;
+        e = z;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n') e++;
+        *e = '\0';
+        if (hpplite_config_parse_privkey(cfg, z) != 0) {
+            fprintf(stderr, "hpplite: key file %s does not contain a 32-byte hex key\n", path);
+            memset(buf, 0, sizeof(buf));
+            return -1;
+        }
+    }
+    memset(buf, 0, sizeof(buf));
+    return 0;
 }
 
 int hpplite_config_parse_privkey(HppliteConfig *cfg, const char *hex) {

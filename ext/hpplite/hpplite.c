@@ -1139,6 +1139,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_LOG_ERRORS 6
 #define STATUS_COL_REPLAY_SKIPPED 7
 #define STATUS_COL_ENCRYPTION 8
+#define STATUS_COL_KEYED 9
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -1148,7 +1149,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
     rc = sqlite3_declare_vtab(db,
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
-        " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT)");
+        " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -1245,6 +1246,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_ENCRYPTION:
             sqlite3_result_text(ctx, node->cipher ? node->cipher->name : "none", -1, SQLITE_STATIC);
+            break;
+        case STATUS_COL_KEYED:
+            sqlite3_result_int(ctx, node->config.hasPrivkey ? 1 : 0);
             break;
         default:
             sqlite3_result_null(ctx);

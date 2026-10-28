@@ -166,6 +166,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_checkpoint_flow hpplite)
         add_executable(test_durability tests/unit/test_durability.c)
         target_link_libraries(test_durability hpplite)
+        add_executable(test_keys tests/unit/test_keys.c)
+        target_link_libraries(test_keys hpplite)
 
         # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
@@ -221,6 +223,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
         add_test(NAME test_durability COMMAND test_durability)
+        add_test(NAME test_keys COMMAND test_keys)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address
