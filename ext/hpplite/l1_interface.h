@@ -376,6 +376,9 @@ uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
 */
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
 
+/* Make hpplite_l1_wait_for_tx() take this long (a flush that is in flight) */
+void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms);
+
 /*
 ** Store submitted batches but report failure, as if the RPC reply was lost
 ** (for testing the adopt path)

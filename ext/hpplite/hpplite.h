@@ -49,6 +49,9 @@ struct HppliteCtx {
   int bInternal;              /* Set while HPPLite runs its own statements */
   int bDbClosed;              /* db is a zombie: no SQLite calls on it any more */
   int bAppFlushing;           /* hpplite_flush() is running on the application thread */
+  volatile int nAppStmtActive; /* Application statements between their STMT and PROFILE trace
+                               ** events (mid-step). Written on the application thread only;
+                               ** the timer thread reads it instead of touching db. */
   int bStatusGone;            /* hpplite_status was disconnected by a close that failed */
   sqlite3_int64 curTxn;       /* Id of the first logged row of the open transaction (0 = none) */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */

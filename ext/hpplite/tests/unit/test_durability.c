@@ -1072,6 +1072,33 @@ static void test_second_connection_is_follower(void) {
     PASS();
 }
 
+/* 28. sqlite3_close() while the timer thread is inside a flush must not deadlock */
+static void test_close_during_timer_flush(void) {
+    TEST("sqlite3_close() while a timer flush is in flight returns (no deadlock)");
+    reset_dir();
+    const char *uri = "file:" DIR "/tclose.db?hpplite=on&privkey=0x" PRIVKEY_HEX "&datadir=" DIR
+                      "&interval=1ms&checkpoint=1";
+    alarm(60);                                   /* a hang fails the whole suite loudly */
+    for (int cycle = 0; cycle < 12; cycle++) {
+        sqlite3 *db = NULL;
+        if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("open");
+        HppliteNode *n = hpplite_get_node(db);
+        if (!n) FAIL("node");
+        /* the timer's flush parks in wait_for_tx; close lands while it is in flight */
+        HppliteL1 *l1 = hpplite_l1_create_mock();
+        hpplite_l1_mock_set_submit_delay_ms(l1, 40);
+        hpplite_node_set_l1(n, l1);
+        sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS t(x)", NULL, NULL, NULL);
+        sqlite3_exec(db, "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<2000)"
+                         " INSERT INTO t SELECT i FROM s", NULL, NULL, NULL);
+        usleep((useconds_t)(5000 + (cycle * 7919) % 60000));
+        if (sqlite3_close(db) != SQLITE_OK) FAIL("close");
+        hpplite_l1_disconnect(l1);
+    }
+    alarm(0);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1101,6 +1128,7 @@ int main(void) {
     test_close_busy_keeps_capturing();
     test_no_commit_under_app_read();
     test_second_connection_is_follower();
+    test_close_during_timer_flush();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

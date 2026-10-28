@@ -60,6 +60,7 @@ struct HppliteL1 {
     int failSubmit;              /* Test hook: reject batch submissions */
     int loseConfirmation;        /* Test hook: store but report failure */
     int txPending;               /* Test hook: wait_for_tx never confirms */
+    int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
     size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
@@ -550,11 +551,15 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
     (void)tx_hash;
     (void)timeout_secs;
     if (l1 && l1->txPending) return -1;   /* still pending after the timeout */
-    /* Mock succeeds immediately */
+    if (l1 && l1->submitDelayMs > 0) usleep((useconds_t)l1->submitDelayMs * 1000);
     return 1;
 }
 
 /* === Mock-specific functions for testing === */
+
+void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
+    if (l1) l1->submitDelayMs = ms;
+}
 
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
     if (l1) l1->failSubmit = fail;

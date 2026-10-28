@@ -575,7 +575,18 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   char *zExpanded;
   int rc;
 
-  if (!pCtx || !pCtx->bEnabled || pCtx->bInternal) return 0;
+  if (!pCtx || pCtx->bInternal) return 0;
+  /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
+  ** connection itself (sqlite3_next_stmt takes the connection mutex, which
+  ** sqlite3_close holds while it joins the timer thread - a deadlock). */
+  if (mask == SQLITE_TRACE_STMT) {
+    /* trigger sub-programs are traced too ("-- TRIGGER x") but have no
+    ** PROFILE event of their own; only top-level statements are counted */
+    if (!(zSql && zSql[0] == '-' && zSql[1] == '-')) pCtx->nAppStmtActive++;
+  } else if (mask == SQLITE_TRACE_PROFILE && pCtx->nAppStmtActive > 0) {
+    pCtx->nAppStmtActive--;
+  }
+  if (!pCtx->bEnabled) return 0;
   if (pCtx->bStatusGone && mask == SQLITE_TRACE_STMT) {
     /* A close that failed (SQLITE_BUSY) disconnected hpplite_status; the
     ** next successful close must flush again, which needs the instance back */
@@ -724,13 +735,13 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   pCtx->pLastLogged = NULL;
 }
 
-/* Statements of the application that are still open (ours do not count);
-** with bBusyOnly, only those in the middle of being stepped */
-static int applicationStatementsOpen(HppliteCtx *pCtx, int bBusyOnly) {
+/* Statements of the application that are still open (ours do not count).
+** Application thread only: it walks the connection. */
+static int applicationStatementsOpen(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt = NULL;
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt) continue;
-    if (!bBusyOnly || sqlite3_stmt_busy(pStmt)) return 1;
+    return 1;
   }
   return 0;
 }
@@ -824,7 +835,6 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
 ** never touch the application's transaction. On the shared (:memory:)
 ** connection they are only possible while the application is in autocommit.
 */
-static int applicationStatementsOpen(HppliteCtx *pCtx, int bBusyOnly);
 static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   if (pCtx->bkDb == pCtx->db && !sqlite3_get_autocommit(pCtx->db)) {
     return SQLITE_BUSY;
@@ -839,7 +849,7 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   ** application's own hpplite_flush() is exempt: that statement is the
   ** flush. */
   if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing
-      && applicationStatementsOpen(pCtx, 1)) {
+      && pCtx->nAppStmtActive > 0) {
     return SQLITE_BUSY;
   }
   return internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1573,7 +1583,7 @@ static void hpplite_on_close(sqlite3 *db) {
     ** fail with SQLITE_BUSY and the connection stays in use: flush what is
     ** pending but keep capturing. The sentinel destructor finishes the
     ** teardown when the connection really closes (issue #31). */
-    if (node->ctx && applicationStatementsOpen(node->ctx, 0)) {
+    if (node->ctx && applicationStatementsOpen(node->ctx)) {
         hpplite_node_flush_batch(node);
         node->ctx->bStatusGone = 1;
         return;
