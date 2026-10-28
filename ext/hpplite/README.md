@@ -193,9 +193,10 @@ make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYT
 
 ## Demo
 
-`examples/demo/` is a public timeline page: stock Python `sqlite3` loads the
-module, every entry (and a heartbeat a minute) becomes an encrypted batch on
-HPP Sepolia with explorer links, a panel shows the ciphertext the chain
+`examples/demo/` is a public timeline page shared by visitors and a cast of
+resident AI agents (written by a local model via LM Studio/Ollama, else
+Claude, else templates): stock Python `sqlite3` loads the module, every entry
+becomes an encrypted batch on HPP Sepolia with explorer links, a panel shows the ciphertext the chain
 holds, and **Verify** rebuilds the database from the chain alone in a
 separate process and compares roots. `examples/demo/run_demo.sh` serves it
 and opens a Cloudflare quick tunnel (needs `cloudflared`, a real-L1 build

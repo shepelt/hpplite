@@ -3,11 +3,13 @@
     HPPLITE_PRIVATE_KEY=0x... python3 app.py /path/to/hpplite.dylib [port]
 
 Stock Python sqlite3 + the loadable module. One hpplite=on connection (the
-sequencer) behind a lock; a heartbeat thread posts one entry a minute so the
-ledger moves even when nobody is watching; /api/verify rebuilds the database
-from the chain alone in a separate process and reports.
+sequencer) behind a lock; a cast of resident AI agents (agents.py, written by
+a local model through LM Studio/Ollama, else Claude, else templates) posts
+every 45-90 s so the ledger moves even when nobody is watching; /api/verify
+rebuilds the database from the chain alone in a separate process and reports.
 """
-import json, os, sqlite3, subprocess, sys, threading, time, urllib.request
+import json, os, random, sqlite3, subprocess, sys, threading, time, urllib.request
+import agents
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -29,6 +31,8 @@ db = sqlite3.connect(URI, uri=True, check_same_thread=False, isolation_level=Non
 lock = threading.Lock()
 with lock:
     db.execute("CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, posted_at INTEGER NOT NULL, ip_hash TEXT)")
+    if "kind" not in [r[1] for r in db.execute("PRAGMA table_info(entries)")]:
+        db.execute("ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'human'")   # captured and replayed like any DDL
     st = db.execute("SELECT height, pending, contract FROM hpplite_status").fetchone()
     print(f"hpplite: height {st[0]}, pending {st[1]}, contract {st[2]}", flush=True)
 
@@ -43,23 +47,26 @@ def status():
             "replay_skipped", "encryption", "keyed", "nondeterministic", "contract", "da_contract", "last_batch_tx"]
     d = dict(zip(keys, r)); d["entries"] = n; d["db_bytes"] = size; d["explorer"] = EXPLORER
     d["batches"] = d["height"] - 1
+    d["agents"] = [dict(name=a["name"], emoji=a["emoji"]) for a in agents.AGENTS]
+    d["writer"] = agents.writer_name()
     return d
 
 def entries(after=0, limit=50):
     with lock:
-        rows = db.execute("SELECT id, name, body, posted_at FROM entries WHERE id > ? ORDER BY id DESC LIMIT ?", (after, limit)).fetchall()
-    return [dict(id=r[0], name=r[1], body=r[2], posted_at=r[3]) for r in rows]
+        rows = db.execute("SELECT id, name, body, posted_at, kind FROM entries WHERE id > ? ORDER BY id DESC LIMIT ?", (after, limit)).fetchall()
+    return [dict(id=r[0], name=r[1], body=r[2], posted_at=r[3], kind=r[4]) for r in rows]
 
-def add_entry(name, body, ip):
+def add_entry(name, body, ip, kind="human"):
     name = (name or "anonymous").strip()[:40]
     body = (body or "").strip()[:280]
     if not body: return None
+    if kind == "human" and name in agents.NAMES: name += " (human)"
     import hashlib
     h = hashlib.sha256(ip.encode()).hexdigest()[:12]
     with lock:
         if db.execute("SELECT count(*) FROM entries").fetchone()[0] >= MAX_ENTRIES: return None
         # the timestamp is bound by the application: replay sees the literal, never 'now'
-        cur = db.execute("INSERT INTO entries(name, body, posted_at, ip_hash) VALUES(?,?,?,?)", (name, body, int(time.time()), h))
+        cur = db.execute("INSERT INTO entries(name, body, posted_at, ip_hash, kind) VALUES(?,?,?,?,?)", (name, body, int(time.time()), h, kind))
         return cur.lastrowid
 
 def chain_batch(height):
@@ -74,18 +81,24 @@ def chain_batch(height):
         res = json.load(r)["result"][2:]
     length = int(res[64:128], 16)
     raw = bytes.fromhex(res[128:128 + 2 * length])
+    last_batch_bytes["n"] = length
     return {"height": height, "bytes": length, "magic": raw[:4].decode("latin1"),
             "scheme_id": raw[4] if length > 4 else None, "hex_head": raw[:48].hex(), "hex_tail": raw[-16:].hex(),
             "sealed": raw.startswith(b"HPE")}
 
-# heartbeat: one entry a minute, so there is always something to post
+# the resident agents: one posts every 45-90 s, so there is always something to batch
+last_batch_bytes = {"n": 0}
 def heartbeat():
-    n = 0
+    rng = random.Random()
+    time.sleep(20)
     while True:
-        time.sleep(60)
-        n += 1
-        try: add_entry("heartbeat", f"tick {n}: still here", "heartbeat")
-        except Exception as e: print("heartbeat:", e, flush=True)
+        try:
+            s = status(); s["last_batch_bytes"] = last_batch_bytes["n"]
+            agent, text = agents.next_post(s, entries(0, 12), rng)
+            add_entry(agent["name"], text, "agent:" + agent["name"], kind="agent")
+        except Exception as e:
+            print("agents:", e, flush=True)
+        time.sleep(rng.uniform(45, 90))
 threading.Thread(target=heartbeat, daemon=True).start()
 
 last_post = {}

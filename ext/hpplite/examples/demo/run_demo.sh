@@ -20,9 +20,14 @@ cd "$here"
 "$py" app.py "$ext" "$port" > "$here/data/app.log" 2>&1 &
 app=$!
 trap 'kill $app 2>/dev/null; wait $app 2>/dev/null' EXIT INT TERM
-sleep 2
-kill -0 $app 2>/dev/null || { cat "$here/data/app.log"; exit 1; }
+# wait for the first lease claim / flush before announcing
+for i in $(seq 1 60); do
+    kill -0 $app 2>/dev/null || { cat "$here/data/app.log"; exit 1; }
+    curl -s -m 5 "http://localhost:$port/api/status" >/dev/null 2>&1 && break
+    sleep 1
+done
 echo "app: http://localhost:$port (log: data/app.log)"
+echo "agents: $(curl -s -m 5 "http://localhost:$port/api/status" | sed -n 's/.*"writer": "\([^"]*\)".*/\1/p')"
 # the quick-tunnel API is occasionally slow to answer; keep asking
 while kill -0 $app 2>/dev/null; do
     cloudflared tunnel --url "http://localhost:$port" --edge-ip-version 4 --protocol http2 2>&1 | grep --line-buffered -E "trycloudflare.com|error|failed"
