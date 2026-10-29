@@ -325,10 +325,15 @@ a hundred batches later:
 | `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `load_extension()` | connection state | read the value, then bind it |
 | `PRAGMA foreign_keys = ON`, `PRAGMA recursive_triggers = ON` | cascades are not replayed (#28) | put the behaviour in triggers; reads of the pragmas are fine |
 | `ATTACH` | writes to another file are not captured | one database per file |
+| writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
+| a statement, or a transaction, larger than one DA batch as posted (default 128 KB after JSON escaping and the envelope) | a transaction is never split across batches, so it could never be posted | smaller transactions; bulk-load before `hpplite=on` |
 
 `determinism=warn` (URI) or `HPPLITE_DETERMINISM=warn` restores warn-and-count
-for people who know what they are doing. Detection is a scan of the text: it
-does not know your own non-deterministic UDFs.
+for people who know what they are doing (the `_hpplite_*` and size rules
+stay). Detection is the parser's authorizer plus a scan of the text outside
+string literals; it does not know your own non-deterministic UDFs.
+`tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
+look-alikes it must let through.
 
 Not detectable, so not refused - know these:
 

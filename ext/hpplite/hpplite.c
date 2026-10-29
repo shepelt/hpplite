@@ -503,19 +503,67 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
 ** the root check fails. Spot the usual suspects and count them, so a user
 ** can see why verification would fail (hpplite_status.nondeterministic).
 */
-static int isNondeterministicSql(const char *z) {
-  /* z is lowercased by the caller */
+/*
+** The things the authorizer cannot see: keywords (CURRENT_*), the zero-
+** argument time functions, strftime with only a format, and the literal
+** 'now' as a time argument. Scans outside string literals; inside one,
+** only a lone 'now' (or 'localtime'-style modifier after it) counts, and
+** only in argument position: due='now' is data, datetime('now') is the clock.
+*/
+/* Is position i (a literal's opening quote) an argument of date(), time(),
+** datetime(), julianday(), unixepoch(), strftime() or timediff()? Walks back
+** to the enclosing '(' (earlier literals are already blanked to '#') and
+** reads the identifier before it. */
+static int isTimeFunctionArg(const char *z, size_t i) {
+  static const char *aTime[] = { "date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff", NULL };
+  int depth = 0;
+  size_t k = i, start, len;
+  while (k > 0) {
+    char c = z[--k];
+    if (c == ')') depth++;
+    else if (c == '(') { if (depth == 0) break; depth--; }
+  }
+  if (k == 0 && z[k] != '(') return 0;
+  while (k > 0 && (z[k - 1] == ' ' || z[k - 1] == '\t' || z[k - 1] == '\n' || z[k - 1] == '\r')) k--;
+  start = k;
+  while (start > 0 && ((z[start - 1] >= 'a' && z[start - 1] <= 'z') || (z[start - 1] >= '0' && z[start - 1] <= '9') || z[start - 1] == '_')) start--;
+  len = k - start;
+  for (int f = 0; aTime[f]; f++) {
+    if (strlen(aTime[f]) == len && strncmp(z + start, aTime[f], len) == 0) return 1;
+  }
+  return 0;
+}
+
+static int isNondeterministicSql(const char *zIn) {
+  /* zIn is lowercased by the caller; build a copy with literals blanked */
+  size_t n = strlen(zIn), i;
+  char *z = sqlite3_malloc64(n + 1);
+  int hit = 0;
+  if (!z) return 0;
+  memcpy(z, zIn, n + 1);
+  for (i = 0; i < n; i++) {
+    if (z[i] == '\'') {
+      size_t j = i + 1;
+      while (j < n && !(z[j] == '\'' && z[j + 1] != '\'')) j += (z[j] == '\'') ? 2 : 1;
+      /* 'now' counts when the function it is an argument of is a time
+      ** function: datetime('now'), strftime('%s', 'now'). VALUES('now'),
+      ** x IN ('now') and upper('now') are data. */
+      if (j - i - 1 == 3 && strncmp(z + i + 1, "now", 3) == 0 && isTimeFunctionArg(z, i)) hit = 1;
+      for (size_t m = i; m <= j && m < n; m++) z[m] = '#';   /* a blanked literal: not an identifier char, not empty */
+      i = j;
+    } else if (z[i] == '"' || z[i] == '`') {
+      /* identifiers: left as is (function names cannot hide in them) */
+    }
+  }
+  if (hit) { sqlite3_free(z); return 1; }
   static const char *aFn[] = {
-    "random(", "randomblob(", "current_time", "current_date", "current_timestamp",
-    "last_insert_rowid(", "changes(", "total_changes(", "sqlite_version(",
-    "load_extension(", "'now'", NULL
+    "current_time", "current_date", "current_timestamp", NULL
   };
   /* date(), time(), datetime(), julianday(), unixepoch() with no argument,
   ** and strftime('fmt') with only a format, all mean the current time */
   static const char *aTime[] = { "date(", "time(", "datetime(", "julianday(", "unixepoch(", NULL };
-  int i;
   for (i = 0; aFn[i]; i++) {
-    if (strstr(z, aFn[i])) return 1;
+    if (strstr(z, aFn[i])) { sqlite3_free(z); return 1; }
   }
   for (i = 0; aTime[i]; i++) {
     const char *p = z;
@@ -524,52 +572,111 @@ static int isNondeterministicSql(const char *z) {
       const char *q = p + n;
       int boundary = (p == z) || !((p[-1] >= 'a' && p[-1] <= 'z') || p[-1] == '_');
       while (*q == ' ' || *q == '\t' || *q == '\n') q++;
-      if (boundary && *q == ')') return 1;
+      if (boundary && *q == ')') { sqlite3_free(z); return 1; }
       p += n;
     }
   }
   {
+    /* strftime('fmt') with only a format: the literal is blanked above, so
+    ** look for strftime( followed by blanks and ')' with nothing else */
     const char *p = strstr(z, "strftime(");
     if (p) {
       const char *q = p + 9;
-      while (*q == ' ' || *q == '\t') q++;
-      if (*q == '\'') {                                 /* skip the format literal */
-        q++;
-        while (*q && !(*q == '\'' && q[1] != '\'')) q += (*q == '\'') ? 2 : 1;
-        if (*q) q++;
-        while (*q == ' ' || *q == '\t') q++;
-        if (*q == ')') return 1;
-      }
+      while (*q == ' ' || *q == '\t' || *q == '#') q++;     /* '#' = the blanked format literal */
+      if (*q == ')') { sqlite3_free(z); return 1; }
     }
   }
+  sqlite3_free(z);
   return 0;
 }
 
 /*
-** Connection state that replay does not carry: an ATTACHed database (its
-** writes are not captured) and the pragmas that change what later
-** statements do (cascades, recursive triggers). Reads of those pragmas are
-** fine. z is lowercased.
+** Authorizer: the parser's view, so quoting, case and comments cannot hide
+** anything. Application statements (bInternal clear) may not write our
+** tables (the log and meta are not user data: #18), ATTACH another file
+** (its writes are not captured), or turn on the pragmas that change what
+** later statements do (cascades, recursive triggers); in warn mode the
+** latter two are only counted. Non-deterministic functions are caught
+** here by name too, which the text scan could only approximate.
 */
-static int isUnsupportedConnectionState(const char *z) {
-  const char *p = z;
-  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-  if (strncmp(p, "attach", 6) == 0) return 1;
-  if (strncmp(p, "pragma", 6) == 0) {
-    static const char *aPragma[] = { "foreign_keys", "recursive_triggers", NULL };
-    int i;
-    for (i = 0; aPragma[i]; i++) {
-      const char *q = strstr(p, aPragma[i]);
-      if (!q) continue;
-      q += strlen(aPragma[i]);
-      while (*q == ' ' || *q == '\t') q++;
-      if (*q != '=') continue;                      /* a read */
-      q++;
-      while (*q == ' ' || *q == '\t') q++;
-      if (strncmp(q, "on", 2) == 0 || strncmp(q, "1", 1) == 0 || strncmp(q, "true", 4) == 0 || strncmp(q, "yes", 3) == 0) return 1;
+static int isHppliteTable(const char *zName) {
+  return zName && sqlite3_strnicmp(zName, "_hpplite_", 9) == 0;
+}
+static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, const char *z2) {
+  switch (op) {
+    case SQLITE_INSERT: case SQLITE_UPDATE: case SQLITE_DELETE:
+    case SQLITE_DROP_TABLE: case SQLITE_DROP_INDEX: case SQLITE_DROP_TRIGGER: case SQLITE_DROP_VIEW:
+    case SQLITE_DROP_TEMP_TABLE: case SQLITE_DROP_TEMP_INDEX: case SQLITE_DROP_TEMP_TRIGGER: case SQLITE_DROP_TEMP_VIEW:
+    case SQLITE_ALTER_TABLE:
+      if (isHppliteTable(z1) || (op == SQLITE_ALTER_TABLE && isHppliteTable(z2))) {
+        pCtx->zDenyWhy = "HPPLite's own tables are not writable from the application";
+        pCtx->nAuthDenied++;
+        return SQLITE_DENY;
+      }
+      return SQLITE_OK;
+    case SQLITE_CREATE_INDEX: case SQLITE_CREATE_TRIGGER:
+    case SQLITE_CREATE_TEMP_INDEX: case SQLITE_CREATE_TEMP_TRIGGER:
+      /* z1 = index/trigger name, z2 = its table: a trigger on the log would
+      ** run (uncaptured) on every write we make */
+      if (isHppliteTable(z1) || isHppliteTable(z2)) {
+        pCtx->zDenyWhy = "HPPLite's own tables are not writable from the application";
+        pCtx->nAuthDenied++;
+        return SQLITE_DENY;
+      }
+      return SQLITE_OK;
+    case SQLITE_CREATE_TABLE: case SQLITE_CREATE_VIEW:
+    case SQLITE_CREATE_TEMP_TABLE: case SQLITE_CREATE_TEMP_VIEW:
+      if (isHppliteTable(z1)) { pCtx->zDenyWhy = "the _hpplite_ prefix is reserved"; pCtx->nAuthDenied++; return SQLITE_DENY; }
+      return SQLITE_OK;
+    case SQLITE_ATTACH:
+      pCtx->nNondeterministic++;
+      if (pCtx->bDeterminismWarn) return SQLITE_OK;
+      pCtx->zDenyWhy = "ATTACH: writes to another file are not captured (unsupported in v0.1)";
+      pCtx->nAuthDenied++;
+      return SQLITE_DENY;
+    case SQLITE_PRAGMA:
+      /* z1 = pragma name, z2 = value or NULL (a read) */
+      if (z1 && z2 && (sqlite3_stricmp(z1, "foreign_keys") == 0 || sqlite3_stricmp(z1, "recursive_triggers") == 0)) {
+        int on = sqlite3_stricmp(z2, "1") == 0 || sqlite3_stricmp(z2, "on") == 0 || sqlite3_stricmp(z2, "true") == 0
+              || sqlite3_stricmp(z2, "yes") == 0;
+        if (on) {
+          pCtx->nNondeterministic++;
+          if (pCtx->bDeterminismWarn) return SQLITE_OK;
+          pCtx->zDenyWhy = "PRAGMA foreign_keys / recursive_triggers: cascades are not replayed (unsupported in v0.1)";
+          pCtx->nAuthDenied++;
+          return SQLITE_DENY;
+        }
+      }
+      return SQLITE_OK;
+    case SQLITE_FUNCTION: {
+      static const char *aFn[] = { "random", "randomblob", "last_insert_rowid", "changes", "total_changes",
+                                   "sqlite_version", "load_extension", NULL };
+      int i;
+      for (i = 0; aFn[i]; i++) {
+        if (z2 && sqlite3_stricmp(z2, aFn[i]) == 0) {
+          pCtx->nNondeterministic++;
+          if (pCtx->bDeterminismWarn) return SQLITE_OK;
+          pCtx->zDenyWhy = "non-deterministic function; replay cannot reproduce it (unsupported in v0.1, bind the value)";
+          pCtx->nAuthDenied++;
+          return SQLITE_DENY;
+        }
+      }
+      return SQLITE_OK;
     }
+    default:
+      return SQLITE_OK;
   }
-  return 0;
+}
+static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4) {
+  HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  int rc;
+  (void)z3; (void)z4;
+  if (!pCtx || pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  rc = hppliteAuthorizerInner(pCtx, op, z1, z2);
+  if (rc == SQLITE_DENY) {
+    fprintf(stderr, "hpplite: %s; statement refused (SQLITE_AUTH)\n", pCtx->zDenyWhy ? pCtx->zDenyWhy : "not authorized");
+  }
+  return rc;
 }
 
 static char *lowercaseDup(const char *z) {
@@ -653,6 +760,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     /* trigger sub-programs are traced too ("-- TRIGGER x") but have no
     ** PROFILE event of their own; only top-level statements are counted */
     if (!(zSql && zSql[0] == '-' && zSql[1] == '-')) pCtx->nAppStmtActive++;
+    if (sqlite3_get_autocommit(pCtx->db)) pCtx->txnBytes = 0;   /* no transaction open (yet): BEGIN starts one at 0 */
   } else if (mask == SQLITE_TRACE_PROFILE && pCtx->nAppStmtActive > 0) {
     pCtx->nAppStmtActive--;
   }
@@ -677,8 +785,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     char *lower = lowercaseDup(zSql);
     const char *zWhy = NULL;
     if (lower) {
-      if (isUnsupportedConnectionState(lower)) zWhy = "ATTACH / PRAGMA foreign_keys=ON / recursive_triggers=ON are not reproduced on replay";
-      else if (isTrackedSql(zSql) && !mentionsHppliteTable(zSql) && isNondeterministicSql(lower))
+      if (isTrackedSql(zSql) && isNondeterministicSql(lower))
         zWhy = "non-deterministic SQL (random(), 'now', CURRENT_TIMESTAMP, date() ...) cannot be replayed";
     }
     sqlite3_free(lower);
@@ -696,7 +803,13 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     }
   }
   if (!isTrackedSql(zSql)) return 0;
-  if (mentionsHppliteTable(zSql)) return 0;  /* never log our own tables */
+  if (mentionsHppliteTable(zSql)) {
+    /* A write that names our tables where the authorizer could not see it
+    ** (RENAME TO _hpplite_x, a subquery over the log whose rows differ on
+    ** every replica): not logged, so not allowed either. */
+    refuseStatement(pCtx, "application writes may not reference _hpplite_ tables", zSql);
+    return 0;
+  }
 
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
@@ -704,13 +817,29 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     refuseStatement(pCtx, "cannot expand bound parameters (out of memory?)", zSql);
     return 0;
   }
-  if (pCtx->maxStmtBytes > 0 && strlen(zExpanded) > pCtx->maxStmtBytes) {
-    char why[128];
-    snprintf(why, sizeof(why), "statement of %zu bytes exceeds what one DA batch can carry (%zu)",
-             strlen(zExpanded), pCtx->maxStmtBytes);
-    refuseStatement(pCtx, why, zSql);
-    sqlite3_free(zExpanded);
-    return 0;
+  if (pCtx->maxStmtBytes > 0) {
+    size_t sz = hpplite_batch_stmt_json_size(zExpanded, -1, 0);
+    char why[160];
+    if (sz > pCtx->maxStmtBytes) {
+      snprintf(why, sizeof(why), "statement of %zu bytes (as posted) exceeds what one DA batch can carry (%zu)",
+               sz, pCtx->maxStmtBytes);
+      refuseStatement(pCtx, why, zSql);
+      sqlite3_free(zExpanded);
+      return 0;
+    }
+    /* A transaction is never split across batches, so one that outgrows a
+    ** batch could never be posted: refuse the statement that would do it
+    ** (the application sees the error at the write, not a stuck sequencer) */
+    if (!sqlite3_get_autocommit(pCtx->db)) {
+      if (pCtx->txnBytes + sz > pCtx->maxStmtBytes) {
+        snprintf(why, sizeof(why), "transaction of %zu bytes (as posted) exceeds what one DA batch can carry (%zu); "
+                 "a transaction is never split across batches", pCtx->txnBytes + sz, pCtx->maxStmtBytes);
+        refuseStatement(pCtx, why, zSql);
+        sqlite3_free(zExpanded);
+        return 0;
+      }
+      pCtx->txnBytes += sz;
+    }
   }
 
   pCtx->bInternal = 1;
@@ -803,6 +932,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
   sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
+  sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
 
   *ppCtx = pCtx;
   return SQLITE_OK;
@@ -820,6 +950,7 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx) {
   ** rely on the commit hook as the canary (a library that replaces one
   ** usually replaces the others; the data_version check in #37 covers the rest) */
   sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
+  sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
   if (lost) {
     pCtx->nHooksReplaced++;
     if (pCtx->nHooksReplaced == 1) {
@@ -860,6 +991,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     sqlite3_commit_hook(pCtx->db, NULL, NULL);
     sqlite3_rollback_hook(pCtx->db, NULL, NULL);
     sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
+    sqlite3_set_authorizer(pCtx->db, NULL, NULL);
     finalizeOwnStatements(pCtx);
   }
   sqlite3_free(pCtx);
@@ -1035,7 +1167,18 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
     }
     sqlite3_finalize(pStmt);
   }
-  if (pBatch && overLimit) pBatch->partial = 1;
+  if (pBatch && overLimit) {
+    /* The size estimate stopped the read; if that landed inside a
+    ** transaction group that began in this batch, move the whole group to
+    ** the next batch - a transaction is never split across batches. */
+    int64_t cutTxn = pBatch->aTxns[pBatch->nTxns - 1].txn;
+    int i = pBatch->nTxns;
+    while (i > 0 && pBatch->aTxns[i - 1].txn == cutTxn) i--;
+    if (i > 0) {
+      while (pBatch->nTxns > i) batchPop(pBatch);
+    }
+    pBatch->partial = 1;
+  }
 
   if (pBatch) {
     pBatch->timestamp = (uint64_t)time(NULL);

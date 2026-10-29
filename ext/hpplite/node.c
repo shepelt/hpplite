@@ -152,10 +152,10 @@ static void node_set_stmt_limit(HppliteNode *node) {
     size_t limit = node->config.maxBatchBytes;
     if (!node->ctx) return;
     if (limit > 0) {
-        size_t overhead = hpplite_batch_json_overhead() + 64;
+        size_t overhead = hpplite_batch_json_overhead();
         if (node->cipher) overhead += hpplite_envelope_overhead(node->cipher);
-        /* JSON escaping can double a statement full of quotes/backslashes;
-        ** the capture-time check is on the raw text, so be conservative */
+        /* capture compares the statement's JSON-escaped size (what is posted)
+        ** against this, the same arithmetic the batch builder uses */
         limit = limit > overhead ? (limit - overhead) : 1;
     }
     node->ctx->maxStmtBytes = limit;
@@ -492,8 +492,23 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         }
         batch = hpplite_batch_from_json((const char *)plain);
         free(plain);
+    } else if (node->cipher) {
+        /* An encrypting node never posts plaintext, so a plaintext batch at
+        ** its height was posted by someone else: unauthenticated SQL that
+        ** every replica would run. Foreign, like a batch with a wrong tag.
+        ** (encrypt=off nodes still read plaintext history.) */
+        node->lastFetchForeign = 1;
+        fprintf(stderr, "hpplite: batch %llu is plaintext on an encrypting rollup: not ours\n", (unsigned long long)height);
+        return NULL;
     } else {
         batch = hpplite_batch_from_json((const char *)data);
+    }
+    if (batch && batch->height != height) {
+        /* the slot is the truth; a batch claiming another height is corrupt */
+        fprintf(stderr, "hpplite: batch at height %llu claims height %llu; corrupt\n",
+                (unsigned long long)height, (unsigned long long)batch->height);
+        hpplite_batch_free(batch);
+        return NULL;
     }
     if (!batch) {
         fprintf(stderr, "hpplite: batch %llu on L1 is not a batch this version can decode (%zu bytes)\n",
@@ -1114,6 +1129,7 @@ int hpplite_node_has_lease(HppliteNode *node) {
 int hpplite_node_start(HppliteNode *node) {
     if (!node) return -1;
     if (node->state == HPPLITE_STATE_RUNNING) return 0;
+    if (node->state == HPPLITE_STATE_ERROR) return -1;    /* sync refused the L1 history: stay in error */
 
     /* Take the lease if it is free or ours; a foreign holder (another
     ** instance of this wallet, or a stranger) is left alone - we capture

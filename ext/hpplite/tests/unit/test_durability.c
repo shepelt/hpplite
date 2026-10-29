@@ -390,9 +390,12 @@ static void test_adopt_on_reopen(void) {
     sqlite3_int64 maxId = 0;
     HppliteBatch *b = hpplite_build_batch(n->ctx, &maxId);
     char *json = hpplite_batch_to_json(b);
-    char *tx = hpplite_l1_submit_batch(l1, n->instanceId, b->height, (const uint8_t *)json, strlen(json));
+    size_t sealedLen = 0;
+    uint8_t *sealed = hpplite_envelope_seal(n->cipher, n->encKey, b->height, HPPLITE_ENCODING_NONE,
+                                            (const uint8_t *)json, strlen(json), &sealedLen);
+    char *tx = hpplite_l1_submit_batch(l1, n->instanceId, b->height, sealed, sealedLen);
     if (!tx) FAIL("manual submit");
-    sqlite3_free(tx); sqlite3_free(json); hpplite_batch_free(b);
+    sqlite3_free(tx); sqlite3_free(json); free(sealed); hpplite_batch_free(b);
     /* crash: tear the node down without the flush destroy would do */
     n->hasLease = 0;
     n->l1 = NULL;
@@ -776,16 +779,21 @@ static void test_encryption_off_and_legacy(void) {
     free(raw);
     sqlite3_close(db);
 
-    HppliteNode *e = open_node(DIR "/enc.db", l1);     /* encrypting node reads the plaintext history */
+    /* an encrypting node never posts plaintext, so plaintext at its height
+    ** is someone else's (review finding): it refuses the rollup rather than
+    ** run unauthenticated SQL. A plaintext rollup is read with encrypt=off. */
+    HppliteNode *e = open_node(DIR "/enc.db", l1);
     if (!e) FAIL("open encrypting node");
-    if (count_rows(e->db, "t") != 1) FAIL("plaintext batch not replayed");
-    hpplite_node_exec(e, "INSERT INTO t VALUES(2)", NULL);
-    if (hpplite_node_flush_batch(e) != 2) FAIL("flush 2");
-    raw = hpplite_l1_get_batch(l1, 2, &len);
-    if (!raw || !hpplite_envelope_is_sealed(raw, len)) FAIL("new batch should be sealed");
-    free(raw);
+    if (e->state != HPPLITE_STATE_ERROR || count_rows(e->db, "t") > 0) FAIL("encrypting node must not replay plaintext batches");  /* -1: table never created */
     hpplite_node_destroy(e);
-    hpplite_l1_disconnect(l1);
+    sqlite3 *db2 = hpplite_open("file:" DIR "/plain2.db?hpplite=on&encrypt=off&datadir=" DIR
+                                "&privkey=0x" PRIVKEY_HEX);
+    if (!db2) FAIL("open plaintext reader");
+    HppliteNode *p2 = hpplite_get_node(db2);
+    hpplite_node_set_l1(p2, l1);
+    if (hpplite_node_sync_from_l1(p2, 1) < 0 || count_rows(db2, "t") != 1) FAIL("encrypt=off reader replays plaintext history");
+    sqlite3_close(db2);
+    e = NULL;
     PASS();
 }
 
@@ -1285,7 +1293,9 @@ static void test_unsupported_sql_refused(void) {
         NULL };
     for (int i = 0; aBad[i]; i++) {
         int rc = sqlite3_exec(n->db, aBad[i], NULL, NULL, NULL);
-        if (rc != SQLITE_INTERRUPT) { printf("(rc=%d for %s) ", rc, aBad[i]); FAIL("unsupported statement must fail with SQLITE_INTERRUPT"); }
+        /* authorizer denials surface at prepare (SQLITE_AUTH, or SQLITE_ERROR through exec); text-scan ones as INTERRUPT */
+        if (rc != SQLITE_INTERRUPT && rc != SQLITE_AUTH && rc != SQLITE_ERROR) { printf("(rc=%d for %s) ", rc, aBad[i]); FAIL("unsupported statement must fail"); }
+        if (rc == SQLITE_OK) { printf("(%s) ", aBad[i]); FAIL("unsupported statement was applied"); }
     }
     if (count_rows(n->db, "t") != 0) FAIL("nothing applied");
     if (hpplite_node_pending_count(n) != 1) FAIL("only the CREATE TABLE is logged");

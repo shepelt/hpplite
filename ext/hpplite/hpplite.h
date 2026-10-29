@@ -74,7 +74,10 @@ struct HppliteCtx {
   int bRootDirty;
 
   size_t maxStmtBytes;        /* Longest statement the DA can carry (0 = unlimited) */
+  size_t txnBytes;            /* Posted size of the open transaction's logged statements so far */
   int bDeterminismWarn;       /* Non-deterministic SQL: 1 = warn and count, 0 = refuse (default) */
+  uint64_t nAuthDenied;       /* Statements the authorizer refused at prepare (our tables, ATTACH, pragmas) */
+  const char *zDenyWhy;       /* Why the statement being prepared was denied (for the error message) */
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
