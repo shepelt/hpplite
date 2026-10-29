@@ -432,17 +432,6 @@ uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
     return l1->leaseExpiry - l1->currentTimestamp;
 }
 
-/*
-** Check if pubkey is current sequencer with active lease
-*/
-int hpplite_l1_is_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
-    if (!l1 || !pubkey || !l1->hasSequencer) return 0;
-    if (!hpplite_l1_is_lease_active(l1)) return 0;
-
-    /* Derive address from pubkey and compare to sequencer wallet */
-    /* For mock, we just check if there's an active lease */
-    return 1;
-}
 
 /*
 ** Claim sequencer lease with instance ID

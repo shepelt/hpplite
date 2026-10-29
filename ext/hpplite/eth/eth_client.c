@@ -321,6 +321,31 @@ int eth_client_latest_block(EthClient *client, uint64_t *pNumber, uint64_t *pTim
     return 0;
 }
 
+/*
+** eth_estimateGas for a call from our address; (uint64_t)-1 on failure.
+** Storage-heavy calls (submitBatch) cannot be sized by a per-byte formula
+** across chains; the node estimates and adds a margin.
+*/
+uint64_t eth_client_estimate_gas(EthClient *client, const uint8_t to[20], const uint8_t *data, size_t data_len) {
+    if (!client || !client->has_privkey) return (uint64_t)-1;
+    cJSON *tx = cJSON_CreateObject();
+    char *from_hex = eth_hex_encode(client->address, 20);
+    char *to_hex = eth_hex_encode(to, 20);
+    char *data_hex = eth_hex_encode(data, data_len);
+    cJSON_AddStringToObject(tx, "from", from_hex);
+    cJSON_AddStringToObject(tx, "to", to_hex);
+    cJSON_AddStringToObject(tx, "data", data_hex);
+    free(from_hex); free(to_hex); free(data_hex);
+    cJSON *params = cJSON_CreateArray();
+    cJSON_AddItemToArray(params, tx);
+    cJSON *response = rpc_call(client, "eth_estimateGas", params);
+    if (!response) return (uint64_t)-1;
+    cJSON *result = cJSON_GetObjectItem(response, "result");
+    uint64_t gas = (result && cJSON_IsString(result)) ? strtoull(result->valuestring, NULL, 16) : (uint64_t)-1;
+    cJSON_Delete(response);
+    return gas;
+}
+
 uint64_t eth_client_get_nonce(EthClient *client, const uint8_t address[20]) {
     cJSON *params = cJSON_CreateArray();
     char *addr_hex = eth_hex_encode(address, 20);
@@ -332,6 +357,11 @@ uint64_t eth_client_get_nonce(EthClient *client, const uint8_t address[20]) {
     if (!response) return (uint64_t)-1;
     
     cJSON *result = cJSON_GetObjectItem(response, "result");
+    if (!result || !cJSON_IsString(result)) {
+        snprintf(client->error, sizeof(client->error), "eth_getTransactionCount: no result");
+        cJSON_Delete(response);
+        return (uint64_t)-1;
+    }
     uint64_t nonce = strtoull(result->valuestring, NULL, 16);
     cJSON_Delete(response);
     return nonce;
@@ -342,6 +372,11 @@ uint64_t eth_client_gas_price(EthClient *client) {
     if (!response) return (uint64_t)-1;
     
     cJSON *result = cJSON_GetObjectItem(response, "result");
+    if (!result || !cJSON_IsString(result)) {
+        snprintf(client->error, sizeof(client->error), "eth_gasPrice: no result");
+        cJSON_Delete(response);
+        return (uint64_t)-1;
+    }
     uint64_t price = strtoull(result->valuestring, NULL, 16);
     cJSON_Delete(response);
     return price;
@@ -431,7 +466,8 @@ static size_t sign_transaction(EthClient *client,
 size_t eth_client_sign_tx(EthClient *client, uint64_t nonce, uint64_t gas_price, uint64_t gas_limit,
                           const uint8_t to[20], uint64_t value, const uint8_t *data, size_t data_len,
                           uint8_t *out, size_t out_size) {
-    uint8_t *raw = malloc(out_size);
+    /* sign_transaction sizes its own scratch from data_len; give it that much */
+    uint8_t *raw = malloc(data_len + 512);
     size_t n;
     if (!raw) return 0;
     n = sign_transaction(client, nonce, gas_price, gas_limit, to, value, data, data_len, raw);
@@ -458,7 +494,12 @@ uint8_t *eth_client_send_raw_tx(EthClient *client,
     }
     
     uint8_t *tx_hash = malloc(32);
-    eth_hex_decode(result->valuestring, tx_hash, 32);
+    if (!tx_hash || eth_hex_decode(result->valuestring, tx_hash, 32) != 0) {
+        snprintf(client->error, sizeof(client->error), "malformed tx hash in response");
+        free(tx_hash);
+        cJSON_Delete(response);
+        return NULL;
+    }
     cJSON_Delete(response);
     return tx_hash;
 }

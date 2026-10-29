@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <time.h>
 
 struct HppliteL1 {
     EthClient *eth;
@@ -241,7 +242,10 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     state->lastCheckpointTime = abi_decode_uint64(p);
 
     /* The chain's own clock, for lease arithmetic (never wall-clock time) */
-    eth_client_latest_block(l1->eth, &state->currentBlock, &state->currentTimestamp);
+    if (eth_client_latest_block(l1->eth, &state->currentBlock, &state->currentTimestamp) != 0) {
+        state->currentBlock = 0;
+        state->currentTimestamp = (uint64_t)time(NULL);   /* callers never see 0; wall clock is the fallback */
+    }
 
     free(result);
     return state;
@@ -286,9 +290,9 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
 
     /* Parse string offset and decode string */
     uint64_t strOffset = abi_decode_uint64(result);
-    if (strOffset < result_len) {
+    if (strOffset + 32 <= result_len && strOffset + 32 >= strOffset) {         /* length word in bounds */
         uint64_t strLen = abi_decode_uint64(result + strOffset);
-        if (strLen > 0 && strOffset + 32 + strLen <= result_len) {
+        if (strLen > 0 && strLen <= result_len && strOffset + 32 + strLen <= result_len) {
             config->daScheme = malloc(strLen + 1);
             memcpy(config->daScheme, result + strOffset + 32, strLen);
             config->daScheme[strLen] = '\0';
@@ -321,20 +325,13 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     return config;
 }
 
-int hpplite_l1_is_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
-    HppliteL1State *state = hpplite_l1_get_state(l1);
-    if (!state) return 0;
-
-    /* Derive address from compressed pubkey and compare */
-    uint8_t address[20];
-    if (eth_address_from_compressed_pubkey(pubkey, address) != 0) {
-        hpplite_l1_state_free(state);
-        return 0;
-    }
-
-    int result = (memcmp(address, state->sequencerWallet, 20) == 0);
-    hpplite_l1_state_free(state);
-    return result;
+uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
+    HppliteL1State *st = hpplite_l1_get_state(l1);
+    uint64_t left = 0;
+    if (!st) return 0;
+    if (st->leaseExpiry > st->currentTimestamp) left = st->leaseExpiry - st->currentTimestamp;
+    hpplite_l1_state_free(st);
+    return left;
 }
 
 char *hpplite_l1_submit_checkpoint(
@@ -424,6 +421,11 @@ char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
     ** Rollups created by the older factory only have the owner-only
     ** forceExpireLease(); the version is read on connect. */
     uint8_t *tx_hash;
+    if (l1->version == 0) {
+        /* connected without reading the system config: ask before choosing the call */
+        HppliteSystemConfig *cfg = hpplite_l1_get_system_config(l1);
+        if (cfg) hpplite_l1_system_config_free(cfg);
+    }
     if (l1->version >= 5 && instanceId) {
         uint8_t calldata[36];
         memcpy(calldata, SEL_RELEASE_LEASE, 4);
@@ -753,8 +755,14 @@ char *hpplite_l1_submit_batch(
      * - On L2s like HPP: additional L1 data posting costs
      * For batch storage, we need significant gas for SSTORE operations.
      */
-    uint64_t gas_estimate = 200000 + data_len * 700;  /* ~700 gas per byte for storage */
-    if (gas_estimate < 3000000) gas_estimate = 3000000;  /* Min 3M gas for batches */
+    /* Ask the chain: storage costs differ per chain and a fixed per-byte
+    ** formula sat right at the edge (fresh storage is ~707 gas/byte; the
+    ** old 700 ran out of gas on larger batches). 25% margin; the formula
+    ** is only the fallback when the estimate call fails. */
+    uint64_t gas_estimate = eth_client_estimate_gas(l1->eth, l1->da_contract, calldata, calldata_len);
+    if (gas_estimate == (uint64_t)-1) gas_estimate = 300000 + data_len * 1000;
+    else gas_estimate += gas_estimate / 4;
+    if (gas_estimate < 3000000) gas_estimate = 3000000;
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->da_contract, calldata, calldata_len,
                                            gas_estimate, 0);
     free(calldata);
@@ -798,7 +806,8 @@ uint8_t *hpplite_l1_get_batch(
     }
 
     uint64_t len = abi_decode_uint64(result + offset);
-    if (len == 0 || offset + 32 + len > result_len) {
+    if (offset + 32 > result_len || offset + 32 < offset) { free(result); return NULL; }   /* length word in bounds */
+    if (len == 0 || len > result_len || offset + 32 + len > result_len) {
         free(result);
         *data_len_out = 0;
         return NULL;

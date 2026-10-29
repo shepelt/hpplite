@@ -39,6 +39,9 @@ uint8_t *eth_client_call(EthClient *client,
 /* Get nonce for address */
 uint64_t eth_client_get_nonce(EthClient *client, const uint8_t address[20]);
 
+/* eth_estimateGas from our address; (uint64_t)-1 on failure */
+uint64_t eth_client_estimate_gas(EthClient *client, const uint8_t to[20], const uint8_t *data, size_t data_len);
+
 /* Sign a legacy (EIP-155) transaction into out; returns its length, 0 on error. For tests. */
 size_t eth_client_sign_tx(EthClient *client, uint64_t nonce, uint64_t gas_price, uint64_t gas_limit,
                           const uint8_t to[20], uint64_t value, const uint8_t *data, size_t data_len,

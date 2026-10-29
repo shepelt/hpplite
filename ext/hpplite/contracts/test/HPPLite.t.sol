@@ -117,6 +117,26 @@ contract HPPLiteTest is Test {
         fresh.setSequencer(address(0x999));
     }
 
+    function test_SetSequencer_RevokesLease() public {
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId1);
+        assertTrue(hpplite.isLeaseActive());
+        address newKey = address(0x7777);
+        hpplite.setSequencer(newKey);
+        // the old key's lease is gone: it cannot renew, checkpoint or post
+        assertFalse(hpplite.isLeaseActive());
+        vm.prank(sequencer);
+        vm.expectRevert("Not the sequencer");
+        hpplite.renewLease(instanceId1);
+        vm.prank(sequencer);
+        vm.expectRevert("Lease expired");
+        da.submitBatch(instanceId1, 1, "x");
+        // and the new key can claim at once
+        vm.prank(newKey);
+        hpplite.claimSequencer(instanceId2);
+        assertEq(hpplite.sequencerWallet(), newKey);
+    }
+
     function test_ReleaseLease() public {
         vm.prank(sequencer);
         hpplite.claimSequencer(instanceId1);

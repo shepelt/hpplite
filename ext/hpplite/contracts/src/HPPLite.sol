@@ -49,6 +49,7 @@ contract HPPLite {
     }
 
     modifier onlyActiveSequencer(bytes32 instanceId) {
+        require(msg.sender == sequencer, "Not the sequencer");
         require(msg.sender == sequencerWallet, "Not sequencer wallet");
         require(instanceId == sequencerInstance, "Wrong instance");
         require(block.timestamp < leaseExpiry, "Lease expired");
@@ -154,6 +155,7 @@ contract HPPLite {
         if (sequencer == owner) {
             emit SequencerChanged(sequencer, newOwner);
             sequencer = newOwner;
+            leaseExpiry = block.timestamp;   // the old key's lease ends with its role
         }
         owner = newOwner;
     }
@@ -165,6 +167,7 @@ contract HPPLite {
         require(newSequencer != address(0), "Invalid sequencer");
         emit SequencerChanged(sequencer, newSequencer);
         sequencer = newSequencer;
+        leaseExpiry = block.timestamp;       // a rotated-out key cannot keep posting on its old lease
     }
 
     /**

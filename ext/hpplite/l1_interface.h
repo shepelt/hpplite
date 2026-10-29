@@ -193,12 +193,6 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
 /* The wallet this connection signs with (needs a private key). 0 on success. */
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]);
 
-/*
-** Check if we are the current sequencer.
-** pubkey: our public key (33 bytes)
-** Returns 1 if we are sequencer with active lease.
-*/
-int hpplite_l1_is_sequencer(HppliteL1 *l1, const unsigned char *pubkey);
 
 /*
 ** Get remaining lease time in seconds.
