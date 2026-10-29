@@ -12,8 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
 
 struct EthClient {
+    pthread_mutex_t lock;      /* one curl easy handle: one request at a time (timer thread vs app thread) */
     char *rpc_url;
     uint64_t chain_id;
     uint8_t privkey[32];
@@ -76,7 +79,21 @@ int eth_hex_decode(const char *hex, uint8_t *out, size_t out_len) {
 }
 
 /* Make JSON-RPC call */
+static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *params);
+/*
+** A curl easy handle must not be used by two threads at once. HPPLite's
+** timer thread and the application (hpplite_get_l1(), close) both reach
+** the same client, which crashed the process once both were busy.
+*/
 static cJSON *rpc_call(EthClient *client, const char *method, cJSON *params) {
+    cJSON *r;
+    pthread_mutex_lock(&client->lock);
+    r = rpc_call_locked(client, method, params);
+    pthread_mutex_unlock(&client->lock);
+    return r;
+}
+
+static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *params) {
     struct ResponseBuffer response = {0};
     struct curl_slist *headers = NULL;
     
@@ -100,13 +117,36 @@ static cJSON *rpc_call(EthClient *client, const char *method, cJSON *params) {
     curl_easy_setopt(client->curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(client->curl, CURLOPT_WRITEDATA, &response);
     
-    CURLcode res = curl_easy_perform(client->curl);
+    curl_easy_setopt(client->curl, CURLOPT_USERAGENT, "hpplite/0.1");
+    curl_easy_setopt(client->curl, CURLOPT_TIMEOUT, 60L);
+
+    /* An RPC under load answers 429/5xx, sometimes with an empty body; one
+    ** empty body used to reach cJSON_Parse(NULL) and crash the process. */
+    CURLcode res = CURLE_OK;
+    long httpStatus = 0;
+    int attempt;
+    for (attempt = 0; attempt < 4; attempt++) {
+        free(response.data);
+        response.data = NULL; response.size = 0;
+        res = curl_easy_perform(client->curl);
+        httpStatus = 0;
+        if (res == CURLE_OK) curl_easy_getinfo(client->curl, CURLINFO_RESPONSE_CODE, &httpStatus);
+        if (res == CURLE_OK && httpStatus != 429 && httpStatus < 500) break;
+        usleep((useconds_t)(250000u << attempt));            /* 0.25, 0.5, 1, 2 s */
+    }
     curl_slist_free_all(headers);
     free(request_str);
     
     if (res != CURLE_OK) {
         snprintf(client->error, sizeof(client->error), "curl error: %s", 
                  curl_easy_strerror(res));
+        free(response.data);
+        return NULL;
+    }
+    if (!response.data || httpStatus >= 400) {
+        snprintf(client->error, sizeof(client->error), "RPC HTTP %ld%s", httpStatus,
+                 response.data ? "" : " (empty body)");
+        if (getenv("HPPLITE_ETH_DEBUG")) fprintf(stderr, "eth: %s -> %s\n", method, client->error);
         free(response.data);
         return NULL;
     }
@@ -157,6 +197,7 @@ EthClient *eth_client_create(const char *rpc_url, uint64_t chain_id) {
     eth_client_global_init();
     client = calloc(1, sizeof(EthClient));
     if (!client) return NULL;
+    pthread_mutex_init(&client->lock, NULL);
     
     client->rpc_url = strdup(rpc_url);
     client->chain_id = chain_id;
@@ -174,6 +215,7 @@ EthClient *eth_client_create(const char *rpc_url, uint64_t chain_id) {
 
 void eth_client_destroy(EthClient *client) {
     if (!client) return;
+    pthread_mutex_destroy(&client->lock);
     free(client->rpc_url);
     if (client->curl) curl_easy_cleanup(client->curl);
     if (client->secp_ctx) secp256k1_context_destroy(client->secp_ctx);
@@ -421,7 +463,21 @@ uint8_t *eth_client_send_raw_tx(EthClient *client,
     return tx_hash;
 }
 
-uint8_t *eth_client_send_tx(EthClient *client,
+static uint8_t *eth_client_send_tx_locked(EthClient *client,
+                                          const uint8_t to[20], const uint8_t *data, size_t data_len,
+                                          uint64_t gas_limit, uint64_t value);
+/* nonce fetch, sign and send as one unit: two threads must not pick the same nonce */
+static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
+uint8_t *eth_client_send_tx(EthClient *client, const uint8_t to[20], const uint8_t *data, size_t data_len,
+                            uint64_t gas_limit, uint64_t value) {
+    uint8_t *r;
+    pthread_mutex_lock(&g_send_lock);
+    r = eth_client_send_tx_locked(client, to, data, data_len, gas_limit, value);
+    pthread_mutex_unlock(&g_send_lock);
+    return r;
+}
+
+static uint8_t *eth_client_send_tx_locked(EthClient *client,
                             const uint8_t to[20],
                             const uint8_t *data, size_t data_len,
                             uint64_t gas_limit,

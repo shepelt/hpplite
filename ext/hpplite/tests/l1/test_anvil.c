@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 
 #define DIR "/tmp/hpplite_anvil"
 static int tests_run = 0, tests_passed = 0;
@@ -127,6 +128,35 @@ static void test_second_instance_same_wallet(void) {
 }
 
 /* 3. Sleep for days, wake, write: one claim, then business as usual */
+/* 5. The application calls into L1 (hpplite_get_l1) while the timer thread flushes: one curl handle */
+static void *app_thread_rpcs(void *arg) {
+    HppliteL1 *l1 = arg;
+    for (int i = 0; i < 40; i++) {
+        HppliteL1State *st = hpplite_l1_get_state(l1);
+        if (st) hpplite_l1_state_free(st);
+        HppliteSystemConfig *c = hpplite_l1_get_system_config(l1);
+        if (c) hpplite_l1_system_config_free(c);
+    }
+    return NULL;
+}
+static void test_concurrent_rpc(void) {
+    TEST("application RPCs through hpplite_get_l1() while the timer flushes (shared curl handle)");
+    sqlite3 *a = open_db("t5.db", KEY0, "&interval=200ms");
+    if (!a) FAIL("open");
+    HppliteNode *na = hpplite_get_node(a);
+    sqlite3_exec(a, "CREATE TABLE IF NOT EXISTS t(x)", NULL, NULL, NULL);
+    pthread_t th;
+    pthread_create(&th, NULL, app_thread_rpcs, na->l1);
+    for (int i = 0; i < 20; i++) {
+        sqlite3_exec(a, "INSERT INTO t VALUES(7)", NULL, NULL, NULL);
+        usleep(100000);
+    }
+    pthread_join(th, NULL);
+    if (na->state == HPPLITE_STATE_ERROR) FAIL("node in error");
+    sqlite3_close(a);
+    PASS();
+}
+
 static void test_sleep_and_wake(void) {
     TEST("lease expired by chain time after a long sleep: wake, claim, post");
     sqlite3 *a = open_db("t3.db", KEY0, NULL);
@@ -183,6 +213,7 @@ int main(void) {
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
     test_second_instance_same_wallet();
+    test_concurrent_rpc();
     test_sleep_and_wake();
     test_stranger_after_expiry();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);

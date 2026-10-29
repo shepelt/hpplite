@@ -15,7 +15,7 @@
 **   HPPLITE_FACTORY_ADDRESS   - Factory contract (auto-creates rollup per wallet)
 **   HPPLITE_CONTRACT_ADDRESS  - Existing rollup contract
 **   HPPLITE_DATA_DIR          - Local data directory
-**   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m)
+**   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m, 1h; 0 = no timer)
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
 **   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
 **   HPPLITE_ROLE              - sequencer|observer

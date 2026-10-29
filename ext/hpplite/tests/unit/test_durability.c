@@ -1230,6 +1230,36 @@ static void test_capture_matching(void) {
     PASS();
 }
 
+/* 33. A node with nothing pending that flushes while another instance posted: replay, not ERROR */
+static void test_idle_reader_flush_replays(void) {
+    TEST("flush on an idle node finds new L1 batches: replays them instead of failing to adopt");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/live.db", l1);
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("a batch 1");
+    /* a rebuild running beside the live sequencer (verify_rebuild.py), its timer ticking */
+    HppliteNode *r = open_node(DIR "/rebuild.db", l1);
+    if (!r || count_rows(r->db, "t") != 1) FAIL("reader synced batch 1");
+    hpplite_node_exec(a, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(a) != 2) FAIL("a batch 2");
+    /* the reader's timer flushes with nothing pending: must catch up, not error */
+    hpplite_node_flush_batch(r);
+    if (r->state == HPPLITE_STATE_ERROR) FAIL("idle reader went to ERROR on a batch it had not seen");
+    if (count_rows(r->db, "t") != 2 || hpplite_node_get_height(r) != 3) FAIL("reader replayed batch 2");
+    /* and with pending SQL of its own, a foreign batch at its height is still refused */
+    hpplite_node_exec(r, "INSERT INTO t VALUES(99)", NULL);
+    hpplite_node_exec(a, "INSERT INTO t VALUES(3)", NULL);
+    if (hpplite_node_flush_batch(a) != 3) FAIL("a batch 3");
+    hpplite_node_flush_batch(r);
+    if (r->state != HPPLITE_STATE_ERROR) FAIL("a writer whose pending SQL diverges from L1 must refuse, not fork");
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1264,6 +1294,7 @@ int main(void) {
     test_stranger_lease_evicted_sibling_not();
     test_replaced_hooks_detected();
     test_capture_matching();
+    test_idle_reader_flush_replays();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

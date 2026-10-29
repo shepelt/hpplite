@@ -109,7 +109,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `contract` | No | Connect to an existing rollup instead of using the factory |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `datadir` | No | Local data directory |
-| `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h` |
+| `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint / state root (default 100) |
 

@@ -40,7 +40,7 @@ fi
 # Defaults
 RPC_URL="${HPPLITE_L1_RPC:-https://sepolia.hpp.io}"
 CHAIN_ID="${HPPLITE_L1_CHAIN_ID:-181228}"
-GAS_AMOUNT="0.01ether"  # Amount to fund test keys
+GAS_AMOUNT="0.001ether"  # Stipend per throwaway test wallet (a rollup + a few batches is ~0.0001 ETH at 0.01 gwei; the rest is stranded)
 
 # HD derivation path for factory deployer
 # m/44'/60'/0'/0/0 = first account
@@ -53,6 +53,7 @@ echo ""
 command -v cast >/dev/null || { echo "ERROR: cast not found (install foundry)"; exit 1; }
 command -v forge >/dev/null || { echo "ERROR: forge not found (install foundry)"; exit 1; }
 
+MASTER_PRIVATE_KEY="$HPPLITE_PRIVATE_KEY"   # the examples fund their own wallets from it
 # Validate master key
 if [ -z "$HPPLITE_PRIVATE_KEY" ]; then
     echo "ERROR: HPPLITE_PRIVATE_KEY not set"
@@ -163,7 +164,11 @@ HPPLITE_FACTORY_ADDRESS=$FACTORY_ADDRESS
 HPPLITE_PRIVATE_KEY=$TEST_PRIVATE_KEY
 EOF
 
-# Run tests
+# Run tests. The key goes into the environment explicitly: an exported
+# HPPLITE_PRIVATE_KEY in the caller's shell (the master key) would otherwise
+# reach the tests and they would open the master wallet's live rollup.
+export HPPLITE_PRIVATE_KEY="$TEST_PRIVATE_KEY"
+unset HPPLITE_CONTRACT_ADDRESS
 cd "$BUILD_DIR"
 cp "$TEST_ENV" .env
 
@@ -179,13 +184,13 @@ if [ $TEST_RESULT -eq 0 ]; then
 fi
 
 # Examples: each must run to completion. They create their own funded wallet
-# from the master key (HPPLITE_PRIVATE_KEY, loaded from .env above).
+# from the master key (the tests above ran with the throwaway test key).
 if [ $TEST_RESULT -eq 0 ]; then
     for ex in da_uri_demo l1_config factory_demo basic_sequencer; do
         if [ -x "./$ex" ]; then
             echo ""
             echo "Running example $ex..."
-            HPPLITE_PRIVATE_KEY="$HPPLITE_PRIVATE_KEY" "./$ex"
+            HPPLITE_PRIVATE_KEY="$MASTER_PRIVATE_KEY" "./$ex"
             rc=$?
             if [ $rc -ne 0 ]; then
                 echo "Example $ex failed (exit $rc)"

@@ -812,10 +812,20 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     if (node->follower) return 0;          /* the sequencer connection posts */
     node->lastFlushTime = node_current_time_ms();
 
-    /* Finish anything a previous attempt left on L1; if L1 holds history
-    ** that is not ours, refuse to write rather than fork the chain */
+    /* Finish anything a previous attempt left on L1. With pending SQL, a
+    ** batch at our height must be ours (adopt) or the chain has forked
+    ** (refuse). With nothing pending it is simply history we have not seen
+    ** yet - another process of this wallet posted while we were idle (a
+    ** rebuild running beside the live sequencer, a resumed machine): replay
+    ** it, as open does. */
     if (node->l1) {
         int rc;
+        if (hpplite_pending_count(node->ctx) == 0) {
+            if (hpplite_node_sync_from_l1(node, 1) < 0) {
+                node->state = HPPLITE_STATE_ERROR;
+                return 0;
+            }
+        }
         while ((rc = node_adopt_existing(node)) == 1) { }
         if (rc < 0) {
             node->state = HPPLITE_STATE_ERROR;

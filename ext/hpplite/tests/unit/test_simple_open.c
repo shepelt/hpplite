@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "hpplite.h"
+#include "node.h"
 #include "config.h"
 #include "da_uri.h"
 #include "batch.h"
@@ -244,6 +245,15 @@ int main(void) {
         /* Check config has correct interval */
         HppliteConfig *cfg = hpplite_get_config(db);
         if (cfg->batchIntervalMs != 200) FAIL("interval not set correctly");
+        {   /* interval=0 means no timer at all; it used to fall back to the 5 s default */
+            unlink("/tmp/test_simple_open_zero.db");
+            sqlite3 *z = hpplite_open("file:/tmp/test_simple_open_zero.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple");
+            if (!z) FAIL("open interval=0");
+            if (hpplite_get_config(z)->batchIntervalMs != 0) FAIL("interval=0 should parse as 0");
+            if (hpplite_get_node(z)->timerRunning) FAIL("interval=0 must not start the timer");
+            sqlite3_close(z);
+            unlink("/tmp/test_simple_open_zero.db");
+        }
 
         /* Get height BEFORE inserting data */
         HppliteCtx *ctx = hpplite_context(db);

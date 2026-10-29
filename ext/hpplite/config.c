@@ -58,6 +58,7 @@ static int parse_duration_ms(const char *str) {
     if (!str) return -1;
 
     int value = atoi(str);
+    if (value == 0 && (str[0] == '0')) return 0;   /* "0", "0s", "0ms": no timer */
     if (value <= 0) return -1;
 
     /* Find unit suffix */
@@ -193,7 +194,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_BATCH_INTERVAL);
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms > 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) cfg->batchIntervalMs = ms;
     }
 
     /* Encryption */
@@ -373,7 +374,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     /* Batch interval */
     if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
-        if (ms > 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) cfg->batchIntervalMs = ms;
     }
 
     /* Encryption */
@@ -492,7 +493,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, "interval");
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms > 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) cfg->batchIntervalMs = ms;
     }
 
     /* Encryption */

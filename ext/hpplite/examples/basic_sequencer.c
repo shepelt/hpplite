@@ -61,7 +61,7 @@ int main(void) {
     char privkey[128], address[64];
     if (test_util_create_funded_wallet(privkey, sizeof(privkey),
                                         address, sizeof(address),
-                                        HPPLITE_DEFAULT_RPC, "0.01ether") != 0) {
+                                        HPPLITE_DEFAULT_RPC, "0.001ether") != 0) {
         return 1;
     }
     printf("  Address: %s\n\n", address);
