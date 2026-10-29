@@ -14,7 +14,7 @@
 ** Factory addresses are per-network constants
 */
 const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0x9c6abd030e61bcc5146db942b1dd4f705ba81897"},
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d"},
     {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL},  /* Not deployed yet */
     {"ethereum",    1,      "https://eth.llamarpc.com", NULL},
     {"sepolia",     11155111, "https://sepolia.drpc.org", NULL},

@@ -43,7 +43,7 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 5);
+        assertEq(hpplite.VERSION(), 6);
     }
 
     function test_ClaimSequencer() public {
@@ -273,7 +273,7 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 5);
+        assertEq(version, 6);
         assertEq(checkpointInterval, 100);
         assertEq(leaseDuration, 5 minutes);
     }

@@ -14,11 +14,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 
 /* Default HPP Sepolia settings */
 #define HPPLITE_DEFAULT_RPC "https://sepolia.hpp.io"
-#define HPPLITE_DEFAULT_FACTORY "0x9c6abd030e61bcc5146db942b1dd4f705ba81897"
+#define HPPLITE_DEFAULT_FACTORY "0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d"
 
 /* Run command and capture first line of output */
 static inline char *test_util_run_cmd(const char *cmd) {
@@ -110,11 +111,18 @@ static inline int test_util_get_address(const char *privkey, char *out, size_t o
 /* Fund address from master key */
 static inline int test_util_fund_wallet(const char *to_address, const char *master_key,
                                         const char *rpc_url, const char *amount) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "cast send \"%s\" --value %s --private-key \"%s\" --rpc-url \"%s\" >/dev/null 2>&1",
-        to_address, amount, master_key, rpc_url);
-    return system(cmd) == 0 ? 0 : -1;
+    char cmd[768];
+    /* Sends from the master wallet follow each other quickly (one per test
+    ** or example): a nonce race or a slow RPC fails one now and then.
+    ** Retry, and show cast's error on the last attempt instead of hiding it. */
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        snprintf(cmd, sizeof(cmd),
+            "cast send \"%s\" --value %s --private-key \"%s\" --rpc-url \"%s\" >/dev/null %s",
+            to_address, amount, master_key, rpc_url, attempt < 3 ? "2>&1" : "");
+        if (system(cmd) == 0) return 0;
+        sleep(3 * attempt);
+    }
+    return -1;
 }
 
 /* All-in-one: generate key, derive address, fund from master

@@ -13,7 +13,7 @@ pragma solidity ^0.8.19;
 contract HPPLite {
     // ============ Constants ============
     uint256 public constant LEASE_DURATION = 5 minutes;
-    uint256 public constant VERSION = 5;
+    uint256 public constant VERSION = 6;
 
     // ============ State ============
     address public owner;
