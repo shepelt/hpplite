@@ -42,7 +42,9 @@ while :; do
     sleep 15
     if ! kill -0 $app 2>/dev/null || ! curl -s -m 10 "http://localhost:$port/api/status" >/dev/null 2>&1; then
         echo "$(date -u +%FT%TZ) app not answering; restarting (the lease is re-taken at open)" | tee -a "$here/data/app.log"
-        kill $app 2>/dev/null; wait $app 2>/dev/null
+        # a dead app makes wait return its exit status: with set -e that
+        # silently ended the launcher instead of restarting the app
+        kill $app 2>/dev/null; wait $app 2>/dev/null || true
         start_app || { echo "restart failed"; exit 1; }
     fi
 done
