@@ -545,6 +545,33 @@ static int isNondeterministicSql(const char *z) {
   return 0;
 }
 
+/*
+** Connection state that replay does not carry: an ATTACHed database (its
+** writes are not captured) and the pragmas that change what later
+** statements do (cascades, recursive triggers). Reads of those pragmas are
+** fine. z is lowercased.
+*/
+static int isUnsupportedConnectionState(const char *z) {
+  const char *p = z;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+  if (strncmp(p, "attach", 6) == 0) return 1;
+  if (strncmp(p, "pragma", 6) == 0) {
+    static const char *aPragma[] = { "foreign_keys", "recursive_triggers", NULL };
+    int i;
+    for (i = 0; aPragma[i]; i++) {
+      const char *q = strstr(p, aPragma[i]);
+      if (!q) continue;
+      q += strlen(aPragma[i]);
+      while (*q == ' ' || *q == '\t') q++;
+      if (*q != '=') continue;                      /* a read */
+      q++;
+      while (*q == ' ' || *q == '\t') q++;
+      if (strncmp(q, "on", 2) == 0 || strncmp(q, "1", 1) == 0 || strncmp(q, "true", 4) == 0 || strncmp(q, "yes", 3) == 0) return 1;
+    }
+  }
+  return 0;
+}
+
 static char *lowercaseDup(const char *z) {
   size_t n = strlen(z), i;
   char *out = sqlite3_malloc64(n + 1);
@@ -641,19 +668,35 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     return 0;
   }
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
-  if (!isTrackedSql(zSql)) return 0;
-  if (mentionsHppliteTable(zSql)) return 0;  /* never log our own tables */
+  /* Statements replay cannot reproduce are unsupported in v0.1 (row-level
+  ** capture, #19, lifts this): connection state that changes what a later
+  ** statement does, and non-deterministic values. Refused by default so the
+  ** application learns at the write, not from a root mismatch 100 batches
+  ** later; determinism=warn keeps the old warn-and-count behaviour. */
   {
     char *lower = lowercaseDup(zSql);
-    if (lower && isNondeterministicSql(lower)) {
-      if (pCtx->nNondeterministic == 0) {
-        fprintf(stderr, "hpplite: statement uses a non-deterministic function; replay cannot "
-                        "reproduce it and verification will report a mismatch: %.80s\n", zSql);
-      }
-      pCtx->nNondeterministic++;
+    const char *zWhy = NULL;
+    if (lower) {
+      if (isUnsupportedConnectionState(lower)) zWhy = "ATTACH / PRAGMA foreign_keys=ON / recursive_triggers=ON are not reproduced on replay";
+      else if (isTrackedSql(zSql) && !mentionsHppliteTable(zSql) && isNondeterministicSql(lower))
+        zWhy = "non-deterministic SQL (random(), 'now', CURRENT_TIMESTAMP, date() ...) cannot be replayed";
     }
     sqlite3_free(lower);
+    if (zWhy) {
+      pCtx->nNondeterministic++;
+      if (!pCtx->bDeterminismWarn) {
+        char why[200];
+        snprintf(why, sizeof(why), "%s; unsupported in v0.1, bind the value instead", zWhy);
+        refuseStatement(pCtx, why, zSql);
+        return 0;
+      }
+      if (pCtx->nNondeterministic == 1) {
+        fprintf(stderr, "hpplite: %s; verification will report a mismatch: %.80s\n", zWhy, zSql);
+      }
+    }
   }
+  if (!isTrackedSql(zSql)) return 0;
+  if (mentionsHppliteTable(zSql)) return 0;  /* never log our own tables */
 
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
@@ -1760,6 +1803,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->chainId = cfg->chainId;
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
+    nc->determinismWarn = cfg->determinismWarn;
     nc->checkpointInterval = cfg->checkpointInterval;
 
     /* Role removed - always sequencer in simplified model */

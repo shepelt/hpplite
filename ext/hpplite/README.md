@@ -112,6 +112,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint / state root (default 100) |
+| `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -309,31 +310,37 @@ until v0.3.
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
 
-## Determinism
+## Unsupported in v0.1
 
-HPPLite replays SQL *text*, so a statement must produce the same rows wherever
-it runs. Values that depend on anything but the database are not reproducible
-and will make verification report a mismatch - correctly, because the data
-really differs: `random()`, `randomblob()`, `datetime('now')`,
-`CURRENT_TIMESTAMP` (also as a column `DEFAULT`), `last_insert_rowid()`,
-`changes()`. Compute such values in the application and **bind** them:
-bound parameters are expanded into the captured statement and replay exactly.
-Capture warns once and counts offenders in `hpplite_status.nondeterministic`.
-Detection is a scan of the statement text: it knows `random()`, the
-`current_*` keywords, `'now'`, and the time functions called with no time
-argument (`date()`, `datetime()`, `julianday()`, `unixepoch()`,
-`strftime('%s')`); it does not know your own non-deterministic UDFs.
+HPPLite v0.1 replays SQL *text*, so a statement must produce the same rows
+wherever it runs. What cannot be reproduced is **refused at the write**
+(`SQLITE_INTERRUPT`, a line on stderr, counted in
+`hpplite_status.nondeterministic`) rather than discovered as a root mismatch
+a hundred batches later:
 
-Two more consequences of replaying text, until row-level capture (#19):
+| Refused | Why | Do this instead |
+|---------|-----|-----------------|
+| `random()`, `randomblob()` | different value on replay | generate in the application, bind it |
+| `CURRENT_TIMESTAMP`, `CURRENT_TIME`, `CURRENT_DATE`, `'now'`, bare `date()`/`time()`/`datetime()`/`julianday()`/`unixepoch()`, `strftime('fmt')` - also as a column `DEFAULT` (`CREATE TABLE` is refused) | the clock | bind the timestamp; `date('2026-01-01')` with an explicit time is fine |
+| `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `load_extension()` | connection state | read the value, then bind it |
+| `PRAGMA foreign_keys = ON`, `PRAGMA recursive_triggers = ON` | cascades are not replayed (#28) | put the behaviour in triggers; reads of the pragmas are fine |
+| `ATTACH` | writes to another file are not captured | one database per file |
+
+`determinism=warn` (URI) or `HPPLITE_DETERMINISM=warn` restores warn-and-count
+for people who know what they are doing. Detection is a scan of the text: it
+does not know your own non-deterministic UDFs.
+
+Not detectable, so not refused - know these:
 
 - **Bound `REAL` values** are expanded with 15 significant digits
   (`sqlite3_expanded_sql`), so `0.1 + 0.2` replays as `0.3`. Store exact
   decimals as `INTEGER` or `TEXT`, or write the literal yourself.
 - **`TEXT` with an embedded NUL** is cut at the NUL in the captured text.
-- **Connection state is not captured**: `PRAGMA foreign_keys=ON` cascades,
-  `recursive_triggers`, and writes to `ATTACH`ed databases are applied at the
-  sequencer but not reproduced on replay (#28). Keep the schema's behaviour
-  in the schema (triggers, constraints) and one database per file.
+- **`INSERT ... SELECT` without `ORDER BY`** into a rowid table takes its row
+  order from the query planner.
+
+All of this is lifted in v0.2 by capturing row changes instead of statement
+text (#19), which is why it is "unsupported", not "won't fix".
 
 ## Keys
 

@@ -47,10 +47,13 @@ static int count_rows(sqlite3 *db, const char *table) {
     return n;
 }
 
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
+static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determinismWarn);
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_mode(dbPath, l1, 0); }
+static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determinismWarn) {
     HppliteNodeConfig config;
     HppliteNode *node;
     memset(&config, 0, sizeof(config));
+    config.determinismWarn = determinismWarn;
     config.nodeId = "durability";
     memcpy(config.privkey, PRIVKEY, 32);
     config.hasPrivkey = 1;
@@ -847,6 +850,7 @@ static void test_capture_corner_cases(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "corner"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/corner.db"; config.checkpointInterval = 1;
+    config.determinismWarn = 1;    /* this case checks detection, not refusal */
     HppliteNode *n = hpplite_node_create(&config);
     if (!n) FAIL("open");
     hpplite_node_set_l1(n, l1); hpplite_node_start(n);
@@ -1260,6 +1264,54 @@ static void test_idle_reader_flush_replays(void) {
     PASS();
 }
 
+/* 34. Unsupported SQL is refused by default; determinism=warn lets it through with a count */
+static void test_unsupported_sql_refused(void) {
+    TEST("non-deterministic SQL, ATTACH and foreign_keys=ON are refused (strict); warn mode counts");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/strict.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    static const char *aBad[] = {
+        "INSERT INTO t(v) VALUES(random())",
+        "INSERT INTO t(v) VALUES(datetime('now'))",
+        "INSERT INTO t(v) VALUES(CURRENT_TIMESTAMP)",
+        "CREATE TABLE log(id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP)",
+        "INSERT INTO t(v) VALUES(date())",
+        "UPDATE t SET v = last_insert_rowid()",
+        "PRAGMA foreign_keys = ON",
+        "PRAGMA foreign_keys=1",
+        "ATTACH DATABASE ':memory:' AS aux",
+        NULL };
+    for (int i = 0; aBad[i]; i++) {
+        int rc = sqlite3_exec(n->db, aBad[i], NULL, NULL, NULL);
+        if (rc != SQLITE_INTERRUPT) { printf("(rc=%d for %s) ", rc, aBad[i]); FAIL("unsupported statement must fail with SQLITE_INTERRUPT"); }
+    }
+    if (count_rows(n->db, "t") != 0) FAIL("nothing applied");
+    if (hpplite_node_pending_count(n) != 1) FAIL("only the CREATE TABLE is logged");
+    if (n->ctx->nNondeterministic != 9) { printf("(counted %llu) ", (unsigned long long)n->ctx->nNondeterministic); FAIL("each refusal counted"); }
+    /* reads of the pragmas, deterministic time functions and bound values are fine */
+    if (sqlite3_exec(n->db, "PRAGMA foreign_keys", NULL, NULL, NULL) != SQLITE_OK) FAIL("pragma read");
+    if (sqlite3_exec(n->db, "INSERT INTO t(v) VALUES(date('2026-01-01'))", NULL, NULL, NULL) != SQLITE_OK) FAIL("date with an argument");
+    sqlite3_stmt *s; sqlite3_prepare_v2(n->db, "INSERT INTO t(v) VALUES(?)", -1, &s, NULL);
+    sqlite3_bind_int64(s, 1, 1700000000); if (sqlite3_step(s) != SQLITE_DONE) FAIL("bound timestamp"); sqlite3_finalize(s);
+    if (count_rows(n->db, "t") != 2 || hpplite_node_pending_count(n) != 3) FAIL("supported statements captured");
+    hpplite_node_destroy(n);
+
+    hpplite_l1_disconnect(l1);
+
+    /* warn mode: the old behaviour (its own rollup, so no history is replayed) */
+    HppliteL1 *l1w = hpplite_l1_create_mock();
+    HppliteNode *w = open_node_mode(DIR "/warn.db", l1w, 1);
+    if (!w) FAIL("open warn");
+    hpplite_node_exec(w, "CREATE TABLE t(v)", NULL);
+    if (sqlite3_exec(w->db, "INSERT INTO t VALUES(random())", NULL, NULL, NULL) != SQLITE_OK) FAIL("warn mode must let it through");
+    if (count_rows(w->db, "t") != 1 || w->ctx->nNondeterministic != 1) FAIL("warn mode applies and counts");
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1w);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_reopen_continues();
@@ -1295,6 +1347,7 @@ int main(void) {
     test_replaced_hooks_detected();
     test_capture_matching();
     test_idle_reader_flush_replays();
+    test_unsupported_sql_refused();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

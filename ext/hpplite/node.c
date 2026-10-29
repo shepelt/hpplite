@@ -100,6 +100,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.batchIntervalMs = config->batchIntervalMs;
     node->config.maxBatchBytes = config->maxBatchBytes ? config->maxBatchBytes : 128 * 1024;
     node->config.noEncrypt = config->noEncrypt;
+    node->config.determinismWarn = config->determinismWarn;
 
     /* Generate unique instance ID */
     generate_instance_id(node->instanceId);
@@ -189,6 +190,7 @@ static int node_init_tracking(HppliteNode *node) {
 
     rc = hpplite_init(node->db, &node->ctx);
     if (rc != SQLITE_OK) return rc;
+    node->ctx->bDeterminismWarn = node->config.determinismWarn;
 
     if (zFile && zFile[0]) {
         rc = sqlite3_open_v2(zFile, &node->bkDb, SQLITE_OPEN_READWRITE, NULL);

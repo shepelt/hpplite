@@ -11,6 +11,7 @@
 #include "hpplite_sqlite.h"
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <ctype.h>
 
@@ -201,6 +202,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
 
+    /* Determinism: strict (default) or warn */
+    val = getenv(HPPLITE_ENV_DETERMINISM);
+    if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
+
     /* Checkpoint interval */
     val = getenv(HPPLITE_ENV_CHECKPOINT);
     if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
@@ -381,6 +386,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_ENCRYPT, buf, sizeof(buf))) {
         cfg->encrypt = parse_bool(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_DETERMINISM, buf, sizeof(buf))) {
+        cfg->determinismWarn = (strcasecmp(buf, "warn") == 0);
+    }
 
     /* Checkpoint interval */
     if (get_uri_param(uri, HPPLITE_URI_CHECKPOINT, buf, sizeof(buf)) && atoi(buf) > 0) {
@@ -499,6 +507,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     /* Encryption */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_DETERMINISM);
+    if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
 
     /* Checkpoint interval */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT);
