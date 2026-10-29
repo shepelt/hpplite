@@ -15,8 +15,11 @@ rpc="http://127.0.0.1:$port"
 # anvil's first two default accounts (public test keys, 10000 ETH each)
 key0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 key1=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+key2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 log=${TMPDIR:-/tmp}/hpplite-anvil-$$.log
-anvil --port "$port" --chain-id 31337 --silent --block-time 1 >"$log" 2>&1 &
+# HPP Sepolia's block gas limit (2^50), not anvil's default 30M: a full
+# 128 KB batch in contract storage needs ~90M gas (#51)
+anvil --port "$port" --chain-id 31337 --silent --block-time 1 --gas-limit 1125899906842624 >"$log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$log"' EXIT INT TERM
 for i in $(seq 1 50); do cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -30,4 +33,4 @@ rm -f "$log.forge"
 # forge script prints the simulated address even when the broadcast reverted (e.g. over the 24 KB size limit)
 [ "$(cast code "$factory" --rpc-url "$rpc" 2>/dev/null | wc -c)" -gt 10 ] || { echo "factory at $factory has no code: deployment reverted (forge build --sizes)"; exit 1; }
 echo "anvil on $rpc, factory $factory"
-HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 "$bin"
+HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 "$bin"

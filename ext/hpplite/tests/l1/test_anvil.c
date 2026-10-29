@@ -6,12 +6,15 @@
 **
 ** What the mock cannot show: real claim/renew/release transactions and
 ** receipts, lease expiry by chain time, a second instance of our own
-** wallet, a stranger's claim after expiry, sleeping for days.
+** wallet, a stranger's claim after expiry, sleeping for days, and (#51)
+** that what capture accepts survives the real path: sealed, posted to
+** contract storage at the size limit, replayed by a fresh replica.
 */
 #include "hpplite.h"
 #include "node.h"
 #include "l1_interface.h"
 #include "eth/eth_client.h"
+#include "batch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +28,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
-static const char *RPC, *FACTORY, *KEY0, *KEY1;
+static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2;
 
 static void chain_sleep(int seconds) {
     char cmd[256];
@@ -205,10 +208,148 @@ static void test_stranger_after_expiry(void) {
     PASS();
 }
 
+
+/* 6. Edge-case SQL and full-size batches end to end (#51). KEY2's own,
+** fresh rollup: writer posts, a replica on another file rebuilds from the
+** chain, roots must match, every posted batch within the contract's limit. */
+static const char *aAllowed[] = {
+    "CREATE TABLE e(id INTEGER PRIMARY KEY, v)",
+    "INSERT INTO e(v) VALUES('random()')",
+    "INSERT INTO e(v) VALUES('now')",
+    "INSERT INTO e(v) VALUES('datetime(''now'')')",
+    "INSERT INTO e(v) VALUES('CURRENT_TIMESTAMP')",
+    "INSERT INTO e(v) VALUES('DELETE FROM _hpplite_pending')",
+    "INSERT INTO e(v) VALUES('it''s now or never')",
+    "INSERT INTO e(v) VALUES(upper('now'))",
+    "INSERT INTO e(v) VALUES(datetime('2024-01-01 00:00:00'))",
+    "INSERT INTO e(v) VALUES(date('2024-01-01', '+1 day'))",
+    "INSERT INTO e(v) VALUES(strftime('%Y-%m-%d %H', '2024-02-29 13:00'))",
+    "INSERT INTO e(v) VALUES(unixepoch('2024-01-01'))",
+    "INSERT INTO e(v) VALUES(julianday('2024-01-01'))",
+    "SELECT count(*) FROM _hpplite_pending",                  /* reads are fine; a write that reads the log is refused */
+    "PRAGMA foreign_keys = OFF",
+    "INSERT INTO e(v) VALUES('back\\slash \"double\" ''single'' tab\there')",
+    "INSERT INTO e(v) VALUES('line one' || char(10) || 'line two' || char(13) || char(1) || char(31) || char(127))",
+    "INSERT INTO e(v) VALUES('한국어 日本語 emoji 🚀🔥 ünïcödé')",
+    "INSERT INTO e(v) VALUES(char(55357, 56832))",
+    "INSERT INTO e(v) VALUES(x'00ff10ab')",
+    "INSERT INTO e(v) VALUES(zeroblob(64))",
+    "INSERT INTO e(v) VALUES(9223372036854775807)",
+    "INSERT INTO e(v) VALUES(-9223372036854775808)",
+    "INSERT INTO e(v) VALUES(1e308)",
+    "INSERT INTO e(v) VALUES(NULL)",
+    "INSERT INTO e(v) VALUES('')",
+    "UPDATE e SET v = v || '/' WHERE typeof(v) = 'text'",
+    "CREATE TABLE \"we\"\"ird \"\"name\"(\"col \"\"x\"\"\")",
+    "INSERT INTO \"we\"\"ird \"\"name\" VALUES('}]\\\",{\"sql\":\"DROP TABLE e\"}')",
+    NULL
+};
+
+/* An INSERT whose posted (JSON-escaped) size is exactly `target` bytes:
+** an escape-heavy head, then plain padding one byte at a time. */
+static char *sized_insert(size_t target) {
+    size_t cap = target + 64, at;
+    char *sql = malloc(cap);
+    at = (size_t)snprintf(sql, cap, "INSERT INTO big VALUES('");
+    for (int i = 0; i < 200; i++) { sql[at++] = '"'; sql[at++] = '\\'; sql[at++] = '\n'; }
+    while (at + 3 < cap) {
+        memcpy(sql + at, "')", 3);                      /* close the statement to measure it */
+        size_t sz = hpplite_batch_stmt_json_size(sql, -1, 0);
+        if (sz == target) return sql;
+        if (sz > target) break;
+        sql[at++] = 'a';                                /* plain byte: +1 posted byte */
+    }
+    free(sql);
+    return NULL;
+}
+
+static void test_edge_sql_end_to_end(void) {
+    TEST("edge-case SQL and full-size batches: posted on the real contract, replica root matches");
+    sqlite3 *w = open_db("e_writer.db", KEY2, NULL);
+    if (!w) FAIL("open writer");
+    HppliteNode *nw = hpplite_get_node(w);
+    if (!nw || !nw->l1 || !nw->ctx) FAIL("writer has no L1");
+    HppliteSystemConfig *cfg = hpplite_l1_get_system_config(nw->l1);
+    if (!cfg) FAIL("system config");
+    size_t limit = (size_t)cfg->batchSizeLimit;
+    hpplite_l1_system_config_free(cfg);
+    size_t stmtLimit = nw->ctx->maxStmtBytes;
+    if (limit == 0 || stmtLimit == 0 || stmtLimit >= limit) FAIL("no batch limit learned from the contract");
+
+    for (int i = 0; aAllowed[i]; i++) {
+        char *err = NULL;
+        if (sqlite3_exec(w, aAllowed[i], NULL, NULL, &err) != SQLITE_OK) {
+            printf("[%s: %s] ", aAllowed[i], err ? err : "?"); sqlite3_free(err); sqlite3_close(w); FAIL("an allowed statement was refused");
+        }
+    }
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("corpus batch not posted"); }
+
+    /* one statement at exactly the per-statement limit, alone in its batch:
+    ** the largest batch the node will ever post, on the real contract */
+    sqlite3_exec(w, "CREATE TABLE big(v)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("flush before the big statement"); }
+    char *atLimit = sized_insert(stmtLimit);
+    char *overLimit = sized_insert(stmtLimit + 1);
+    if (!atLimit || !overLimit) { sqlite3_close(w); FAIL("could not build statements of the target size"); }
+    int rcOver = sqlite3_exec(w, overLimit, NULL, NULL, NULL);
+    int rcAt = sqlite3_exec(w, atLimit, NULL, NULL, NULL);
+    free(atLimit); free(overLimit);
+    if (rcOver == SQLITE_OK) { sqlite3_close(w); FAIL("a statement one byte over the limit was accepted"); }
+    if (rcAt != SQLITE_OK) { sqlite3_close(w); FAIL("a statement exactly at the limit was refused"); }
+    uint64_t hBig = (uint64_t)scalar(w, "SELECT hpplite_flush()");
+    if (hBig == 0) { dump_state(nw->l1, nw->instanceId, "big flush"); sqlite3_close(w); FAIL("the contract did not take a batch at the size limit (gas or size)"); }
+    size_t bigLen = 0;
+    uint8_t *raw = hpplite_l1_get_batch(nw->l1, hBig, &bigLen);
+    free(raw);
+    printf("(limit %zu, largest batch %zu) ", limit, bigLen);
+    if (bigLen > limit) { sqlite3_close(w); FAIL("posted batch over the contract's limit"); }
+    if (bigLen < limit - limit / 20) { sqlite3_close(w); FAIL("the at-limit batch is not near the limit: the test is not exercising it"); }
+
+    /* a backlog of escape-heavy rows that fills several batches */
+    uint64_t hBefore = (uint64_t)scalar(w, "SELECT height FROM hpplite_status");
+    sqlite3_exec(w, "CREATE TABLE fill(i, v)", NULL, NULL, NULL);
+    char row[1200];
+    for (int i = 0; i < 300; i++) {
+        int at = snprintf(row, sizeof(row), "INSERT INTO fill VALUES(%d, '", i);
+        for (int k = 0; k < 250; k++) { row[at++] = (k % 3) ? 'q' : '"'; row[at++] = (k % 5) ? 'z' : '\\'; }
+        snprintf(row + at, sizeof(row) - (size_t)at, " %d🚀')", i);
+        if (sqlite3_exec(w, row, NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("fill insert"); }
+    }
+    uint64_t hLast = (uint64_t)scalar(w, "SELECT hpplite_flush()");
+    /* hBefore is the next height to post, so the backlog is hBefore..hLast */
+    if (hLast < hBefore) { sqlite3_close(w); FAIL("backlog not posted"); }
+    if (hLast == hBefore) { sqlite3_close(w); FAIL("the backlog fit in one batch: the test is not exercising the cut"); }
+    for (uint64_t h = hBefore; h <= hLast; h++) {
+        size_t len = 0;
+        uint8_t *b = hpplite_l1_get_batch(nw->l1, h, &len);
+        free(b);
+        if (len > limit) { sqlite3_close(w); FAIL("a backlog batch is over the contract's limit"); }
+    }
+    if (scalar(w, "SELECT pending FROM hpplite_status") != 0) { sqlite3_close(w); FAIL("pending left after flush"); }
+
+    unsigned char rootW[32], rootR[32];
+    hpplite_state_root(w, rootW);
+    sqlite3_int64 rowsW = scalar(w, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
+    sqlite3_int64 heightW = scalar(w, "SELECT height FROM hpplite_status");
+    sqlite3_close(w);                       /* releases the lease */
+
+    sqlite3 *r = open_db("e_replica.db", KEY2, NULL);
+    if (!r) FAIL("open replica");
+    if (scalar(r, "SELECT height FROM hpplite_status") != heightW) { sqlite3_close(r); FAIL("replica did not sync to the writer's height"); }
+    hpplite_state_root(r, rootR);
+    sqlite3_int64 rowsR = scalar(r, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
+    sqlite3_int64 bigR = scalar(r, "SELECT length(v) FROM big");
+    sqlite3_close(r);
+    if (rowsR != rowsW) FAIL("replica row count differs");
+    if (bigR <= 0) FAIL("the at-limit row is missing on the replica");
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica state root differs from the writer's");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
-    KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
@@ -216,6 +357,7 @@ int main(void) {
     test_concurrent_rpc();
     test_sleep_and_wake();
     test_stranger_after_expiry();
+    test_edge_sql_end_to_end();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     (void)!system("rm -rf " DIR);
     return tests_passed == tests_run ? 0 : 1;
