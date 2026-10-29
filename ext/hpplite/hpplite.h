@@ -55,6 +55,10 @@ struct HppliteCtx {
   int bStatusGone;            /* hpplite_status was disconnected by a close that failed */
   sqlite3_int64 curTxn;       /* Id of the first logged row of the open transaction (0 = none) */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
+  sqlite3_stmt *pRecTrigStmt; /* Cached PRAGMA recursive_triggers (read) */
+  int bRecTrigSeen;           /* The application prepared PRAGMA recursive_triggers: read it per statement */
+  sqlite3_stmt *aActiveStmt[16]; /* Application statements between their STMT and PROFILE trace */
+  int nActiveStmt;
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
   sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
   sqlite3_int64 lastLogId;    /* ...and that row's id */

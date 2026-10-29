@@ -174,7 +174,8 @@ static const char *HPPLITE_SCHEMA =
   "CREATE TABLE IF NOT EXISTS _hpplite_pending("
   "  id INTEGER PRIMARY KEY,"
   "  txn INTEGER NOT NULL,"
-  "  sql TEXT NOT NULL"
+  "  sql TEXT NOT NULL,"
+  "  mode INTEGER NOT NULL DEFAULT 0"   /* HPPLITE_MODE_*: the connection state it ran under (#52) */
   ");";
 
 /*
@@ -594,9 +595,7 @@ static int isNondeterministicSql(const char *zIn) {
 ** Authorizer: the parser's view, so quoting, case and comments cannot hide
 ** anything. Application statements (bInternal clear) may not write our
 ** tables (the log and meta are not user data: #18), ATTACH another file
-** (its writes are not captured), or turn on the pragmas that change what
-** later statements do (cascades, recursive triggers); in warn mode the
-** latter two are only counted. Non-deterministic functions are caught
+** (its writes are not captured); in warn mode ATTACH is only counted. Non-deterministic functions are caught
 ** here by name too, which the text scan could only approximate.
 */
 static int isHppliteTable(const char *zName) {
@@ -635,18 +634,10 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       pCtx->nAuthDenied++;
       return SQLITE_DENY;
     case SQLITE_PRAGMA:
-      /* z1 = pragma name, z2 = value or NULL (a read) */
-      if (z1 && z2 && (sqlite3_stricmp(z1, "foreign_keys") == 0 || sqlite3_stricmp(z1, "recursive_triggers") == 0)) {
-        int on = sqlite3_stricmp(z2, "1") == 0 || sqlite3_stricmp(z2, "on") == 0 || sqlite3_stricmp(z2, "true") == 0
-              || sqlite3_stricmp(z2, "yes") == 0;
-        if (on) {
-          pCtx->nNondeterministic++;
-          if (pCtx->bDeterminismWarn) return SQLITE_OK;
-          pCtx->zDenyWhy = "PRAGMA foreign_keys / recursive_triggers: cascades are not replayed (unsupported in v0.1)";
-          pCtx->nAuthDenied++;
-          return SQLITE_DENY;
-        }
-      }
+      /* foreign_keys / recursive_triggers are allowed and replayed in the
+      ** mode each statement ran in (#52); foreign keys are read from the
+      ** connection flags, recursive_triggers only after it was touched */
+      if (z1 && sqlite3_stricmp(z1, "recursive_triggers") == 0) pCtx->bRecTrigSeen = 1;
       return SQLITE_OK;
     case SQLITE_FUNCTION: {
       static const char *aFn[] = { "random", "randomblob", "last_insert_rowid", "changes", "total_changes",
@@ -745,6 +736,34 @@ static void refuseStatement(HppliteCtx *pCtx, const char *zWhy, const char *zSql
 ** statement and rolls back with it. SQLITE_TRACE_PROFILE runs when the
 ** statement finishes and removes the row again if the statement failed.
 */
+/*
+** The connection state a statement runs under that its text does not show
+** (#52). Foreign keys come from the connection's flags (no statement);
+** recursive_triggers has no such accessor, so it is read with the pragma -
+** only once the application has prepared that pragma at all.
+** Called with bInternal set (the reads are not captured or authorized).
+*/
+static int currentMode(HppliteCtx *pCtx) {
+  int mode = 0, fk = 0;
+  if (sqlite3_db_config(pCtx->db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &fk) == SQLITE_OK && fk) {
+    mode |= HPPLITE_MODE_FOREIGN_KEYS;
+  }
+  if (pCtx->bRecTrigSeen) {
+    if (!pCtx->pRecTrigStmt
+        && sqlite3_prepare_v3(pCtx->db, "PRAGMA recursive_triggers", -1, SQLITE_PREPARE_PERSISTENT,
+                              &pCtx->pRecTrigStmt, NULL) != SQLITE_OK) {
+      pCtx->pRecTrigStmt = NULL;
+    }
+    if (pCtx->pRecTrigStmt) {
+      if (sqlite3_step(pCtx->pRecTrigStmt) == SQLITE_ROW && sqlite3_column_int(pCtx->pRecTrigStmt, 0)) {
+        mode |= HPPLITE_MODE_RECURSIVE_TRIGGERS;
+      }
+      sqlite3_reset(pCtx->pRecTrigStmt);
+    }
+  }
+  return mode;
+}
+
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
@@ -757,12 +776,29 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** connection itself (sqlite3_next_stmt takes the connection mutex, which
   ** sqlite3_close holds while it joins the timer thread - a deadlock). */
   if (mask == SQLITE_TRACE_STMT) {
-    /* trigger sub-programs are traced too ("-- TRIGGER x") but have no
-    ** PROFILE event of their own; only top-level statements are counted */
-    if (!(zSql && zSql[0] == '-' && zSql[1] == '-')) pCtx->nAppStmtActive++;
+    /* Sub-programs are traced too and have no PROFILE event of their own.
+    ** Named triggers say so ("-- TRIGGER x"); foreign key actions (ON
+    ** DELETE CASCADE ...) are unnamed and arrive with the text of the
+    ** statement that fired them, for a statement already running. Neither
+    ** is a statement of its own: not counted, not logged (#52). */
+    int i, running = 0;
+    if (zSql && zSql[0] == '-' && zSql[1] == '-') return 0;
+    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { running = 1; break; }
+    if (running) return 0;
+    if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
+      pCtx->aActiveStmt[pCtx->nActiveStmt++] = pS;
+    }
+    pCtx->nAppStmtActive++;
     if (sqlite3_get_autocommit(pCtx->db)) pCtx->txnBytes = 0;   /* no transaction open (yet): BEGIN starts one at 0 */
-  } else if (mask == SQLITE_TRACE_PROFILE && pCtx->nAppStmtActive > 0) {
-    pCtx->nAppStmtActive--;
+  } else if (mask == SQLITE_TRACE_PROFILE) {
+    int i;
+    for (i = 0; i < pCtx->nActiveStmt; i++) {
+      if (pCtx->aActiveStmt[i] == pS) {
+        pCtx->aActiveStmt[i] = pCtx->aActiveStmt[--pCtx->nActiveStmt];
+        break;
+      }
+    }
+    if (pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
   }
   if (!pCtx->bEnabled) return 0;
   if (pCtx->bStatusGone && mask == SQLITE_TRACE_STMT) {
@@ -845,7 +881,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   pCtx->bInternal = 1;
   if (!pCtx->pLogStmt) {
     rc = sqlite3_prepare_v3(pCtx->db,
-      "INSERT INTO _hpplite_pending(txn, sql) VALUES(?1, ?2)",
+      "INSERT INTO _hpplite_pending(txn, sql, mode) VALUES(?1, ?2, ?3)",
       -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pLogStmt, NULL);
     if (rc != SQLITE_OK) pCtx->pLogStmt = NULL;
   }
@@ -855,6 +891,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     ** this file, with no counter to keep in step (issue #24). */
     sqlite3_bind_int64(pCtx->pLogStmt, 1, pCtx->curTxn);
     sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(pCtx->pLogStmt, 3, currentMode(pCtx));
     rc = sqlite3_step(pCtx->pLogStmt);
     if (rc == SQLITE_DONE) {
       pCtx->pLastLogged = pS;
@@ -923,6 +960,18 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   pCtx->bEnabled = 1;
 
   rc = internalExec(pCtx, db, HPPLITE_SCHEMA);
+  if (rc == SQLITE_OK) {
+    /* files from before #52: the log has no mode column yet (rows already
+    ** in it ran with the default state, which DEFAULT 0 records) */
+    sqlite3_stmt *q = NULL;
+    int has = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_pending') WHERE name = 'mode'",
+                           -1, &q, NULL) == SQLITE_OK) {
+      has = (sqlite3_step(q) == SQLITE_ROW);
+    }
+    sqlite3_finalize(q);
+    if (!has) rc = internalExec(pCtx, db, "ALTER TABLE _hpplite_pending ADD COLUMN mode INTEGER NOT NULL DEFAULT 0");
+  }
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);
     return rc;
@@ -968,8 +1017,9 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx) {
 static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pLogStmt) sqlite3_finalize(pCtx->pLogStmt);
   if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
+  if (pCtx->pRecTrigStmt) sqlite3_finalize(pCtx->pRecTrigStmt);
   if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
-  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = NULL;
+  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = NULL;
   pCtx->pLastLogged = NULL;
 }
 
@@ -978,7 +1028,8 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
 static int applicationStatementsOpen(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt = NULL;
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
-    if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt) continue;
+    if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
+        || pStmt == pCtx->pRecTrigStmt) continue;
     return 1;
   }
   return 0;
@@ -1065,6 +1116,11 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
   }
   for (i = 0; i < pBatch->nTxns; i++) {
     hashText(&h, (const unsigned char*)pBatch->aTxns[i].zSql);
+    if (pBatch->aTxns[i].mode) {
+      /* tagged, and only when set: hashes of mode-0 batches are unchanged */
+      sha256_update(&h, (const uint8_t*)"M", 1);
+      hashU64(&h, (uint64_t)pBatch->aTxns[i].mode);
+    }
   }
   sha256_final(&h, pOut);
 }
@@ -1137,7 +1193,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   size_t estSize = hpplite_batch_json_overhead();
   int overLimit = 0;
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql FROM _hpplite_pending ORDER BY id",
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode FROM _hpplite_pending ORDER BY id",
     -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
@@ -1163,6 +1219,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       }
       if (txn != lastTxn) { txnRel++; lastTxn = txn; }
       hpplite_batch_add_stmt(pBatch, zSql, -1, txnRel);
+      pBatch->aTxns[pBatch->nTxns - 1].mode = sqlite3_column_int(pStmt, 3);
       aId[pBatch->nTxns - 1] = sqlite3_column_int64(pStmt, 0);
     }
     sqlite3_finalize(pStmt);
@@ -1329,6 +1386,41 @@ struct HppliteBatch *hpplite_flush_block(HppliteCtx *pCtx) {
   return pBatch;
 }
 
+/*
+** Put the replay connection in the state a statement ran under (#52).
+** Foreign keys can only change outside a transaction - which is also why
+** every statement of one writer transaction shares the setting.
+*/
+static int replayMode(sqlite3 *rdb, int mode, int *pCur) {
+  int want, rc = SQLITE_OK;
+  if (mode == *pCur) return SQLITE_OK;
+  want = (mode & HPPLITE_MODE_FOREIGN_KEYS) != 0;
+  if (want != ((*pCur & HPPLITE_MODE_FOREIGN_KEYS) != 0) && sqlite3_get_autocommit(rdb)) {
+    int out = -1;
+    sqlite3_db_config(rdb, SQLITE_DBCONFIG_ENABLE_FKEY, want, &out);
+    if (out != want) return SQLITE_ERROR;
+    *pCur = (*pCur & ~HPPLITE_MODE_FOREIGN_KEYS) | (want ? HPPLITE_MODE_FOREIGN_KEYS : 0);
+  }
+  want = (mode & HPPLITE_MODE_RECURSIVE_TRIGGERS) != 0;
+  if (want != ((*pCur & HPPLITE_MODE_RECURSIVE_TRIGGERS) != 0)) {
+    rc = sqlite3_exec(rdb, want ? "PRAGMA recursive_triggers = 1" : "PRAGMA recursive_triggers = 0", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) *pCur = (*pCur & ~HPPLITE_MODE_RECURSIVE_TRIGGERS) | (want ? HPPLITE_MODE_RECURSIVE_TRIGGERS : 0);
+  }
+  return rc;
+}
+
+static int connectionMode(sqlite3 *db) {
+  int mode = 0, fk = 0;
+  sqlite3_stmt *q = NULL;
+  if (sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &fk) == SQLITE_OK && fk) mode |= HPPLITE_MODE_FOREIGN_KEYS;
+  if (sqlite3_prepare_v2(db, "PRAGMA recursive_triggers", -1, &q, NULL) == SQLITE_OK
+      && sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0)) {
+    mode |= HPPLITE_MODE_RECURSIVE_TRIGGERS;
+  }
+  sqlite3_finalize(q);
+  return mode;
+}
+
 int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTxn) {
   int savedEnabled, rc = SQLITE_OK, i, open = 0;
   sqlite3_int64 lastTxn = -1;
@@ -1341,17 +1433,31 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   /* Replay runs on the bookkeeping connection: no hooks there, so nothing
   ** is captured and the application thread's flags are left alone. */
   sqlite3 *rdb = pCtx->bkDb;
+  /* A mode this version does not know cannot be reproduced: stop rather
+  ** than replay into a different state */
+  for (i = 0; i < pBatch->nTxns; i++) {
+    if (pBatch->aTxns[i].mode & ~(HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_RECURSIVE_TRIGGERS)) {
+      fprintf(stderr, "hpplite: batch %llu statement %d ran under connection state this version cannot apply (mode %d)\n",
+              (unsigned long long)pBatch->height, i, pBatch->aTxns[i].mode);
+      return SQLITE_MISMATCH;
+    }
+  }
   savedEnabled = pCtx->bEnabled;
   if (rdb == pCtx->db) { pCtx->bEnabled = 0; pCtx->bInternal = 1; }
+  int savedMode = connectionMode(rdb), curMode = savedMode;
   for (i = 0; i < pBatch->nTxns && rc == SQLITE_OK; i++) {
     const char *zSql = pBatch->aTxns[i].zSql;
     if (!zSql) continue;
     if (useTxn && pBatch->aTxns[i].txn != lastTxn) {
       if (open) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
+      open = 0;
+      /* foreign keys for the whole group, before it begins */
+      if (rc == SQLITE_OK) rc = replayMode(rdb, pBatch->aTxns[i].mode, &curMode);
       if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "BEGIN", NULL, NULL, NULL);
       open = (rc == SQLITE_OK);
       lastTxn = pBatch->aTxns[i].txn;
     }
+    if (rc == SQLITE_OK) rc = replayMode(rdb, pBatch->aTxns[i].mode, &curMode);
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
       /* The statement failed here as it did at the sequencer (a failed
@@ -1369,6 +1475,10 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (open) {
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
     else sqlite3_exec(rdb, "ROLLBACK", NULL, NULL, NULL);
+  }
+  /* back to the connection's own state (the application's, on :memory:) */
+  if (replayMode(rdb, savedMode, &curMode) != SQLITE_OK) {
+    fprintf(stderr, "hpplite: could not restore the connection's foreign_keys/recursive_triggers after replay\n");
   }
   if (rdb == pCtx->db) { pCtx->bInternal = 0; pCtx->bEnabled = savedEnabled; }
   pCtx->bRootDirty = 1;
@@ -1411,12 +1521,13 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
 
   int saved = bkEnter(pCtx);
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, sql FROM _hpplite_pending ORDER BY id LIMIT ?1", -1, &pStmt, NULL);
+    "SELECT id, sql, mode FROM _hpplite_pending ORDER BY id LIMIT ?1", -1, &pStmt, NULL);
   if (rc != SQLITE_OK) { bkLeave(pCtx, saved); return rc; }
   sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
   while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
-    if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0) {
+    if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0
+        || sqlite3_column_int(pStmt, 2) != pBatch->aTxns[i].mode) {
       ok = 0;
       break;
     }

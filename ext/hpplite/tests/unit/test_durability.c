@@ -1274,7 +1274,7 @@ static void test_idle_reader_flush_replays(void) {
 
 /* 34. Unsupported SQL is refused by default; determinism=warn lets it through with a count */
 static void test_unsupported_sql_refused(void) {
-    TEST("non-deterministic SQL, ATTACH and foreign_keys=ON are refused (strict); warn mode counts");
+    TEST("non-deterministic SQL and ATTACH are refused (strict); warn mode counts");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/strict.db", l1);
@@ -1287,8 +1287,6 @@ static void test_unsupported_sql_refused(void) {
         "CREATE TABLE log(id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP)",
         "INSERT INTO t(v) VALUES(date())",
         "UPDATE t SET v = last_insert_rowid()",
-        "PRAGMA foreign_keys = ON",
-        "PRAGMA foreign_keys=1",
         "ATTACH DATABASE ':memory:' AS aux",
         NULL };
     for (int i = 0; aBad[i]; i++) {
@@ -1299,8 +1297,9 @@ static void test_unsupported_sql_refused(void) {
     }
     if (count_rows(n->db, "t") != 0) FAIL("nothing applied");
     if (hpplite_node_pending_count(n) != 1) FAIL("only the CREATE TABLE is logged");
-    if (n->ctx->nNondeterministic != 9) { printf("(counted %llu) ", (unsigned long long)n->ctx->nNondeterministic); FAIL("each refusal counted"); }
-    /* reads of the pragmas, deterministic time functions and bound values are fine */
+    if (n->ctx->nNondeterministic != 7) { printf("(counted %llu) ", (unsigned long long)n->ctx->nNondeterministic); FAIL("each refusal counted"); }
+    /* pragmas (foreign keys replay in the writer's mode, #52), deterministic
+    ** time functions and bound values are fine */
     if (sqlite3_exec(n->db, "PRAGMA foreign_keys", NULL, NULL, NULL) != SQLITE_OK) FAIL("pragma read");
     if (sqlite3_exec(n->db, "INSERT INTO t(v) VALUES(date('2026-01-01'))", NULL, NULL, NULL) != SQLITE_OK) FAIL("date with an argument");
     sqlite3_stmt *s; sqlite3_prepare_v2(n->db, "INSERT INTO t(v) VALUES(?)", -1, &s, NULL);

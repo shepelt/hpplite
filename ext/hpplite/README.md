@@ -323,7 +323,6 @@ a hundred batches later:
 | `random()`, `randomblob()` | different value on replay | generate in the application, bind it |
 | `CURRENT_TIMESTAMP`, `CURRENT_TIME`, `CURRENT_DATE`, `'now'`, bare `date()`/`time()`/`datetime()`/`julianday()`/`unixepoch()`, `strftime('fmt')` - also as a column `DEFAULT` (`CREATE TABLE` is refused) | the clock | bind the timestamp; `date('2026-01-01')` with an explicit time is fine |
 | `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `load_extension()` | connection state | read the value, then bind it |
-| `PRAGMA foreign_keys = ON`, `PRAGMA recursive_triggers = ON` | cascades are not replayed (#28) | put the behaviour in triggers; reads of the pragmas are fine |
 | `ATTACH` | writes to another file are not captured | one database per file |
 | writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
 | a statement, or a transaction, larger than one DA batch as posted (default 128 KB after JSON escaping and the envelope) | a transaction is never split across batches, so it could never be posted | smaller transactions; bulk-load before `hpplite=on` |
@@ -334,6 +333,16 @@ stay). Detection is the parser's authorizer plus a scan of the text outside
 string literals; it does not know your own non-deterministic UDFs.
 `tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
 look-alikes it must let through.
+
+**Foreign keys and recursive triggers are supported.** `PRAGMA foreign_keys`
+and `PRAGMA recursive_triggers` are connection state: they change what a
+statement does to other rows (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`,
+`ON UPDATE CASCADE`, a trigger that fires itself) without showing in its
+text. HPPLite records the state each statement ran under and replays it in
+that state, so an application that turns foreign keys on at connect (as
+Django and Rails do) needs no change for it, and switching the pragmas
+mid-session is fine (#52). The rest of this table still applies to ORM
+schemas: a `DEFAULT CURRENT_TIMESTAMP` column is refused.
 
 Not detectable, so not refused - know these:
 

@@ -134,14 +134,7 @@ static const char *aRefused[] = {
     "INSERT INTO t SELECT sql FROM _hpplite_pending",
     "INSERT INTO t SELECT value FROM _hpplite_meta",
     "UPDATE t SET x = (SELECT value FROM _hpplite_meta WHERE key = 'block_height')",
-    /* connection state that changes what later statements do */
-    "PRAGMA foreign_keys = ON",
-    "PRAGMA foreign_keys=1",
-    "PRAGMA foreign_keys(1)",
-    "pragma FOREIGN_KEYS = true",
-    "PRAGMA main.foreign_keys = yes",
-    "PRAGMA recursive_triggers = ON",
-    "PRAGMA recursive_triggers(1)",
+    /* writes to another file are not captured */
     "ATTACH ':memory:' AS other",
     "ATTACH DATABASE '" DIR "/other.db' AS other",
     /* values replay cannot reproduce */
@@ -226,11 +219,27 @@ static const char *aAllowed[] = {
     "CREATE TABLE \"date\"(x)",
     "INSERT INTO \"date\" VALUES(1)",
     "UPDATE t SET x = x WHERE x = 'now'",
+    /* foreign keys and recursive triggers replay in the writer's mode (#52) */
     "PRAGMA foreign_keys",
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA foreign_keys=1",
+    "PRAGMA foreign_keys(1)",
+    "pragma FOREIGN_KEYS = true",
+    "PRAGMA main.foreign_keys = yes",
     "PRAGMA foreign_keys = OFF",
+    "PRAGMA recursive_triggers = ON",
+    "PRAGMA recursive_triggers(1)",
     "PRAGMA recursive_triggers = 0",
     "PRAGMA journal_mode",
     "PRAGMA user_version = 3",
+    /* a cascade with foreign keys on is replayed in that mode (#52) */
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE ap(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE ac(id INTEGER PRIMARY KEY, p INTEGER REFERENCES ap(id) ON DELETE CASCADE)",
+    "INSERT INTO ap VALUES(1)",
+    "INSERT INTO ac VALUES(10, 1)",
+    "DELETE FROM ap WHERE id = 1",
+    "PRAGMA foreign_keys = OFF",
     NULL
 };
 

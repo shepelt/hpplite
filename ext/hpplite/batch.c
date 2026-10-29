@@ -91,6 +91,7 @@ int hpplite_batch_add_stmt(HppliteBatch *pBatch, const char *zSql, int64_t nRows
   pBatch->aTxns[pBatch->nTxns].zSql = sqlite3_mprintf("%s", zSql);
   pBatch->aTxns[pBatch->nTxns].nRowsAffected = nRowsAffected;
   pBatch->aTxns[pBatch->nTxns].txn = txn;
+  pBatch->aTxns[pBatch->nTxns].mode = 0;
   pBatch->nTxns++;
 
   return 0;
@@ -165,8 +166,10 @@ static size_t json_escaped_len(const char *zIn) {
 }
 
 size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn) {
-  /*    {"sql":"...","txn":N[,"rows_affected":M]},   */
-  size_t n = 1 + 7 + json_escaped_len(zSql ? zSql : "") + 8 + 20 + 2;
+  /*    {"sql":"...","txn":N[,"mode":K][,"rows_affected":M]},
+  ** "mode" is counted always: the caller does not know it, and 9 bytes
+  ** of slack is cheaper than a batch over the DA limit */
+  size_t n = 1 + 7 + json_escaped_len(zSql ? zSql : "") + 8 + 20 + 2 + 9;
   if (nRowsAffected >= 0) n += 17 + 20;
   (void)txn;
   return n;
@@ -210,6 +213,10 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
     sqlite3_str_appendf(pStr, "{\"sql\":\"%s\",\"txn\":%lld", escaped ? escaped : "",
                         (long long)pBatch->aTxns[i].txn);
     sqlite3_free(escaped);
+    if (pBatch->aTxns[i].mode) {
+      /* only when set: batches without it replay as they always did */
+      sqlite3_str_appendf(pStr, ",\"mode\":%d", pBatch->aTxns[i].mode);
+    }
     if (pBatch->aTxns[i].nRowsAffected >= 0) {
       sqlite3_str_appendf(pStr, ",\"rows_affected\":%lld",
                           (long long)pBatch->aTxns[i].nRowsAffected);
@@ -387,6 +394,7 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         char *zSql = NULL;
         int64_t nRows = -1;
         int64_t txn = pBatch->nTxns;  /* Older batches: one group per statement */
+        int64_t mode = 0;             /* Batches without it: default connection state */
 
         while (*p && *p != '}') {
           p = json_skip_ws(p);
@@ -405,6 +413,8 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
             nRows = json_parse_number(&p);
           } else if (strcmp(txKey, "txn") == 0) {
             txn = json_parse_number(&p);
+          } else if (strcmp(txKey, "mode") == 0) {
+            mode = json_parse_number(&p);
           } else {
             /* Skip unknown value */
             if (*p == '"') {
@@ -420,7 +430,10 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         if (*p == '}') p++;
 
         if (zSql) {
-          hpplite_batch_add_stmt(pBatch, zSql, nRows, txn);
+          if (hpplite_batch_add_stmt(pBatch, zSql, nRows, txn) == 0) {
+            /* unknown bits are kept: replay refuses what it cannot apply */
+            pBatch->aTxns[pBatch->nTxns - 1].mode = (int)(mode & 0x7fffffff);
+          }
           sqlite3_free(zSql);
         }
       }

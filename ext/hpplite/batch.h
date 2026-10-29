@@ -25,7 +25,15 @@ struct HppliteTxn {
   char *zSql;              /* SQL statement */
   int64_t nRowsAffected;   /* Number of rows affected (-1 if unknown) */
   int64_t txn;             /* Transaction group within the batch (0, 1, ...) */
+  int mode;                /* Connection state the statement ran under (HPPLITE_MODE_*) */
 };
+
+/*
+** Connection state that changes what a statement does to other rows without
+** appearing in its text (#52). Recorded per statement, applied on replay.
+*/
+#define HPPLITE_MODE_FOREIGN_KEYS        1   /* PRAGMA foreign_keys: cascades, SET NULL/DEFAULT */
+#define HPPLITE_MODE_RECURSIVE_TRIGGERS  2   /* PRAGMA recursive_triggers */
 
 /*
 ** A batch of transactions with state transition

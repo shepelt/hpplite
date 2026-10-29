@@ -240,6 +240,19 @@ static const char *aAllowed[] = {
     "INSERT INTO e(v) VALUES(NULL)",
     "INSERT INTO e(v) VALUES('')",
     "UPDATE e SET v = v || '/' WHERE typeof(v) = 'text'",
+    /* foreign key actions and recursive triggers replay in the mode they ran in (#52) */
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE fp(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE fc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fp(id) ON DELETE CASCADE)",
+    "INSERT INTO fp VALUES(1), (2)",
+    "INSERT INTO fc VALUES(10, 1), (20, 2)",
+    "DELETE FROM fp WHERE id = 1",
+    "PRAGMA foreign_keys = OFF",
+    "PRAGMA recursive_triggers = ON",
+    "CREATE TABLE cd(v INTEGER)",
+    "CREATE TRIGGER cd_down AFTER INSERT ON cd WHEN new.v > 0 BEGIN INSERT INTO cd VALUES(new.v - 1); END",
+    "INSERT INTO cd VALUES(4)",
+    "PRAGMA recursive_triggers = OFF",
     "CREATE TABLE \"we\"\"ird \"\"name\"(\"col \"\"x\"\"\")",
     "INSERT INTO \"we\"\"ird \"\"name\" VALUES('}]\\\",{\"sql\":\"DROP TABLE e\"}')",
     NULL
@@ -330,6 +343,7 @@ static void test_edge_sql_end_to_end(void) {
     unsigned char rootW[32], rootR[32];
     hpplite_state_root(w, rootW);
     sqlite3_int64 rowsW = scalar(w, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
+    if (scalar(w, "SELECT count(*) FROM fc") != 1 || scalar(w, "SELECT count(*) FROM cd") != 5) { sqlite3_close(w); FAIL("test premise: cascade or recursion did not run on the writer"); }
     sqlite3_int64 heightW = scalar(w, "SELECT height FROM hpplite_status");
     sqlite3_close(w);                       /* releases the lease */
 
@@ -339,9 +353,12 @@ static void test_edge_sql_end_to_end(void) {
     hpplite_state_root(r, rootR);
     sqlite3_int64 rowsR = scalar(r, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
     sqlite3_int64 bigR = scalar(r, "SELECT length(v) FROM big");
+    sqlite3_int64 fcR = scalar(r, "SELECT count(*) FROM fc"), cdR = scalar(r, "SELECT count(*) FROM cd");
     sqlite3_close(r);
     if (rowsR != rowsW) FAIL("replica row count differs");
     if (bigR <= 0) FAIL("the at-limit row is missing on the replica");
+    if (fcR != 1) FAIL("the cascade did not replay on the replica (#52)");
+    if (cdR != 5) FAIL("the recursive trigger did not replay on the replica (#52)");
     if (memcmp(rootW, rootR, 32) != 0) FAIL("replica state root differs from the writer's");
     PASS();
 }
