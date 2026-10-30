@@ -1334,6 +1334,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     {
       /* our row's id is not the application's last_insert_rowid() */
       sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
+      /* In autocommit our row commits now, on its own, before the statement
+      ** runs; if the statement changes nothing it is removed after. Until its
+      ** end (PROFILE) the row is unsettled (see bkBegin) - marked before it
+      ** can be seen. */
+      if (sqlite3_get_autocommit(pCtx->db)) __atomic_store_n(&pCtx->nUnsettled, 1, __ATOMIC_RELEASE);
       rc = sqlite3_step(pCtx->pLogStmt);
       if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
@@ -1380,11 +1385,6 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
 static int hppliteCommitHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   if (pCtx->bInternal) return 0;
-  /* an autocommit statement whose effect is not checked yet: its log row may
-  ** still be removed after this commit (see bkBegin) */
-  if (pCtx->pLastLogged && sqlite3_get_autocommit(pCtx->db)) {
-    __atomic_store_n(&pCtx->nUnsettled, 1, __ATOMIC_RELEASE);
-  }
   pCtx->curTxn = 0;
   pCtx->bRootDirty = 1;
   if (pCtx->xOnCommit) {
@@ -1728,11 +1728,11 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
       __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
     }
     if (rc == SQLITE_OK && !bWrite && pCtx->bkDb != pCtx->db) {
-      /* An autocommit statement commits with its log row; if it changed
-      ** nothing, the row is removed only afterwards. A snapshot taken in
-      ** between would hold a row the log is about to lose (a batch built
-      ** from it fails adoption later). Take the snapshot, then look: if the
-      ** commit is marked unsettled, it may be in it - try again later. */
+      /* An autocommit statement's log row commits before the statement
+      ** runs; if it changed nothing, the row is removed only afterwards. A
+      ** snapshot taken in between would hold a row the log is about to lose
+      ** (a batch built from it fails adoption later). Take the snapshot, then
+      ** look: if a row is marked unsettled, it may be in it - try later. */
       internalExec(pCtx, pCtx->bkDb, "SELECT 1 FROM _hpplite_meta LIMIT 1");
       if (__atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE)) {
         internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
