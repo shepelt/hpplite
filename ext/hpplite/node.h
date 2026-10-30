@@ -81,6 +81,7 @@ typedef struct HppliteNode {
     int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */
     uint8_t *postedCopy;            /* The bytes of the batch being finalized (kept for a reorg, #49) */
+    int wrongRollup;                /* The database's history is on another rollup: never post or replay */
     int64_t retryAt;                /* Timer does not retry before this (ms, monotonic) */
 
     /* Database and context */

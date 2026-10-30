@@ -25,6 +25,12 @@ staff session, 10 tags, 60 posts (Lexical; drafts, published, scheduled,
 featured), 20 edits, 5 deletes, 8 pages, 150 members with labels, a
 settings change and a newsletter.
 
+Ghost does not close its database when it stops (SIGINT), so HPPLite's
+final flush on close never runs: before stopping it, wait until the file's
+`_hpplite_pending` is empty (read it with plain sqlite3, read-only). What is
+left is not lost - it stays in the file and the next open posts it - but the
+lease the dead instance held must expire first (minutes).
+
 ## Results (2026-10-30, anvil)
 
 - First boot, all of Ghost's migrations and fixtures (106 tables): clean,
@@ -35,3 +41,14 @@ settings change and a newsletter.
 - Found on the way, fixed in 280a364cf2: a finalize deferred while Ghost had
   a statement open was taken for a fork; a batch built while a no-op
   statement was being unlogged carried a row the log no longer had.
+
+## Results (2026-10-30, HPP Sepolia)
+
+- First boot (migrations and fixtures posted as Ghost starts): 45 s.
+- Admin API session: every call succeeded.
+- A replica rebuilt from HPP Sepolia alone equals Ghost's database: 102
+  tables, 2207 rows, 35 batches, same state root. ~0.006 ETH of gas.
+- Found on the way, fixed in the next commit: the first attempt reused the
+  database from the anvil run with a fresh wallet; HPPLite took "this
+  database is ahead of L1" for a reorg and re-posted the anvil history's
+  first batch into the new rollup. A database is now bound to its rollup.

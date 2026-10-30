@@ -15,6 +15,7 @@
 #include "node.h"
 #include "da_uri.h"
 static void node_cap_batch_limit(HppliteNode *node);
+static int node_check_rollup(HppliteNode *node);
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -488,6 +489,35 @@ static void node_learn_batch_limit(HppliteNode *node) {
     node_set_stmt_limit(node);
     hpplite_l1_set_max_tx_gas(node->l1, node->config.maxTxGas ? node->config.maxTxGas
                                          : hpplite_network_max_tx_gas(node->config.chainId));
+    node_check_rollup(node);
+}
+
+/*
+** A database's history is on one rollup. Opened against another - a new
+** wallet, another chain, a copied file - it must not post its batches there
+** (nor re-post kept ones after "a reorg" that is no reorg), and must not
+** replay a stranger's: it stops and says which rollup is its own. Bound the
+** first time the rollup is known (a fresh wallet's is created at its first
+** post, so this runs again before every submission). 1 ok, 0 not known
+** yet, -1 another rollup.
+*/
+static int node_check_rollup(HppliteNode *node) {
+    char c[43], d[43], z[80];
+    int rc;
+    if (node->wrongRollup) return -1;
+    if (!node->l1 || !node->ctx || hpplite_l1_get_addresses(node->l1, c, d) != 0 || !c[0]) return 0;
+    if (strcmp(c, "0x0000000000000000000000000000000000000000") == 0) return 0;
+    snprintf(z, sizeof(z), "%llu:%s", (unsigned long long)node->config.chainId, c);
+    rc = hpplite_bind_rollup(node->ctx, z);
+    if (rc == -1) {
+        fprintf(stderr, "hpplite: this database's history is on rollup %s, not %s (another wallet, chain or "
+                "copy?); not posting or replaying - open it with its own rollup, or start a new database\n",
+                node->ctx->zRollup, z);
+        node->wrongRollup = 1;
+        node->state = HPPLITE_STATE_ERROR;
+        return -1;
+    }
+    return rc == -2 ? 0 : 1;
 }
 
 /*
@@ -603,6 +633,7 @@ static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
 */
 static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
     uint64_t h;
+    if (node_check_rollup(node) < 0) return -1;    /* not a reorg: another rollup */
     for (h = lastBatch + 1; h < node->ctx->blockHeight; h++) {
         size_t len = 0;
         uint8_t *bytes = hpplite_posted_batch(node->ctx, h, &len);
@@ -818,6 +849,12 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             *pMore = 0;
             return 0;
         }
+        /* the rollup may only now be known (created at the first post) */
+        if (node_check_rollup(node) < 0) {
+            hpplite_batch_free(batch);
+            *pMore = 0;
+            return 0;
+        }
 
         char *json = hpplite_batch_to_json(batch);
         uint8_t *postedCopy = NULL;
@@ -922,6 +959,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
 
     if (!node->ctx) return 0;
     if (node->follower) return 0;          /* the sequencer connection posts */
+    if (node->l1 && node_check_rollup(node) < 0) return 0;
     node->lastFlushTime = node_current_time_ms();
 
     /* Finish anything a previous attempt left on L1. With pending SQL, a
@@ -992,6 +1030,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     int synced = 0;
 
     if (!node || !node->l1 || !node->ctx) return 0;
+    if (node_check_rollup(node) < 0) return -1;
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
 
     while (node->ctx->blockHeight <= lastBatch) {

@@ -9,6 +9,7 @@
 #include "crypto.h"
 #include "hpplite_sqlite.h"
 #include <string.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -70,6 +71,7 @@ struct HppliteL1 {
     size_t batchLen[MAX_BATCHES];
 
     char *dir;                   /* Directory-backed: every change is written here */
+    unsigned char address[20];   /* the rollup's identity (from the directory when backed by one) */
 };
 
 /*
@@ -193,6 +195,8 @@ static void mockLoad(HppliteL1 *l1) {
 /*
 ** Create a new mock L1
 */
+static void mockSetAddress(HppliteL1 *l1, const char *seed, uint64_t salt);
+
 HppliteL1 *hpplite_l1_create_mock(void) {
     HppliteL1 *l1 = sqlite3_malloc(sizeof(HppliteL1));
     if (!l1) return NULL;
@@ -210,6 +214,10 @@ HppliteL1 *hpplite_l1_create_mock(void) {
     l1->checkpointInterval = 100;
     l1->leaseDuration = DEFAULT_LEASE_DURATION;
 
+    {
+        static uint64_t created;
+        mockSetAddress(l1, NULL, (uint64_t)time(NULL) * 1000003u + (uint64_t)(uintptr_t)l1 + ++created);
+    }
     /* Initialize mock block state */
     l1->currentBlock = 1;
     l1->currentTimestamp = (uint64_t)time(NULL);
@@ -222,6 +230,7 @@ HppliteL1 *hpplite_l1_create_mock_dir(const char *dir) {
     HppliteL1 *l1 = hpplite_l1_create_mock();
     if (!l1 || !dir) return l1;
     l1->dir = strdup(dir);
+    mockSetAddress(l1, dir, 0);
     mockLoad(l1);
     return l1;
 }
@@ -374,9 +383,26 @@ void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultC
 uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
 
 int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
-    (void)l1;
-    contractHex[0] = daHex[0] = 0;
-    return -1;
+    static const char *h = "0123456789abcdef";
+    int i;
+    if (!l1) return -1;
+    contractHex[0] = '0'; contractHex[1] = 'x';
+    for (i = 0; i < 20; i++) {
+        contractHex[2 + 2*i] = h[l1->address[i] >> 4];
+        contractHex[3 + 2*i] = h[l1->address[i] & 15];
+    }
+    contractHex[42] = 0;
+    daHex[0] = 0;
+    return 0;
+}
+
+/* each mock is a rollup of its own; one backed by a directory is the same
+** rollup every time it is loaded from there */
+static void mockSetAddress(HppliteL1 *l1, const char *seed, uint64_t salt) {
+    uint64_t x = 1469598103934665603ULL ^ salt;
+    int i;
+    for (; seed && *seed; seed++) x = (x ^ (unsigned char)*seed) * 1099511628211ULL;
+    for (i = 0; i < 20; i++) { x = (x ^ (uint64_t)i) * 1099511628211ULL; l1->address[i] = (unsigned char)(x >> 32); }
 }
 
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {

@@ -174,7 +174,8 @@ static const char *HPPLITE_SCHEMA =
   "  last_checkpoint_root BLOB,"
   "  open_txn INTEGER NOT NULL DEFAULT 0,"  /* writer: group left open by the last posted batch (#57) */
   "  frag_id INTEGER NOT NULL DEFAULT 0,"   /* writer: log row whose text is posted in part (#59) */
-  "  frag_off INTEGER NOT NULL DEFAULT 0"   /* ...bytes of it posted */
+  "  frag_off INTEGER NOT NULL DEFAULT 0,"  /* ...bytes of it posted */
+  "  rollup TEXT NOT NULL DEFAULT ''"       /* "<chain id>:<contract>" its history is on */
   ");"
   "INSERT OR IGNORE INTO _hpplite_meta(id, next_height, prev_block_hash, state_root)"
   "  VALUES(1, 1, zeroblob(32), zeroblob(32));"
@@ -249,7 +250,7 @@ static int loadMeta(HppliteCtx *pCtx) {
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT next_height, prev_block_hash, state_root,"
     "       last_checkpoint_height, last_checkpoint_root, open_txn,"
-    "       (SELECT count(*) FROM _hpplite_carry), frag_id, frag_off"
+    "       (SELECT count(*) FROM _hpplite_carry), frag_id, frag_off, rollup"
     "  FROM _hpplite_meta WHERE id=1", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) {
@@ -262,6 +263,8 @@ static int loadMeta(HppliteCtx *pCtx) {
       pCtx->nCarry = sqlite3_column_int(pStmt, 6);
       pCtx->fragId = sqlite3_column_int64(pStmt, 7);
       pCtx->fragOff = (size_t)sqlite3_column_int64(pStmt, 8);
+      snprintf(pCtx->zRollup, sizeof(pCtx->zRollup), "%s",
+               sqlite3_column_text(pStmt, 9) ? (const char*)sqlite3_column_text(pStmt, 9) : "");
     }
     sqlite3_finalize(pStmt);
   }
@@ -1503,6 +1506,15 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
+  if (rc == SQLITE_OK) {
+    /* the rollup the history is on */
+    sqlite3_stmt *q = NULL;
+    int has = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'rollup'", -1, &q, NULL) == SQLITE_OK)
+      has = (sqlite3_step(q) == SQLITE_ROW);
+    sqlite3_finalize(q);
+    if (!has) rc = internalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN rollup TEXT NOT NULL DEFAULT ''");
+  }
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);
     return rc;
@@ -2091,6 +2103,29 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
   }
   return SQLITE_OK;
+}
+
+int hpplite_bind_rollup(HppliteCtx *pCtx, const char *zRollup) {
+  sqlite3_stmt *pStmt;
+  int rc;
+  if (!pCtx || !zRollup || !zRollup[0]) return 0;
+  if (pCtx->zRollup[0]) return strcmp(pCtx->zRollup, zRollup) == 0 ? 0 : -1;
+  rc = bkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return -2;
+  {
+    int saved = bkEnter(pCtx);
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET rollup = ?1 WHERE id = 1", -1, &pStmt, NULL);
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_text(pStmt, 1, zRollup, -1, SQLITE_STATIC);
+      rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      sqlite3_finalize(pStmt);
+    }
+    bkLeave(pCtx, saved);
+  }
+  rc = bkEnd(pCtx, rc);
+  if (rc != SQLITE_OK) return -2;
+  snprintf(pCtx->zRollup, sizeof(pCtx->zRollup), "%s", zRollup);
+  return 1;
 }
 
 uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen) {

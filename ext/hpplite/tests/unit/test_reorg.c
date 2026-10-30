@@ -109,10 +109,44 @@ static void test_lost_beyond_retention_stops(void) {
     PASS();
 }
 
+/* A database belongs to the rollup its history is on. Opened against
+** another one (a new wallet, another chain, a copied file), it must neither
+** post its old batches there nor post past a gap: it stops and says so. */
+static void test_other_rollup_refused(void) {
+    TEST("a database opened against a rollup that is not its own: nothing posted, the writer stops");
+    reset_dir();
+    HppliteL1 *a = hpplite_l1_create_mock(), *b = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/w.db", a);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x)", NULL);
+    for (int i = 1; i <= 3; i++) write_and_flush(w, i);
+    hpplite_node_destroy(w);
+    w = open_node(DIR "/w.db", b);                           /* the same file, another rollup */
+    if (!w) FAIL("reopen");
+    write_and_flush(w, 4);
+    hpplite_node_flush_batch(w);
+    uint64_t onB = 0, total = 0; unsigned char lh[32];
+    hpplite_l1_get_da_state(b, &onB, &total, lh);
+    int state = w->state;
+    hpplite_node_destroy(w);
+    w = open_node(DIR "/w.db", a);                           /* its own rollup: fine again */
+    int ok = w && w->state != HPPLITE_STATE_ERROR;
+    if (w) { hpplite_node_flush_batch(w); }
+    int left = w ? hpplite_node_pending_count(w) : -1;
+    if (w) hpplite_node_destroy(w);
+    hpplite_l1_disconnect(a);
+    hpplite_l1_disconnect(b);
+    if (onB != 0) FAILF("%llu batches posted to a rollup that is not the database's", (unsigned long long)onB);
+    if (state != HPPLITE_STATE_ERROR) FAIL("the writer did not stop");
+    if (!ok || left != 0) FAIL("its own rollup did not take it back");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite chain reorganisation (#49) ===\n");
     test_lost_batches_reposted();
     test_lost_beyond_retention_stops();
+    test_other_rollup_refused();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
