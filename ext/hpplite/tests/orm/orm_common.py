@@ -13,6 +13,7 @@ EXT = os.environ["HPPLITE_EXT"]
 RPC = os.environ["HPPLITE_ANVIL_RPC"]
 FACTORY = os.environ["HPPLITE_ANVIL_FACTORY"]
 KEY = os.environ["HPPLITE_ANVIL_KEY0"]
+CHAINID = os.environ.get("HPPLITE_ANVIL_CHAINID", "31337")
 DIR = os.environ.get("HPPLITE_ORM_DIR") or tempfile.mkdtemp(prefix="hpplite-orm-")
 
 _c = sqlite3.connect(":memory:")
@@ -21,7 +22,7 @@ _c.load_extension(os.path.splitext(EXT)[0])
 _c.close()
 
 def uri(name, extra=""):
-    return (f"file:{DIR}/{name}?hpplite=on&rpc={RPC}&factory={FACTORY}&chainid=31337"
+    return (f"file:{DIR}/{name}?hpplite=on&rpc={RPC}&factory={FACTORY}&chainid={CHAINID}"
             f"&privkey={KEY}&datadir={DIR}&interval=0{extra}")
 
 failures, probes = [], []

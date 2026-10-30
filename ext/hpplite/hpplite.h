@@ -72,12 +72,29 @@ struct HppliteCtx {
   sqlite3_int64 aActiveLog[16];  /* ...the log row each one wrote (0 = none) */
   sqlite3_int64 aActiveNow[16];  /* ...the time pinned for it (0 = none; #56) */
   unsigned aActiveSeen[16];      /* ...clock reads on the thread when it started */
+  int aActiveVm[16];             /* ...its VM step count when this run started (a later trace with
+                                 ** the same count is a sub-program; another count, a new run) */
+  volatile int bAppTxnOpen;   /* The application connection is inside a transaction (app thread
+                              ** writes, the timer thread reads: no bookkeeping commit then) */
+  struct HppliteNoClock { sqlite3_int64 id, now; } *aNoClock; /* Log rows whose statement did not read
+                              ** the clock: the batch leaves their time out (#56) */
+  int nNoClock, nNoClockAlloc;
+  sqlite3_mutex *pNoClockMutex;
+  sqlite3_stmt *pZeroStmt;    /* Cached zero-row UPDATE: puts changes() back to 0 after our DELETE */
+  volatile int txnGate;       /* 0 free, 1 the application (a statement or transaction open), 2 a
+                              ** bookkeeping write: its commit never lands inside the application's */
+  int bBkGate;                /* this bookkeeping transaction took the gate */
+  sqlite3_stmt *pSeqStmt;     /* Cached fingerprint of sqlite_sequence (NULL: none yet) */
+  int seqTriedGen;            /* nDdlGen + 1 when sqlite_sequence was last found missing */
+  sqlite3_int64 seqAtLog[2];  /* ...its fingerprint when the last statement was logged */
+  int bSeqAtLog;              /* ...taken (an INSERT on a database that has sqlite_sequence) */
   int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
   sqlite3_stmt *pPinOwner;    /* The statement that pinned the clock (outermost write) */
-  sqlite3_stmt *pNowStmt;     /* Cached UPDATE _hpplite_pending SET now */
+
   int nActiveStmt;
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
   sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
+  int bLastLoggedKeep;        /* ...is kept even without an effect (header pragma) */
   sqlite3_int64 lastLogId;    /* ...and that row's id */
   sqlite3_int64 changesAtLog; /* total_changes when it was logged */
   int schemaAtLog;            /* schema_version when it was logged */

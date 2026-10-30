@@ -7,6 +7,7 @@
 
 #include "hpplite.h"
 #include "clock.h"
+#include <ctype.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <string.h>
@@ -397,6 +398,26 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
   sqlite3_finalize(pStmt);
   if (rc != SQLITE_DONE && rc != SQLITE_OK) return rc;
 
+  /* the header fields an application sets, only when set: roots of
+  ** databases that never touched them are unchanged */
+  {
+    static const char *aHdr[] = { "SELECT user_version FROM pragma_user_version", "U",
+                                  "SELECT application_id FROM pragma_application_id", "A", NULL };
+    int k;
+    for (k = 0; aHdr[k]; k += 2) {
+      sqlite3_int64 v = 0;
+      if (sqlite3_prepare_v2(db, aHdr[k], -1, &pStmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(pStmt) == SQLITE_ROW) v = sqlite3_column_int64(pStmt, 0);
+        sqlite3_finalize(pStmt);
+      }
+      if (v) {
+        sha256_update(&h, (const uint8_t*)aHdr[k + 1], 1);
+        hashU64(&h, (uint64_t)v);
+        nEntries++;
+      }
+    }
+  }
+
   if (nEntries == 0) {
     memset(pOut, 0, HPPLITE_HASH_SIZE);  /* Genesis: no user schema */
   } else {
@@ -414,6 +435,32 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
 /*
 ** Decide whether a statement is a write worth logging, by its first keyword.
 */
+/* PRAGMA [schema.]user_version / application_id = N (or (N)): the two header
+** fields an application writes - migration tools keep their version there.
+** Deterministic, so captured and replayed like any write; their reads are not. */
+static int isHeaderPragmaWrite(const char *z) {
+  static const char *aName[] = { "user_version", "application_id", NULL };
+  int i;
+  while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+  if (sqlite3_strnicmp(z, "pragma", 6) != 0) return 0;
+  z += 6;
+  while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+  {
+    const char *dot = z;
+    while (*dot && (isalnum((unsigned char)*dot) || *dot == '_')) dot++;
+    if (*dot == '.') z = dot + 1;                          /* main.user_version */
+  }
+  for (i = 0; aName[i]; i++) {
+    size_t n = strlen(aName[i]);
+    if (sqlite3_strnicmp(z, aName[i], (int)n) == 0 && !(isalnum((unsigned char)z[n]) || z[n] == '_')) {
+      z += n;
+      while (*z == ' ' || *z == '\t') z++;
+      return *z == '=' || *z == '(';
+    }
+  }
+  return 0;
+}
+
 static int isTrackedSql(const char *z) {
   static const char *aSkip[] = {
     "SELECT", "EXPLAIN", "PRAGMA", "BEGIN", "COMMIT", "END", "ROLLBACK",
@@ -438,6 +485,7 @@ static int isTrackedSql(const char *z) {
     }
   }
   if (*z == '\0') return 0;
+  if (isHeaderPragmaWrite(z)) return 1;
   for (i = 0; aSkip[i]; i++) {
     int n = (int)strlen(aSkip[i]);
     if (sqlite3_strnicmp(z, aSkip[i], n) == 0) {
@@ -488,15 +536,29 @@ static int schemaVersion(HppliteCtx *pCtx) {
 ** statement, so it would survive to COMMIT. The DELETE runs inside the same
 ** transaction.
 */
+static int seqFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[2]);
 static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   if (pS != pCtx->pLastLogged) return;
   pCtx->pLastLogged = NULL;
+  if (pCtx->bLastLoggedKeep) return;   /* a header pragma changes neither rows nor schema: keep */
+  /* Reset before it finished (a RETURNING write stepped once - node:sqlite's
+  ** .get()): SQLite reports the end from sqlite3_reset() while the statement
+  ** is still busy, before it counts the changes it made. Its writes are done
+  ** (they all happen in the first step), the count says nothing: keep. */
+  if (sqlite3_stmt_busy(pS)) return;
 
   pCtx->bInternal = 1;
   if (totalChanges(pCtx->db) != pCtx->changesAtLog
       || schemaVersion(pCtx) != pCtx->schemaAtLog) {
     pCtx->bInternal = 0;
     return;   /* had an effect: keep */
+  }
+  if (pCtx->bSeqAtLog) {
+    sqlite3_int64 now[2];
+    if (seqFingerprint(pCtx, now) && (now[0] != pCtx->seqAtLog[0] || now[1] != pCtx->seqAtLog[1])) {
+      pCtx->bInternal = 0;
+      return;   /* no row changed, but sqlite_sequence did: keep */
+    }
   }
   if (!pCtx->pUnlogStmt) {
     if (sqlite3_prepare_v3(pCtx->db, "DELETE FROM _hpplite_pending WHERE id = ?1",
@@ -508,6 +570,17 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
     sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->lastLogId);
     sqlite3_step(pCtx->pUnlogStmt);
     sqlite3_reset(pCtx->pUnlogStmt);
+    /* changes() now says 1 (our DELETE); the application's statement changed
+    ** nothing - that is why its row went. A zero-row UPDATE says 0 again. */
+    if (!pCtx->pZeroStmt
+        && sqlite3_prepare_v3(pCtx->db, "UPDATE _hpplite_pending SET txn = txn WHERE 0", -1,
+                              SQLITE_PREPARE_PERSISTENT, &pCtx->pZeroStmt, NULL) != SQLITE_OK) {
+      pCtx->pZeroStmt = NULL;
+    }
+    if (pCtx->pZeroStmt) {
+      sqlite3_step(pCtx->pZeroStmt);
+      sqlite3_reset(pCtx->pZeroStmt);
+    }
   }
   pCtx->bInternal = 0;
 }
@@ -940,26 +1013,6 @@ static int currentMode(HppliteCtx *pCtx) {
   return mode;
 }
 
-/* A logged statement read the clock: its row records the time it read
-** (no-op if the effect check removed the row) */
-static void recordNow(HppliteCtx *pCtx, sqlite3_int64 logId, sqlite3_int64 t) {
-  pCtx->bInternal = 1;
-  if (!pCtx->pNowStmt
-      && sqlite3_prepare_v3(pCtx->db, "UPDATE _hpplite_pending SET now = ?2 WHERE id = ?1", -1,
-                            SQLITE_PREPARE_PERSISTENT, &pCtx->pNowStmt, NULL) != SQLITE_OK) {
-    pCtx->pNowStmt = NULL;
-  }
-  if (pCtx->pNowStmt) {
-    sqlite3_bind_int64(pCtx->pNowStmt, 1, logId);
-    sqlite3_bind_int64(pCtx->pNowStmt, 2, t);
-    if (sqlite3_step(pCtx->pNowStmt) != SQLITE_DONE) pCtx->nLogErrors++;
-    sqlite3_reset(pCtx->pNowStmt);
-  } else {
-    pCtx->nLogErrors++;
-  }
-  pCtx->bInternal = 0;
-}
-
 /* 'localtime' / 'utc' as a time function's modifier; zIn lower-cased.
 ** Literals already looked at are blanked, as isTimeFunctionArg expects. */
 static int usesTimeZone(const char *zIn) {
@@ -984,14 +1037,116 @@ static int usesTimeZone(const char *zIn) {
   return hit;
 }
 
+/*
+** The transaction gate. In WAL mode a bookkeeping commit that lands after an
+** application transaction has read makes that transaction's next write fail
+** ("database is locked": its snapshot can no longer become a write). Checks
+** at the start of the bookkeeping transaction leave a window; the gate does
+** not: the application holds it from the start of a statement until no
+** statement runs and no transaction is open, and a bookkeeping write takes
+** it or does not happen (the batch is adopted by a later flush). A flag, not
+** a mutex: several application threads may share the connection.
+*/
+static void gateEnterApp(HppliteCtx *pCtx) {
+  int expected;
+  if (pCtx->bkDb == pCtx->db) return;
+  for (;;) {
+    if (__atomic_load_n(&pCtx->txnGate, __ATOMIC_ACQUIRE) == 1) return;
+    expected = 0;
+    if (__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    usleep(200);                          /* a bookkeeping write: milliseconds */
+  }
+}
+static void gateLeaveAppIfIdle(HppliteCtx *pCtx) {
+  if (pCtx->bkDb == pCtx->db) return;
+  if (pCtx->nAppStmtActive == 0 && sqlite3_get_autocommit(pCtx->db)
+      && __atomic_load_n(&pCtx->txnGate, __ATOMIC_ACQUIRE) == 1) {
+    __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+  }
+}
+
+/* sqlite_sequence changes without changes() saying so (a zero-row INSERT
+** into an AUTOINCREMENT table creates its entry): a fingerprint of it */
+static int seqFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[2]) {
+  if (!pCtx->pSeqStmt) {
+    if (pCtx->seqTriedGen == pCtx->nDdlGen + 1) return 0;
+    if (sqlite3_prepare_v3(pCtx->db, "SELECT count(*), total(seq) FROM sqlite_sequence", -1,
+                           SQLITE_PREPARE_PERSISTENT, &pCtx->pSeqStmt, NULL) != SQLITE_OK) {
+      pCtx->pSeqStmt = NULL;
+      pCtx->seqTriedGen = pCtx->nDdlGen + 1;
+      return 0;
+    }
+  }
+  out[0] = out[1] = -1;
+  if (sqlite3_step(pCtx->pSeqStmt) == SQLITE_ROW) {
+    out[0] = sqlite3_column_int64(pCtx->pSeqStmt, 0);
+    out[1] = (sqlite3_int64)sqlite3_column_double(pCtx->pSeqStmt, 1);
+  }
+  sqlite3_reset(pCtx->pSeqStmt);
+  return 1;
+}
+
+/* A run of an application statement is over: forget it (PROFILE, or found
+** reset without finishing). Returns what was recorded for it. */
+typedef struct ActiveRun { sqlite3_int64 log, now; unsigned reads; int found; } ActiveRun;
+static ActiveRun endActiveRun(HppliteCtx *pCtx, int i) {
+  ActiveRun r;
+  int last = --pCtx->nActiveStmt;
+  r.log = pCtx->aActiveLog[i]; r.now = pCtx->aActiveNow[i]; r.found = 1;
+  /* clock reads during the run, counted before the pin goes (it resets the
+  ** count) and before our own statements below read it */
+  r.reads = hpplite_clock_consulted() - pCtx->aActiveSeen[i];
+  if (pCtx->aActiveStmt[i] == pCtx->pPinOwner) {
+    hpplite_clock_pin(0);
+    pCtx->pPinOwner = NULL;
+  }
+  pCtx->aActiveStmt[i] = pCtx->aActiveStmt[last];
+  pCtx->aActiveLog[i] = pCtx->aActiveLog[last];
+  pCtx->aActiveNow[i] = pCtx->aActiveNow[last];
+  pCtx->aActiveSeen[i] = pCtx->aActiveSeen[last];
+  pCtx->aActiveVm[i] = pCtx->aActiveVm[last];
+  if (pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
+  return r;
+}
+
+/* Runs whose end went unreported (finalized while tracing was replaced,
+** say) must not count as running forever - bookkeeping would never commit:
+** runs that are no longer busy, or no longer exist, are over. Application
+** thread. */
+static void endResetRuns(HppliteCtx *pCtx, sqlite3_stmt *pExcept) {
+  int j;
+  for (j = pCtx->nActiveStmt - 1; j >= 0; j--) {
+    sqlite3_stmt *p = NULL, *q = pCtx->aActiveStmt[j];
+    if (q == pExcept) continue;
+    while ((p = sqlite3_next_stmt(pCtx->db, p)) != NULL) if (p == q) break;
+    if (!p || !sqlite3_stmt_busy(q)) endActiveRun(pCtx, j);
+  }
+}
+
+static void noteNoClock(HppliteCtx *pCtx, sqlite3_int64 id, sqlite3_int64 now) {
+  if (!pCtx->pNoClockMutex) pCtx->pNoClockMutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+  if (!pCtx->pNoClockMutex) return;
+  sqlite3_mutex_enter(pCtx->pNoClockMutex);
+  if (pCtx->nNoClock == pCtx->nNoClockAlloc) {
+    int n = pCtx->nNoClockAlloc ? pCtx->nNoClockAlloc * 2 : 256;
+    struct HppliteNoClock *a = sqlite3_realloc64(pCtx->aNoClock, sizeof(*a) * (size_t)n);
+    if (a) { pCtx->aNoClock = a; pCtx->nNoClockAlloc = n; }
+  }
+  if (pCtx->nNoClock < pCtx->nNoClockAlloc) {
+    pCtx->aNoClock[pCtx->nNoClock].id = id;
+    pCtx->aNoClock[pCtx->nNoClock].now = now;
+    pCtx->nNoClock++;
+  }
+  sqlite3_mutex_leave(pCtx->pNoClockMutex);
+}
+
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
   const char *zSql = (const char*)pX;
   char *zExpanded;
-  int rc, slot = -1, readClock = 0;
-  sqlite3_int64 doneLog = 0, doneNow = 0;
-  unsigned doneSeen = 0;
+  int rc, slot = -1;
+  ActiveRun done = { 0, 0, 0, 0 };
 
   if (!pCtx || pCtx->bInternal) return 0;
   /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
@@ -1002,46 +1157,40 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     ** Named triggers say so ("-- TRIGGER x"); foreign key actions (ON
     ** DELETE CASCADE ...) are unnamed and arrive with the text of the
     ** statement that fired them, for a statement already running. Neither
-    ** is a statement of its own: not counted, not logged (#52). */
-    int i, running = 0;
+    ** is a statement of its own: not counted, not logged (#52).
+    ** Should a run's end ever go unreported, its next run would arrive as a
+    ** trace for a "running" statement and be taken for a sub-program. SQLite
+    ** adds to the VM step count only when sqlite3_step() returns, and a write
+    ** does all its writing in its first step (RETURNING included): a
+    ** sub-program sees the count its statement started with, a new run a
+    ** larger one. */
+    int i, running = -1;
     if (zSql && zSql[0] == '-' && zSql[1] == '-') return 0;
-    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { running = 1; break; }
-    if (running) return 0;
+    if (pCtx->nActiveStmt > 0) endResetRuns(pCtx, pS);
+    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { running = i; break; }
+    if (running >= 0) {
+      if (sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0) == pCtx->aActiveVm[running]) return 0;
+      endActiveRun(pCtx, running);          /* the last run was reset unfinished: this is a new one */
+    }
     if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
       slot = pCtx->nActiveStmt++;
       pCtx->aActiveStmt[slot] = pS;
       pCtx->aActiveLog[slot] = 0;
       pCtx->aActiveNow[slot] = 0;
       pCtx->aActiveSeen[slot] = 0;
+      pCtx->aActiveVm[slot] = sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0);
     }
+    gateEnterApp(pCtx);
     pCtx->nAppStmtActive++;
+    pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   } else if (mask == SQLITE_TRACE_PROFILE) {
     int i;
     for (i = 0; i < pCtx->nActiveStmt; i++) {
-      if (pCtx->aActiveStmt[i] == pS) {
-        int last = --pCtx->nActiveStmt;
-        doneLog = pCtx->aActiveLog[i];
-        doneNow = pCtx->aActiveNow[i];
-        doneSeen = pCtx->aActiveSeen[i];
-        pCtx->aActiveStmt[i] = pCtx->aActiveStmt[last];
-        pCtx->aActiveLog[i] = pCtx->aActiveLog[last];
-        pCtx->aActiveNow[i] = pCtx->aActiveNow[last];
-        pCtx->aActiveSeen[i] = pCtx->aActiveSeen[last];
-        break;
-      }
+      if (pCtx->aActiveStmt[i] == pS) { done = endActiveRun(pCtx, i); break; }
     }
-    if (pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
-    if (doneNow) {
-      /* the statement read the clock while it ran: record the time it got.
-      ** One read is SQLite's own: with PROFILE tracing on it times every
-      ** statement, and the closing read lands just before this callback.
-      ** Reads by statements nested in this one only over-record (harmless). */
-      readClock = hpplite_clock_consulted() - doneSeen > 1;
-    }
-    if (pS == pCtx->pPinOwner) {
-      hpplite_clock_pin(0);
-      pCtx->pPinOwner = NULL;
-    }
+    if (!done.found && pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
+    pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
+    gateLeaveAppIfIdle(pCtx);
   }
   if (!pCtx->bEnabled) return 0;
   if (pCtx->bStatusGone && mask == SQLITE_TRACE_STMT) {
@@ -1052,7 +1201,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
-    if (readClock && doneLog) recordNow(pCtx, doneLog, doneNow);
+    /* Its row carries the time pinned for it (#56). One clock read is
+    ** SQLite's own: with PROFILE tracing on it times every statement, the
+    ** closing read just before this callback. With no other read, the
+    ** batch can leave the time out. No write here: a write now would
+    ** become what changes() reports. */
+    if (done.now && done.log && done.reads <= 1) noteNoClock(pCtx, done.log, done.now);
     return 0;
   }
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
@@ -1161,7 +1315,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   pCtx->bInternal = 1;
   if (!pCtx->pLogStmt) {
     rc = sqlite3_prepare_v3(pCtx->db,
-      "INSERT INTO _hpplite_pending(txn, sql, mode) VALUES(?1, ?2, ?3)",
+      "INSERT INTO _hpplite_pending(txn, sql, mode, now) VALUES(?1, ?2, ?3, ?4)",
       -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pLogStmt, NULL);
     if (rc != SQLITE_OK) pCtx->pLogStmt = NULL;
   }
@@ -1172,10 +1326,17 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     sqlite3_bind_int64(pCtx->pLogStmt, 1, pCtx->curTxn);
     sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(pCtx->pLogStmt, 3, currentMode(pCtx));
-    rc = sqlite3_step(pCtx->pLogStmt);
+    sqlite3_bind_int64(pCtx->pLogStmt, 4, slot >= 0 ? pCtx->aActiveNow[slot] : 0);
+    {
+      /* our row's id is not the application's last_insert_rowid() */
+      sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
+      rc = sqlite3_step(pCtx->pLogStmt);
+      if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
+    }
     if (rc == SQLITE_DONE) {
       pCtx->pLastLogged = pS;
-      pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      pCtx->bLastLoggedKeep = isHeaderPragmaWrite(zSql);
       if (slot < 0) {
         int i;
         for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { slot = i; break; }
@@ -1184,6 +1345,13 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->lastLogId;
       pCtx->changesAtLog = totalChanges(pCtx->db);
       pCtx->schemaAtLog = schemaVersion(pCtx);
+      {
+        const char *z = zSql;
+        while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+        pCtx->bSeqAtLog = (sqlite3_strnicmp(z, "INSERT", 6) == 0 || sqlite3_strnicmp(z, "REPLACE", 7) == 0
+                           || sqlite3_strnicmp(z, "WITH", 4) == 0)
+                          && seqFingerprint(pCtx, pCtx->seqAtLog);
+      }
     }
     sqlite3_reset(pCtx->pLogStmt);
     sqlite3_clear_bindings(pCtx->pLogStmt);
@@ -1373,8 +1541,10 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
   if (pCtx->pRecTrigStmt) sqlite3_finalize(pCtx->pRecTrigStmt);
   if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
-  if (pCtx->pNowStmt) sqlite3_finalize(pCtx->pNowStmt);
-  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pNowStmt = NULL;
+  if (pCtx->pZeroStmt) sqlite3_finalize(pCtx->pZeroStmt);
+  if (pCtx->pSeqStmt) sqlite3_finalize(pCtx->pSeqStmt);
+  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
+  pCtx->pSeqStmt = NULL;
   pCtx->pLastLogged = NULL;
 }
 
@@ -1384,7 +1554,7 @@ static int applicationStatementsOpen(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt = NULL;
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
-        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pNowStmt) continue;
+        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt) continue;
     return 1;
   }
   return 0;
@@ -1401,6 +1571,8 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     finalizeOwnStatements(pCtx);
   }
   freeFunctionChecks(pCtx);
+  sqlite3_free(pCtx->aNoClock);
+  if (pCtx->pNoClockMutex) sqlite3_mutex_free(pCtx->pNoClockMutex);
   sqlite3_free(pCtx);
 }
 
@@ -1510,7 +1682,30 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
       && pCtx->nAppStmtActive > 0) {
     return SQLITE_BUSY;
   }
-  return internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
+  /* The same between statements of an application transaction: a read
+  ** snapshot taken before our commit cannot become a write after it, so the
+  ** transaction's next write would fail with "database is locked" (Knex's
+  ** deferred BEGIN, Django's atomic(): read, then write). Even the
+  ** application's own hpplite_flush() waits for its COMMIT. */
+  if (bWrite && pCtx->bkDb != pCtx->db && pCtx->bAppTxnOpen) {
+    return SQLITE_BUSY;
+  }
+  pCtx->bBkGate = 0;
+  if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing) {
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      return SQLITE_BUSY;                 /* the application is between read and write */
+    }
+    pCtx->bBkGate = 1;
+  }
+  {
+    int rc = internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
+    if (rc != SQLITE_OK && pCtx->bBkGate) {
+      pCtx->bBkGate = 0;
+      __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+    }
+    return rc;
+  }
 }
 
 static int bkEnd(HppliteCtx *pCtx, int rc) {
@@ -1519,6 +1714,10 @@ static int bkEnd(HppliteCtx *pCtx, int rc) {
   }
   if (rc != SQLITE_OK) {
     internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
+  }
+  if (pCtx->bBkGate) {
+    pCtx->bBkGate = 0;
+    __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
   }
   return rc;
 }
@@ -1536,6 +1735,13 @@ static void batchPop(HppliteBatch *pBatch) {
     sqlite3_free(pBatch->aTxns[pBatch->nTxns].zSql);
     pBatch->aTxns[pBatch->nTxns].zSql = NULL;
   }
+}
+
+static int cmpNoClock(const void *a, const void *b) {
+  const struct HppliteNoClock *x = a, *y = b;
+  if (x->id != y->id) return x->id < y->id ? -1 : 1;
+  if (x->now != y->now) return x->now < y->now ? -1 : 1;
+  return 0;
 }
 
 /* Drop the trailing statements of the last group, unless the group began
@@ -1683,6 +1889,28 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       pBatch->openGroup = next;
     }
   }
+  if (pBatch && pCtx->nNoClock > 0 && pCtx->pNoClockMutex) {
+    /* statements known not to have read the clock: their time stays out */
+    struct HppliteNoClock *a = NULL;
+    int n = 0, i;
+    sqlite3_mutex_enter(pCtx->pNoClockMutex);
+    if (pCtx->nNoClock > 0) {
+      a = sqlite3_malloc64(sizeof(*a) * (size_t)pCtx->nNoClock);
+      if (a) { memcpy(a, pCtx->aNoClock, sizeof(*a) * (size_t)pCtx->nNoClock); n = pCtx->nNoClock; }
+    }
+    sqlite3_mutex_leave(pCtx->pNoClockMutex);
+    if (a) {
+      qsort(a, (size_t)n, sizeof(*a), cmpNoClock);
+      for (i = 0; i < pBatch->nTxns; i++) {
+        struct HppliteNoClock key, *hit;
+        if (!pBatch->aTxns[i].now) continue;
+        key.id = aId[i]; key.now = pBatch->aTxns[i].now;
+        hit = bsearch(&key, a, (size_t)n, sizeof(*a), cmpNoClock);
+        if (hit) pBatch->aTxns[i].now = 0;
+      }
+      sqlite3_free(a);
+    }
+  }
   if (pBatch) maxId = aId[pBatch->nTxns - 1];
   sqlite3_free(aId);
   sqlite3_free(aGroup);
@@ -1725,6 +1953,13 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     if (rc != SQLITE_DONE) return rc;
   }
 
+  if (maxId > 0 && pCtx->nNoClock > 0 && pCtx->pNoClockMutex) {
+    int i, k = 0;
+    sqlite3_mutex_enter(pCtx->pNoClockMutex);
+    for (i = 0; i < pCtx->nNoClock; i++) if (pCtx->aNoClock[i].id > maxId) pCtx->aNoClock[k++] = pCtx->aNoClock[i];
+    pCtx->nNoClock = k;
+    sqlite3_mutex_leave(pCtx->pNoClockMutex);
+  }
   if (maxId > 0 && pCtx->nCarry > 0) {
     /* we post now: a part held from another writer's open transaction will
     ** never be continued (its replicas drop it on this batch too) */
@@ -2079,7 +2314,9 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
     if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0
         || sqlite3_column_int(pStmt, 2) != pBatch->aTxns[i].mode
-        || sqlite3_column_int64(pStmt, 4) != pBatch->aTxns[i].now) {
+        /* a time in the batch must be the one logged; none means the writer
+        ** knew the statement did not read the clock (#56) */
+        || (pBatch->aTxns[i].now && sqlite3_column_int64(pStmt, 4) != pBatch->aTxns[i].now)) {
       ok = 0;
       break;
     }

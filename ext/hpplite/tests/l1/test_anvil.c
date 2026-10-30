@@ -28,7 +28,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
-static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3;
+static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *ANVIL_PID;
 
 static void chain_sleep(int seconds) {
     char cmd[256];
@@ -409,11 +409,73 @@ static void test_big_transaction_end_to_end(void) {
     PASS();
 }
 
+/* 8. The chain stops answering mid-session (#49): anvil is frozen (SIGSTOP),
+** so connections hang rather than fail. Writes are local and must stay
+** fast; a flush and a close must return in bounded time, keeping the
+** batches pending; once the chain answers again everything posts and a
+** replica matches. KEY4's own rollup. */
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void anvil_signal(const char *sig) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "kill -%s %s", sig, ANVIL_PID);
+    (void)!system(cmd);
+}
+static void test_l1_outage(void) {
+    TEST("L1 frozen mid-session: writes stay fast, flush and close return, all posts after recovery");
+    sqlite3 *w = open_db("o_writer.db", KEY4, NULL);
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE o(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("first batch"); }
+    anvil_signal("STOP");
+    double slowest = 0, t0, t;
+    for (int i = 0; i < 50; i++) {
+        char sql[96];
+        snprintf(sql, sizeof(sql), "INSERT INTO o VALUES(%d, 'during the outage')", i);
+        t0 = now_s();
+        int rc = sqlite3_exec(w, sql, NULL, NULL, NULL);
+        t = now_s() - t0;
+        if (t > slowest) slowest = t;
+        if (rc != SQLITE_OK) { anvil_signal("CONT"); sqlite3_close(w); FAIL("a write failed during the outage"); }
+    }
+    t0 = now_s();
+    sqlite3_int64 flushed = scalar(w, "SELECT hpplite_flush()");
+    double flushTime = now_s() - t0;
+    t0 = now_s();
+    sqlite3_close(w);                                      /* close tries to post: must give up in bounded time */
+    double closeTime = now_s() - t0;
+    printf("(write max %.3fs, flush %.1fs -> %lld, close %.1fs) ", slowest, flushTime, (long long)flushed, closeTime);
+    anvil_signal("CONT");
+    if (slowest > 0.5) FAIL("a write waited on the chain");
+    if (flushTime > 20) FAIL("flush hung on the frozen chain");
+    if (closeTime > 20) FAIL("close hung on the frozen chain");
+    /* the close could not release the lease: the next process posts once
+    ** it expires (a sibling instance of our own wallet is never taken over) */
+    chain_sleep(400);
+    w = open_db("o_writer.db", KEY4, NULL);                /* the rows waited in the log */
+    if (!w) FAIL("reopen writer");
+    sqlite3_int64 pend = scalar(w, "SELECT pending FROM hpplite_status");
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("nothing posted after recovery"); }
+    unsigned char rootW[32], rootR[32];
+    hpplite_state_root(w, rootW);
+    sqlite3_int64 left = scalar(w, "SELECT pending FROM hpplite_status");
+    sqlite3_close(w);
+    if (pend != 50) { printf("(pending %lld) ", (long long)pend); FAIL("the outage's writes were not kept pending"); }
+    if (left != 0) FAIL("pending left after recovery");
+    sqlite3 *r = open_db("o_replica.db", KEY4, NULL);
+    if (!r) FAIL("replica");
+    sqlite3_int64 rows = scalar(r, "SELECT count(*) FROM o");
+    hpplite_state_root(r, rootR);
+    sqlite3_close(r);
+    if (rows != 50) FAIL("replica rows");
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica root differs");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
-    KEY3 = getenv("HPPLITE_ANVIL_KEY3");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    KEY3 = getenv("HPPLITE_ANVIL_KEY3"); KEY4 = getenv("HPPLITE_ANVIL_KEY4"); ANVIL_PID = getenv("HPPLITE_ANVIL_PID");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
@@ -423,6 +485,7 @@ int main(void) {
     test_stranger_after_expiry();
     test_edge_sql_end_to_end();
     test_big_transaction_end_to_end();
+    test_l1_outage();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     (void)!system("rm -rf " DIR);
     return tests_passed == tests_run ? 0 : 1;

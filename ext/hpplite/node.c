@@ -806,8 +806,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         ** must not commit now (see bkBegin). The batch is on L1 (when there
         ** is one) and the next flush adopts it; locally nothing changed. */
         node->retryAt = 0;        /* not an L1 failure: try again next tick */
-        if (ctx->nAppStmtActive == 0) {
-            /* not the mid-step deferral: something is actually wrong */
+        if (ctx->nAppStmtActive == 0 && !ctx->bAppTxnOpen && ctx->txnGate != 1) {
+            /* not a deferral for an application statement or transaction
+            ** (the gate): something is actually wrong */
             fprintf(stderr, "hpplite: could not finalize batch %llu locally\n",
                     (unsigned long long)height);
         }

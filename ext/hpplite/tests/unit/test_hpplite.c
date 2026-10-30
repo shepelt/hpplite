@@ -184,7 +184,8 @@ static void test_statement_classification(void) {
     exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
     if (hpplite_pending_count(ctx) != 1) FAIL("CREATE TABLE should be logged");
 
-    exec(db, "PRAGMA user_version = 7");
+    exec(db, "PRAGMA user_version");                     /* a read */
+    exec(db, "PRAGMA journal_mode");
     exec(db, "SELECT count(*) FROM t");
     exec(db, "EXPLAIN SELECT 1");
     exec(db, "ANALYZE");
@@ -192,6 +193,9 @@ static void test_statement_classification(void) {
     exec(db, "BEGIN; COMMIT;");
     exec(db, "SAVEPOINT sp; RELEASE sp;");
     if (hpplite_pending_count(ctx) != 1) FAIL("PRAGMA/SELECT/EXPLAIN/ANALYZE/VACUUM/txn control must not be logged");
+    /* the header fields an application writes are (migration versions) */
+    exec(db, "PRAGMA user_version = 7");
+    if (hpplite_pending_count(ctx) != 2) FAIL("PRAGMA user_version = N must be logged");
 
     exec(db, "  /* leading comment */ -- and another\n INSERT INTO t VALUES(1,'c')");
     if (pending_has(ctx, "VALUES(1,'c')") != 1) FAIL("comment-prefixed INSERT should be logged");

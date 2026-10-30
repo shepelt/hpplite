@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 struct EthClient {
     pthread_mutex_t lock;      /* one curl easy handle: one request at a time (timer thread vs app thread) */
@@ -25,7 +26,17 @@ struct EthClient {
     char error[256];
     CURL *curl;
     secp256k1_context *secp_ctx;
+    time_t downUntil;          /* an endpoint that timed out: calls fail at once until then */
 };
+
+/* One request may take this long. An endpoint that answers nothing in 15 s
+** is down for our purposes; HPP's RPC answers in well under a second, a
+** full batch transaction included. HPPLITE_RPC_TIMEOUT (seconds) overrides. */
+static long rpcTimeout(void) {
+    const char *z = getenv("HPPLITE_RPC_TIMEOUT");
+    long v = z ? strtol(z, NULL, 10) : 0;
+    return v > 0 ? v : 15;
+}
 
 /* Response buffer for curl */
 struct ResponseBuffer {
@@ -96,6 +107,16 @@ static cJSON *rpc_call(EthClient *client, const char *method, cJSON *params) {
 static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *params) {
     struct ResponseBuffer response = {0};
     struct curl_slist *headers = NULL;
+
+    /* After a timeout, the operations that follow (a lease read is several
+    ** calls, a flush and a close several more) fail at once instead of each
+    ** waiting out its own timeout: a frozen endpoint costs one timeout, not
+    ** one per call. The window is short; the node retries on its own schedule. */
+    if (client->downUntil && time(NULL) < client->downUntil) {
+        snprintf(client->error, sizeof(client->error), "L1 RPC did not answer recently; not trying again yet");
+        if (params) cJSON_Delete(params);
+        return NULL;
+    }
     
     /* Build request */
     cJSON *request = cJSON_CreateObject();
@@ -118,7 +139,8 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     curl_easy_setopt(client->curl, CURLOPT_WRITEDATA, &response);
     
     curl_easy_setopt(client->curl, CURLOPT_USERAGENT, "hpplite/0.1");
-    curl_easy_setopt(client->curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(client->curl, CURLOPT_TIMEOUT, rpcTimeout());
+    curl_easy_setopt(client->curl, CURLOPT_CONNECTTIMEOUT, 5L);
 
     /* An RPC under load answers 429/5xx, sometimes with an empty body; one
     ** empty body used to reach cJSON_Parse(NULL) and crash the process. */
@@ -132,11 +154,15 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
         httpStatus = 0;
         if (res == CURLE_OK) curl_easy_getinfo(client->curl, CURLINFO_RESPONSE_CODE, &httpStatus);
         if (res == CURLE_OK && httpStatus != 429 && httpStatus < 500) break;
+        /* an endpoint that does not answer will not answer 2 s later either */
+        if (res == CURLE_OPERATION_TIMEDOUT) break;
         usleep((useconds_t)(250000u << attempt));            /* 0.25, 0.5, 1, 2 s */
     }
     curl_slist_free_all(headers);
     free(request_str);
     
+    if (res == CURLE_OPERATION_TIMEDOUT) client->downUntil = time(NULL) + 10;
+    else client->downUntil = 0;
     if (res != CURLE_OK) {
         snprintf(client->error, sizeof(client->error), "curl error: %s", 
                  curl_easy_strerror(res));

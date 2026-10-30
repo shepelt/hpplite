@@ -437,6 +437,270 @@ static void test_last_refusal(void) {
     PASS();
 }
 
+/* Migration tools keep their version in the header (PRAGMA user_version):
+** a replica that becomes the writer reads it to decide what to migrate */
+static void test_header_pragmas_replicate(void) {
+    TEST("PRAGMA user_version / application_id writes reach a replica");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/uv.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    if (sqlite3_exec(n->db, "PRAGMA user_version = 7", NULL, NULL, NULL) != SQLITE_OK) FAIL("user_version");
+    if (sqlite3_exec(n->db, "pragma main.APPLICATION_ID=1095779411", NULL, NULL, NULL) != SQLITE_OK) FAIL("application_id");
+    hpplite_node_exec(n, "BEGIN", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_exec(n, "PRAGMA user_version = 8", NULL);           /* in a migration's transaction */
+    hpplite_node_exec(n, "COMMIT", NULL);
+    hpplite_node_exec(n, "BEGIN", NULL);
+    hpplite_node_exec(n, "PRAGMA user_version = 99", NULL);
+    hpplite_node_exec(n, "ROLLBACK", NULL);                          /* rolled back: not replayed */
+    sqlite3_exec(n->db, "PRAGMA user_version", NULL, NULL, NULL);    /* a read: not captured */
+    if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node(DIR "/uv_replica.db", l1);
+    if (!r) FAIL("replica");
+    sqlite3_stmt *st;
+    int uv = -1, aid = -1;
+    if (sqlite3_prepare_v2(r->db, "SELECT user_version FROM pragma_user_version", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) uv = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    if (sqlite3_prepare_v2(r->db, "SELECT application_id FROM pragma_application_id", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) aid = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    hpplite_node_get_state_root(r, rb);
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (uv != 8) FAILF("replica user_version %d, expected 8", uv);
+    if (aid != 1095779411) FAILF("replica application_id %d", aid);
+    if (memcmp(ra, rb, 32) != 0) FAIL("roots differ");
+    PASS();
+}
+
+/* What the application reads back about its own writes must be what plain
+** SQLite says: compare-and-set and optimistic locking depend on changes()
+** (found by an agent-built inventory app: an order for 9 units with 3 in
+** stock was accepted because a 0-row UPDATE reported 1) */
+static sqlite3_int64 changes_after(sqlite3 *db, const char *sql) {
+    if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) return -100;
+    return sqlite3_changes64(db);
+}
+static void test_changes_are_the_applications(void) {
+    TEST("sqlite3_changes() after a write is the write's own count, whatever HPPLite logged");
+    reset_dir();
+    HppliteNode *n = open_node(DIR "/chg.db", NULL);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE p(id INTEGER PRIMARY KEY, stock INTEGER, at TEXT)", NULL);
+    hpplite_node_exec(n, "INSERT INTO p VALUES(1, 3, NULL), (2, 5, NULL), (3, 7, NULL)", NULL);
+    struct { const char *sql; sqlite3_int64 want; } a[] = {
+        { "UPDATE p SET stock = stock - 9 WHERE id = 1 AND stock >= 9", 0 },
+        { "DELETE FROM p WHERE id = 42", 0 },
+        { "UPDATE p SET stock = stock - 1 WHERE id = 1 AND stock >= 1", 1 },
+        { "UPDATE p SET at = datetime('now')", 3 },                  /* reads the clock (#56) */
+        { "UPDATE p SET at = CURRENT_TIMESTAMP WHERE id > 1", 2 },
+        { "UPDATE p SET at = datetime('now') WHERE id = 99", 0 },
+        { "INSERT INTO p VALUES(4, 1, CURRENT_TIMESTAMP)", 1 },
+        { NULL, 0 } };
+    for (int i = 0; a[i].sql; i++) {
+        sqlite3_int64 got = changes_after(n->db, a[i].sql);
+        if (got != a[i].want) { hpplite_node_destroy(n); FAILF("%s: changes() = %lld, expected %lld", a[i].sql, (long long)got, (long long)a[i].want); }
+        /* the explicit read sees the same */
+        sqlite3_stmt *st;
+        sqlite3_int64 viaSql = -1;
+        if (sqlite3_prepare_v2(n->db, "SELECT changes()", -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) viaSql = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+        if (viaSql != a[i].want) { hpplite_node_destroy(n); FAILF("%s: SELECT changes() = %lld", a[i].sql, (long long)viaSql); }
+    }
+    hpplite_node_destroy(n);
+    PASS();
+}
+
+/* node:sqlite's StatementSync.get() steps a statement once and resets it:
+** for INSERT ... RETURNING the write is complete after that one step, and
+** SQLite reports no end of statement to the trace (found by an agent-built
+** habit tracker: rows written that way never reached the chain) */
+static void test_returning_stepped_once(void) {
+    TEST("INSERT/UPDATE ... RETURNING stepped once and reset, then run again: every run captured");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/ret.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE r(id INTEGER PRIMARY KEY, v TEXT)", NULL);
+    sqlite3_stmt *ins = NULL, *upd = NULL;
+    if (sqlite3_prepare_v2(n->db, "INSERT INTO r(v) VALUES(?1) RETURNING id", -1, &ins, NULL) != SQLITE_OK) FAIL("prepare");
+    if (sqlite3_prepare_v2(n->db, "UPDATE r SET v = v || '!' WHERE id = ?1 RETURNING v", -1, &upd, NULL) != SQLITE_OK) FAIL("prepare upd");
+    for (int i = 0; i < 5; i++) {
+        char v[16];
+        snprintf(v, sizeof(v), "row%d", i);
+        sqlite3_bind_text(ins, 1, v, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_ROW) FAIL("insert step");
+        sqlite3_reset(ins);                                   /* .get(): one step, then reset */
+        sqlite3_bind_int(upd, 1, i + 1);
+        if (sqlite3_step(upd) != SQLITE_ROW) FAIL("update step");
+        sqlite3_reset(upd);
+    }
+    sqlite3_finalize(ins);
+    sqlite3_finalize(upd);
+    if (hpplite_node_pending_count(n) != 11) { printf("(pending %d) ", hpplite_node_pending_count(n)); FAIL("not every run was captured"); }
+    if (n->ctx->nAppStmtActive != 0) FAIL("statements left counted as running");
+    if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node(DIR "/ret_replica.db", l1);
+    if (!r) FAIL("replica");
+    int rows = count_rows(r->db, "r");
+    hpplite_node_get_state_root(r, rb);
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (rows != 5) FAIL("replica rows");
+    if (memcmp(ra, rb, 32) != 0) FAIL("replica root differs (the updates)");
+    PASS();
+}
+
+static void test_last_insert_rowid_is_the_applications(void) {
+    TEST("last_insert_rowid() after a write that inserts nothing is the application's, not the log's");
+    reset_dir();
+    HppliteNode *n = open_node(DIR "/rowid.db", NULL);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE u(id INTEGER PRIMARY KEY, k TEXT UNIQUE)", NULL);
+    hpplite_node_exec(n, "CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID", NULL);
+    hpplite_node_exec(n, "INSERT INTO u(id, k) VALUES(41, 'a')", NULL);
+    sqlite3_int64 a = sqlite3_last_insert_rowid(n->db);
+    hpplite_node_exec(n, "INSERT OR IGNORE INTO u(k) VALUES('a')", NULL);   /* ignored */
+    sqlite3_int64 b = sqlite3_last_insert_rowid(n->db);
+    hpplite_node_exec(n, "INSERT INTO w VALUES('x', 1)", NULL);             /* no rowid */
+    sqlite3_int64 c = sqlite3_last_insert_rowid(n->db);
+    hpplite_node_exec(n, "UPDATE u SET k = 'b'", NULL);
+    sqlite3_int64 d = sqlite3_last_insert_rowid(n->db);
+    hpplite_node_destroy(n);
+    if (a != 41 || b != 41 || c != 41 || d != 41) FAILF("last_insert_rowid %lld %lld %lld %lld, expected 41 each", (long long)a, (long long)b, (long long)c, (long long)d);
+    PASS();
+}
+
+/* "Changed no rows" is not "had no effect": an INSERT of zero rows into an
+** AUTOINCREMENT table creates its sqlite_sequence entry (Django's table
+** rebuild of an empty table does exactly this) */
+static void test_zero_row_insert_into_autoincrement(void) {
+    TEST("a zero-row INSERT that creates a sqlite_sequence entry reaches the replica");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/seq.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE src(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(n, "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v)", NULL);
+    hpplite_node_exec(n, "INSERT INTO a(id, v) SELECT id, v FROM src", NULL);   /* 0 rows */
+    if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
+    int seqW = count_rows(n->db, "sqlite_sequence");
+    HppliteNode *r = open_node(DIR "/seq_replica.db", l1);
+    if (!r) FAIL("replica");
+    int seqR = count_rows(r->db, "sqlite_sequence");
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (seqW != 1) FAIL("test premise: the writer has the sequence entry");
+    if (seqR != seqW) FAILF("replica sqlite_sequence has %d rows, writer %d", seqR, seqW);
+    PASS();
+}
+
+/* The timer's bookkeeping commit can land between an application
+** transaction's read and its write however the flags are checked at its
+** start: stress it with the timer thread flushing continuously */
+#include <pthread.h>
+typedef struct { HppliteNode *n; volatile int stop; int flushes; } Flusher;
+static void *flusher(void *arg) {
+    Flusher *f = arg;
+    while (!f->stop) { hpplite_node_flush_batch(f->n); f->flushes++; }
+    return NULL;
+}
+static void test_read_then_write_under_timer(void) {
+    TEST("read-then-write transactions never hit 'database is locked' while flushes run");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
+    HppliteNode *n = open_node(DIR "/race2.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER)", NULL);
+    hpplite_node_exec(n, "INSERT INTO s VALUES(1, 0)", NULL);
+    Flusher f = { n, 0, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, flusher, &f);
+    int locked = 0, done = 0;
+    for (int i = 0; i < 1500; i++) {
+        sqlite3_stmt *st;
+        if (sqlite3_exec(n->db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) { locked++; continue; }
+        if (sqlite3_prepare_v2(n->db, "SELECT v FROM s WHERE id = 1", -1, &st, NULL) == SQLITE_OK) { sqlite3_step(st); sqlite3_finalize(st); }
+        int rc = sqlite3_exec(n->db, "UPDATE s SET v = v + 1 WHERE id = 1", NULL, NULL, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_exec(n->db, "INSERT INTO s(v) VALUES(1)", NULL, NULL, NULL);
+        if (rc == SQLITE_OK && sqlite3_exec(n->db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) done++;
+        else { locked++; sqlite3_exec(n->db, "ROLLBACK", NULL, NULL, NULL); }
+    }
+    f.stop = 1;
+    pthread_join(th, NULL);
+    hpplite_node_flush_batch(n);
+    sqlite3_int64 v = -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(n->db, "SELECT v FROM s WHERE id = 1", -1, &st, NULL) == SQLITE_OK) { if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0); sqlite3_finalize(st); }
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node(DIR "/race2_replica.db", l1);
+    if (r) hpplite_node_get_state_root(r, rb);
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    printf("(%d flushes, %d done, %d locked) ", f.flushes, done, locked);
+    if (locked) FAIL("application transactions were locked out by bookkeeping");
+    if (v != done) FAIL("counter");
+    if (!r || memcmp(ra, rb, 32) != 0) FAIL("replica root differs");
+    PASS();
+}
+
+/* A transaction that reads, then writes (Knex's deferred BEGIN, Django's
+** atomic(): the usual shape) must not be broken by a bookkeeping commit in
+** between: in WAL mode the read snapshot could no longer become a write */
+static void test_bookkeeping_waits_for_app_transaction(void) {
+    TEST("a flush during an application's read-then-write transaction does not lock it out");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/rw.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER)", NULL);
+    hpplite_node_exec(n, "INSERT INTO s VALUES(1, 10)", NULL);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("batch 1");
+    hpplite_node_exec(n, "INSERT INTO s VALUES(2, 20)", NULL);            /* pending: the flush has work */
+    if (sqlite3_exec(n->db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) FAIL("begin");
+    sqlite3_int64 v = -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(n->db, "SELECT v FROM s WHERE id = 1", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);                                         /* the read transaction stays open */
+    }
+    hpplite_node_flush_batch(n);                                      /* as the timer would, mid-transaction */
+    char *err = NULL;
+    int rc = sqlite3_exec(n->db, "UPDATE s SET v = v + 1 WHERE id = 1", NULL, NULL, &err);
+    if (rc != SQLITE_OK) { printf("[%s] ", err ? err : "?"); sqlite3_free(err); sqlite3_exec(n->db, "ROLLBACK", NULL, NULL, NULL); hpplite_node_destroy(n); FAIL("the write after the read failed"); }
+    if (sqlite3_exec(n->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) FAIL("commit");
+    hpplite_node_flush_batch(n);
+    if (hpplite_node_pending_count(n) != 0) FAIL("pending left");
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node(DIR "/rw_replica.db", l1);
+    if (!r) FAIL("replica");
+    hpplite_node_get_state_root(r, rb);
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (v != 10) FAIL("read");
+    if (memcmp(ra, rb, 32) != 0) FAIL("replica root differs");
+    PASS();
+}
+
 /* ------------------------------------------------------------------------
 ** 2. Adversarial bytes on L1
 ** ---------------------------------------------------------------------- */
@@ -852,6 +1116,13 @@ int main(void) {
     test_guard_spellings();
     test_app_defined_functions();
     test_last_refusal();
+    test_header_pragmas_replicate();
+    test_changes_are_the_applications();
+    test_returning_stepped_once();
+    test_last_insert_rowid_is_the_applications();
+    test_bookkeeping_waits_for_app_transaction();
+    test_zero_row_insert_into_autoincrement();
+    test_read_then_write_under_timer();
     test_wrong_height_batch();
     test_plaintext_on_encrypting_rollup();
     test_plaintext_at_height_1();

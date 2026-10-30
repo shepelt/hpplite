@@ -108,10 +108,11 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `factory` | Yes* | Factory contract address (if no `l1`) |
 | `contract` | No | Connect to an existing rollup instead of using the factory |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
-| `datadir` | No | Local data directory |
+| `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
+| `datadir` | No | Reserved; v0.1 keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
-| `checkpoint` | No | Batches per checkpoint / state root (default 100) |
+| `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
@@ -162,6 +163,52 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 
 One SQLite library per process: loading the module into a second one
 (better-sqlite3's copy and Node's own) is refused.
+
+### Using it from an application
+
+Load the module once per process, through any connection (a throwaway
+`:memory:` one is fine), before opening the database; then open the
+database the HPPLite way. Connections opened afterwards in the process are
+covered automatically.
+
+```python
+# Python sqlite3 (SQLAlchemy: pass a creator; Django: NAME = uri)
+boot = sqlite3.connect(":memory:"); boot.enable_load_extension(True)
+boot.load_extension("/path/to/hpplite"); boot.close()      # no suffix needed
+uri = "file:app.db?hpplite=on&l1=hpp-sepolia&keyfile=/etc/app/key"
+db = sqlite3.connect(uri, uri=True)
+engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(uri, uri=True, check_same_thread=False),
+                       poolclass=QueuePool)
+```
+
+```js
+// Node node:sqlite (Drizzle: drizzle-orm/sqlite-proxy over it)
+const boot = new DatabaseSync(":memory:", { allowExtension: true });
+boot.loadExtension("/path/to/hpplite.dylib"); boot.close();
+const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
+// npm sqlite3 (Knex): new sqlite3.Database(":memory:").loadExtension(path, cb) first
+```
+
+- **The first connection to a file in a process is the sequencer** (it
+  posts); later ones capture and leave posting to it. Open it at startup
+  and keep it open for the life of the process; close it last. With a
+  connection pool, open one connection yourself at startup and hold it.
+  A migration tool run as its own process while the server is stopped is
+  fine: it becomes the sequencer for its run.
+- **Close flushes**: it posts what is pending, waits for L1 and releases
+  the sequencer lease. Bounded: an unreachable RPC costs one timeout (15 s,
+  `HPPLITE_RPC_TIMEOUT`) and the rows stay in the file for the next open -
+  but the lease could not be released then, so the next process posts only
+  once it expires (the lease length, minutes). To be sure before exiting,
+  `SELECT hpplite_flush()` and check `pending` is 0.
+- **Everything that writes is replayed**, DDL included: `CREATE`, `ALTER`,
+  `DROP`, the table rebuilds migration tools do, `PRAGMA user_version` and
+  `application_id`. `changes()`, `last_insert_rowid()` and `RETURNING`
+  report the application's statements as in plain SQLite.
+- **One wallet is one database on chain.** A new, empty file opened with the
+  same key rebuilds that database from L1 (that is how you verify, or move
+  to another machine). In the same process as the live writer it says
+  `another sequencer instance holds the lease`: expected - it is a reader.
 
 **Every connection that writes must open with `hpplite=on`** - a plain
 connection's writes are not captured. The first `hpplite=on` connection to a
@@ -296,6 +343,20 @@ function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 
 
 ## Verification
 
+A replica rebuilt from L1 compares its content hash with the root posted at
+each checkpoint (`roots_compared`, `root_mismatches`). Until the first
+checkpoint (`checkpoint=`, default every 100 batches) there is no posted
+root yet: compare `SELECT state_root FROM hpplite_status` of the writer and
+the rebuilt file yourself, or use a smaller `checkpoint` in development.
+
+`hpplite_status` columns: `height` (next batch number), `pending` (statements
+logged, not yet posted), `state_root`, `prev_block_hash`,
+`last_checkpoint_height`, `lease` (1 = this instance may post), `log_errors`,
+`replay_skipped`, `encryption`, `keyed`, `nondeterministic`, `contract`,
+`da_contract`, `last_batch_tx`, `foreign_batches`, `hooks_replaced`,
+`roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`.
+
+
 What exists in v0.1 is **rebuild and compare**: open an empty file with the
 same key and `l1=`/`contract=`; every batch is fetched, opened and replayed,
 and after each batch that carries a state root the content hash of the
@@ -406,7 +467,10 @@ Not detectable, so not refused - know these:
 
 - **Bound `REAL` values** are expanded with 15 significant digits
   (`sqlite3_expanded_sql`), so `0.1 + 0.2` replays as `0.3`. Store exact
-  decimals as `INTEGER` or `TEXT`, or write the literal yourself.
+  decimals as `INTEGER` or `TEXT`, or write the literal yourself. (Node's
+  `node:sqlite` binds every JS number as `REAL`, so its integers appear as
+  `1.0` in the captured text; the writer stored the same value, so replay
+  agrees - bind `BigInt` if you want integers stored as integers.)
 - **`TEXT` with an embedded NUL** is cut at the NUL in the captured text.
 - **`INSERT ... SELECT` without `ORDER BY`** into a rowid table takes its row
   order from the query planner.
