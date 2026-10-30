@@ -99,6 +99,16 @@ struct HppliteCtx {
   sqlite3_stmt *pPinOwner;    /* The statement that pinned the clock (outermost write) */
 
   int nActiveStmt;
+
+  /* Row capture (capture engine v2, #19; capture_rows.c) */
+  int bRows;                  /* writes are captured as row records by the connection's TEMP triggers */
+  int rowsBuiltFor;           /* schema_version the triggers were built for (-1: none) */
+  int bRowsCapOff;            /* the running statement is logged as text: its triggers record nothing */
+  sqlite3_stmt *pRowsTextStmt; /* ...that statement */
+  sqlite3_stmt *pRowsSchemaStmt; /* Cached PRAGMA main.schema_version */
+  char *zRowsTextOnly;        /* Names a write must not mention to be captured as rows: virtual
+                              ** tables and what reaches them through triggers ('\0'-separated,
+                              ** ends with an empty name) */
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
   sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
   int bLastLoggedKeep;        /* ...is kept even without an effect (header pragma) */

@@ -43,10 +43,15 @@ database file.
 - **Invisible to the application's schema.** TEMP triggers are not in
   `sqlite_schema`; migration tools that compare schemas see nothing.
 - **Effects of everything.** The application's own triggers, foreign-key
-  cascades, `REPLACE` conflict deletes, and what FTS5 and R*Tree write to
-  their internal tables all arrive as row changes (checked on SQLite 3.51:
-  cascades and app triggers captured in order; FTS5 internal tables accept
-  triggers; virtual tables and `sqlite_sequence` do not).
+  cascades and `REPLACE` conflict deletes all arrive as row changes
+  (checked on SQLite 3.51: cascades and app triggers captured in order).
+  Virtual tables (FTS5, R*Tree) are the exception: they cannot carry
+  triggers, and their internal (shadow) tables must not. FTS5 accepts a
+  trigger there, but its own flush then opens a statement savepoint that
+  flushes again, and the recursion overflows the stack. A write that names a
+  virtual table, or a table or view whose triggers reach one (the usual
+  external-content FTS sync), is logged as text, the v1 way, and replays
+  with triggers on.
 
 ### Records
 
@@ -127,7 +132,7 @@ detected.
    inserts, updates, deletes; against v1 on the same workloads - equality,
    size, overhead.
 2. Engine: schema changes in the log, trigger rebuild, WITHOUT ROWID,
-   `sqlite_sequence`, FTS5/R*Tree internal tables, VACUUM, the authorizer.
+   `sqlite_sequence`, VACUUM, the authorizer guarding the triggers.
 3. Batch format v2; v1 history still replayed.
 4. Validation: all current suites, agent apps, Ghost, WordPress concurrent;
    then SQLite's TCL suite with HPPLite on every connection, Rails 8,

@@ -55,6 +55,10 @@ target_include_directories(sqlite3 PUBLIC
 )
 target_compile_definitions(sqlite3 PUBLIC
     SQLITE_THREADSAFE=1
+    # full-text search and R*Tree, as in the SQLite of Homebrew, macOS, Debian and
+    # Python's builds: what applications use, row capture records (their tables)
+    SQLITE_ENABLE_FTS5
+    SQLITE_ENABLE_RTREE
 )
 target_link_libraries(sqlite3 PUBLIC
     Threads::Threads
@@ -64,6 +68,7 @@ target_link_libraries(sqlite3 PUBLIC
 # HPPLite core library
 set(HPPLITE_SOURCES
     hpplite.c
+    capture_rows.c
     batch.c
     crypto.c
     node.c
@@ -192,6 +197,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_big_stmt hpplite)
         add_executable(test_concurrency tests/unit/test_concurrency.c)
         target_link_libraries(test_concurrency hpplite)
+        add_executable(test_rows tests/unit/test_rows.c)
+        target_link_libraries(test_rows hpplite)
 
         # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
@@ -282,6 +289,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_reorg COMMAND test_reorg)
         add_test(NAME test_big_stmt COMMAND test_big_stmt)
         add_test(NAME test_concurrency COMMAND test_concurrency)
+        add_test(NAME test_rows COMMAND test_rows)
         add_test(NAME test_crash COMMAND crash_hpplite)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c

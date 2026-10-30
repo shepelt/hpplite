@@ -6,6 +6,7 @@
 */
 
 #include "hpplite.h"
+#include "capture_rows.h"
 #include "clock.h"
 #include <ctype.h>
 #include <fnmatch.h>
@@ -475,6 +476,24 @@ static int isHeaderPragmaWrite(const char *z) {
   return 0;
 }
 
+/* A write row capture records (INSERT, REPLACE, UPDATE, DELETE, and WITH
+** in front of one); schema changes and the rest stay statement text */
+static int isRowsDml(const char *z) {
+  static const char *aDml[] = { "INSERT", "REPLACE", "UPDATE", "DELETE", "WITH", NULL };
+  int i;
+  for (;;) {
+    while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+    if (z[0] == '-' && z[1] == '-') { while (*z && *z != '\n') z++; }
+    else if (z[0] == '/' && z[1] == '*') { const char *e = strstr(z + 2, "*/"); if (!e) return 0; z = e + 2; }
+    else break;
+  }
+  for (i = 0; aDml[i]; i++) {
+    size_t n = strlen(aDml[i]);
+    if (sqlite3_strnicmp(z, aDml[i], (int)n) == 0 && !((z[n] >= 'A' && z[n] <= 'Z') || (z[n] >= 'a' && z[n] <= 'z') || z[n] == '_')) return 1;
+  }
+  return 0;
+}
+
 static int isTrackedSql(const char *z) {
   static const char *aSkip[] = {
     "SELECT", "EXPLAIN", "PRAGMA", "BEGIN", "COMMIT", "END", "ROLLBACK",
@@ -928,13 +947,18 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
 static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   int rc;
-  (void)z3; (void)z4;
+  (void)z3;
   if (!pCtx) return SQLITE_OK;
   if (pCtx->bCollectFns) {
+    /* the capture triggers' functions are ours, and silent in a text statement */
+    if (pCtx->bRows && z4 && sqlite3_strnicmp(z4, "hpplite_cap_", 12) == 0) return SQLITE_OK;
     if (op == SQLITE_FUNCTION && z2 && !pCtx->zCollectWhy[0]) collectFunction(pCtx, z2);
     return SQLITE_OK;
   }
   if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  /* the capture triggers' own writes into the log (z4: the trigger running) */
+  if (pCtx->bRows && z4 && sqlite3_strnicmp(z4, "hpplite_cap_", 12) == 0
+      && (op == SQLITE_INSERT || op == SQLITE_READ || op == SQLITE_FUNCTION || op == SQLITE_SELECT)) return SQLITE_OK;
   rc = hppliteAuthorizerInner(pCtx, op, z1, z2);
   if (rc == SQLITE_DENY) {
     fprintf(stderr, "hpplite: %s; statement refused (SQLITE_AUTH)\n", pCtx->zDenyWhy ? pCtx->zDenyWhy : "not authorized");
@@ -1308,6 +1332,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     /* a schema change of this connection's own is not staleness */
     if (bWasLogged && pS != pCtx->pRerunStmt) pCtx->seenSchema = schemaVersion(pCtx);
     if (pS == pCtx->pRerunStmt) rerunStatementDone(pCtx, pS);
+    if (pCtx->bRows) {
+      if (pS == pCtx->pRowsTextStmt) { pCtx->pRowsTextStmt = NULL; pCtx->bRowsCapOff = 0; }
+      /* a safe point for DDL: the statement is over (not a reset mid-run) */
+      if (!sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0) hpplite_rows_after_statement(pCtx);
+    }
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
     ** closing read just before this callback. With no other read, the
@@ -1320,6 +1349,17 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* SQLite's own verdict: a statement that cannot write is never logged, so
   ** nothing in it needs to replay (WITH ... SELECT random() included) */
   if (pS && sqlite3_stmt_readonly(pS)) return 0;
+  /* Row capture (#19): the triggers record what a write changes - its text,
+  ** its functions and the clock no longer matter. A write on a table they do
+  ** not cover yet (created by another connection since the last rebuild) is
+  ** logged as text, the v1 way, its triggers silent; rebuilt after it. So
+  ** is a write that may reach a virtual table (FTS5, R*Tree): what those
+  ** store cannot carry triggers. */
+  if (pCtx->bRows && isRowsDml(zSql)) {
+    if (hpplite_rows_covered(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
+    pCtx->pRowsTextStmt = pS;
+    pCtx->bRowsCapOff = 1;
+  }
   /* Statements replay cannot reproduce are unsupported in v0.1 (row-level
   ** capture, #19, lifts this): connection state that changes what a later
   ** statement does, and non-deterministic values. Refused by default so the
@@ -1655,8 +1695,9 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
   if (pCtx->pZeroStmt) sqlite3_finalize(pCtx->pZeroStmt);
   if (pCtx->pSeqStmt) sqlite3_finalize(pCtx->pSeqStmt);
+  if (pCtx->pRowsSchemaStmt) sqlite3_finalize(pCtx->pRowsSchemaStmt);
   pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
-  pCtx->pSeqStmt = NULL;
+  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = NULL;
   pCtx->pLastLogged = NULL;
 }
 
@@ -1666,7 +1707,8 @@ static int applicationStatementsOpen(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt = NULL;
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
-        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt) continue;
+        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt
+        || pStmt == pCtx->pRowsSchemaStmt) continue;
     return 1;
   }
   return 0;
@@ -1684,6 +1726,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   }
   freeFunctionChecks(pCtx);
   sqlite3_free(pCtx->aNoClock);
+  sqlite3_free(pCtx->zRowsTextOnly);
   if (pCtx->pNoClockMutex) sqlite3_mutex_free(pCtx->pNoClockMutex);
   sqlite3_free(pCtx);
 }
