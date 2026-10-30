@@ -14,6 +14,15 @@ $P /tmp/wp/wp-cli.phar --path=/tmp/wp/wordpress core install --url=http://localh
 (cd /tmp/wp/wordpress && $P -S localhost:8090)          # web traffic, REST API
 ```
 
+`session.sh <php> <module> <dir> [port]` runs the whole session below (install, WP-CLI,
+pages and REST writes); then the replica check:
+
+```bash
+HPPLITE_EXT=build_real/hpplite.dylib HPPLITE_ANVIL_RPC=... HPPLITE_ANVIL_FACTORY=... \
+  HPPLITE_ANVIL_KEY0=0x... HPPLITE_ANVIL_CHAINID=... HPPLITE_ORM_DIR=/tmp/wp/wordpress/wp-content/database \
+  python tests/orm/orm_common.py .ht.sqlite
+```
+
 ## Results (2026-10-30, anvil; PHP 8.4.23 static build, SQLite 3.45.2)
 
 - `wp core install`: installed. One statement refused, by design (#53): the
@@ -31,3 +40,13 @@ $P /tmp/wp/wp-cli.phar --path=/tmp/wp/wordpress core install --url=http://localh
 - A replica rebuilt from the chain alone equals WordPress's database: 22
   tables, 908 rows, same state root; the checkpoint root at batch 100 was
   compared too.
+
+## HPP Sepolia (2026-10-30)
+
+The same session (`session.sh`) on a fresh WordPress and a fresh wallet: no
+refusals but the installer's REGEXP one, no HPPLite errors, every WP-CLI
+command and REST write (5 posts, a comment: 201) through. A replica rebuilt
+from HPP Sepolia alone equals WordPress's database: 22 tables, 909 rows,
+153 batches, same root, the checkpoint root compared. 506 transactions,
+0.0081 ETH: each of the ~75 PHP processes claims the lease when it opens the
+database and posts what it wrote when it closes.
