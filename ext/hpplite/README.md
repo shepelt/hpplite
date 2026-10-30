@@ -422,7 +422,6 @@ a hundred batches later:
 | a write that calls a function the application registered (`sqlite3_create_function`, Python `create_function`; Django's `django_date_extract` behind `filter(due__month=3).update(...)`), directly or through a view, trigger, generated column or expression index | a replica has SQLite's functions only, so the statement could not run there (#53) | compute the value in the application and bind it, or filter with a built-in (`due__year`, a range); reads may call it |
 | `ATTACH` | writes to another file are not captured | one database per file |
 | writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
-| a single statement larger than one DA batch as posted (default 128 KB after JSON escaping and the envelope) | it could never be posted | split the statement (a multi-row `INSERT` into several); bulk-load before `hpplite=on` |
 
 **What a refusal looks like.** The driver reports only SQLite's code:
 `interrupted` (`SQLITE_INTERRUPT`) or `not authorized` (`SQLITE_AUTH`) - in
@@ -457,9 +456,10 @@ VFS, which it is unless the application names another one (`vfs=` in the URI,
 or a VFS registered as default after HPPLite was loaded); there, clock SQL in
 writes is still refused.
 
-**Transactions of any size are supported.** One larger than a DA batch (a
-seed script, `bulk_create` of thousands of rows, a data migration) is posted
-across several batches: the batch it starts in is marked open, the ones it
+**Transactions and statements of any size are supported.** One larger than
+a DA batch (a seed script, `bulk_create` of thousands of rows, a data
+migration, a multi-row `INSERT` an ORM builds from a list - one statement
+can be larger than a batch, #59) is posted across several batches: the batch it starts in is marked open, the ones it
 continues in say so, and a replica applies it only when its last part has
 arrived - a reader never sees part of it. If the writer dies with the rest
 in a log nobody else has, replicas drop the held part whole and count it in

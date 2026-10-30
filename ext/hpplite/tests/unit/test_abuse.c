@@ -948,7 +948,7 @@ static void test_json_fuzz(void) {
 ** 3. Size limits
 ** ---------------------------------------------------------------------- */
 static void test_escaped_size_limit(void) {
-    TEST("capture measures the statement as posted: quote-heavy SQL cannot overflow a batch");
+    TEST("quote-heavy SQL larger than a batch as posted: accepted, posted in pieces within the limit (#59)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     const size_t LIMIT = 4096;
@@ -966,9 +966,7 @@ static void test_escaped_size_limit(void) {
     at += (size_t)snprintf(sql + at, LIMIT - at, "')");
     if (at >= LIMIT - 200) FAIL("test statement too long for the limit");
     int rc = sqlite3_exec(n->db, sql, NULL, NULL, NULL);
-    if (rc == SQLITE_OK) FAIL("a statement whose escaped form exceeds the batch was accepted");
-    if (count_rows(n->db, "t") != 0) FAIL("refused statement left a row");
-    if (hpplite_node_pending_count(n) != 0) FAIL("refused statement left a log entry");
+    if (rc != SQLITE_OK) FAIL("a statement whose escaped form exceeds the batch was refused");
 
     /* same raw length, plain characters: accepted, and the batch as posted fits */
     at = (size_t)snprintf(sql, LIMIT, "INSERT INTO t VALUES('");
@@ -992,9 +990,17 @@ static void test_escaped_size_limit(void) {
         if (len > LIMIT) FAILF("batch %d is %zu bytes as posted, limit %zu", h, len, LIMIT);
     }
     if (hpplite_node_pending_count(n) != 0) FAIL("pending rows left after flushing");
-    if (count_rows(n->db, "t") != 1 + secondAccepted) FAIL("row count");
+    if (count_rows(n->db, "t") != 2 + secondAccepted) FAIL("row count");
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node_ex(DIR "/size_replica.db", l1, LIMIT, 0);
+    if (!r) FAIL("replica");
+    hpplite_node_get_state_root(r, rb);
+    int rrows = count_rows(r->db, "t");
+    hpplite_node_destroy(r);
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
+    if (rrows != 2 + secondAccepted || memcmp(ra, rb, 32) != 0) FAIL("replica differs (escapes cut wrong?)");
     PASS();
 }
 

@@ -63,6 +63,8 @@ struct HppliteCtx {
   int nReplicaFns;            /* ...count; -1 = unknown (pragma_function_list unavailable) */
   int nDdlGen;                /* DDL captured on this connection (invalidates the verdicts) */
   sqlite3_int64 openTxnId;    /* Writer: log id of the group the last posted batch left open (#57) */
+  sqlite3_int64 fragId;       /* Writer: log id of the statement the last posted batch ended a piece of (#59) */
+  size_t fragOff;             /* ...bytes of its text posted so far */
   int nCarry;                 /* Replica: statements held back from an open group (_hpplite_carry) */
   uint64_t nTxnsDropped;      /* Replica: transactions dropped because their other part never came */
   struct HppliteFnVerdict {   /* Function check of a write, by statement text and schema */
@@ -143,6 +145,11 @@ int hpplite_internal_open_active(void);
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */
 #define HPPLITE_POSTED_KEEP 32
+/* A statement cut into pieces (#59): what the flag adds to an entry, what an
+** entry's framing costs, the smallest piece worth starting in a batch */
+#define HPPLITE_FRAG_FLAG_BYTES 9
+#define HPPLITE_FRAG_ENTRY_BYTES 128
+#define HPPLITE_FRAG_MIN 512
 uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen);
 /* Why the last hpplite_init() failed, when it knows (NULL otherwise) */
 const char *hpplite_init_error(void);

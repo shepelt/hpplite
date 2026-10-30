@@ -28,8 +28,9 @@ c.commit()
 c.execute("UPDATE notes SET body = body || '!' WHERE id % 7 = 0")
 c.commit()
 assert c.execute("SELECT pending FROM hpplite_status").fetchone()[0] == 302
-assert c.execute("SELECT hpplite_flush()").fetchone()[0] == 1
-assert c.execute("SELECT height, pending FROM hpplite_status").fetchone() == (2, 0)
+h = c.execute("SELECT hpplite_flush()").fetchone()[0]       # the last height posted (40 KB batches: maybe 2)
+assert h >= 1, h
+assert c.execute("SELECT height, pending FROM hpplite_status").fetchone() == (h + 1, 0)
 # a rolled-back transaction leaves no trace
 c.execute("INSERT INTO notes(body, n) VALUES('never', -1)")
 c.rollback()
@@ -39,6 +40,6 @@ c.commit()
 c.close()                                          # flushes batch 2
 
 c = sqlite3.connect(uri, uri=True)
-assert c.execute("SELECT height, pending, (SELECT count(*) FROM notes) FROM hpplite_status").fetchone() == (3, 0, 290)
+assert c.execute("SELECT height, pending, (SELECT count(*) FROM notes) FROM hpplite_status").fetchone() == (h + 2, 0, 290)
 c.close()
 print("python smoke: ok")

@@ -629,28 +629,33 @@ static void test_batch_size_limit(void) {
     r->l1 = NULL;
     hpplite_node_destroy(r);
 
-    /* a single statement that cannot fit is refused when it runs (the app
-    ** sees SQLITE_INTERRUPT) instead of stalling every later batch forever */
+    /* a single statement larger than a batch is posted in pieces (#59):
+    ** accepted, inside a transaction too, and rebuilt whole by a reader */
     char huge[3600];
     memset(huge, 'y', 3500); huge[3500] = 0;
     char *big = sqlite3_mprintf("INSERT INTO t VALUES(99,'%s')", huge);
     int rc = sqlite3_exec(n->db, big, NULL, NULL, NULL);
     sqlite3_free(big);
-    if (rc != SQLITE_INTERRUPT) { printf("(rc=%d) ", rc); FAIL("oversized statement should fail with SQLITE_INTERRUPT"); }
-    if (count_rows(n->db, "t") != 32) FAIL("refused statement must not be applied");
-    if (hpplite_node_pending_count(n) != 0) FAIL("refused statement must not be logged");
-    if (n->ctx->nLogErrors == 0) FAIL("oversized statement should be reported");
-    /* the same inside an explicit transaction: the transaction is gone, the app knows */
+    if (rc != SQLITE_OK) { printf("(rc=%d) ", rc); FAIL("a statement larger than a batch was refused"); }
     sqlite3_exec(n->db, "BEGIN; INSERT INTO t VALUES(100,'ok')", NULL, NULL, NULL);
     big = sqlite3_mprintf("INSERT INTO t VALUES(101,'%s')", huge);
     rc = sqlite3_exec(n->db, big, NULL, NULL, NULL);
     sqlite3_free(big);
-    if (rc != SQLITE_INTERRUPT) FAIL("oversized statement in a transaction should fail");
-    if (!sqlite3_get_autocommit(n->db)) sqlite3_exec(n->db, "ROLLBACK", NULL, NULL, NULL);
-    if (count_rows(n->db, "t") != 32 || hpplite_node_pending_count(n) != 0) FAIL("nothing from the aborted transaction survives");
+    if (rc != SQLITE_OK) FAIL("the same inside a transaction was refused");
+    sqlite3_exec(n->db, "COMMIT", NULL, NULL, NULL);
+    if (count_rows(n->db, "t") != 35) FAIL("rows");
     /* later writes flow normally */
     hpplite_node_exec(n, "INSERT INTO t VALUES(102,'after')", NULL);
-    if (hpplite_node_flush_batch(n) == 0) FAIL("writes after a refused statement must still flush");
+    if (hpplite_node_flush_batch(n) == 0) FAIL("writes after a large statement must still flush");
+    if (hpplite_node_pending_count(n) != 0) FAIL("pending left");
+    unsigned char rootW[32], rootR2[32];
+    hpplite_node_get_state_root(n, rootW);
+    HppliteNode *r2 = open_node(DIR "/chunks_reader2.db", l1);
+    if (!r2) FAIL("open reader 2");
+    int rows2 = count_rows(r2->db, "t");
+    hpplite_node_get_state_root(r2, rootR2);
+    hpplite_node_destroy(r2);
+    if (rows2 != 36 || memcmp(rootW, rootR2, 32) != 0) { printf("(rows %d) ", rows2); FAIL("a reader did not rebuild the large statements"); }
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
     PASS();

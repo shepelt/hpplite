@@ -93,6 +93,7 @@ int hpplite_batch_add_stmt(HppliteBatch *pBatch, const char *zSql, int64_t nRows
   pBatch->aTxns[pBatch->nTxns].txn = txn;
   pBatch->aTxns[pBatch->nTxns].mode = 0;
   pBatch->aTxns[pBatch->nTxns].now = 0;
+  pBatch->aTxns[pBatch->nTxns].frag = 0;
   pBatch->nTxns++;
 
   return 0;
@@ -166,6 +167,23 @@ static size_t json_escaped_len(const char *zIn) {
   return n;
 }
 
+size_t hpplite_json_prefix_fit(const char *zIn, size_t budget) {
+  size_t n = 0, i, cut = 0;
+  for (i = 0; zIn[i]; i++) {
+    unsigned char c = (unsigned char)zIn[i];
+    size_t w;
+    switch (c) {
+      case '"': case '\\': case '\b': case '\f': case '\n': case '\r': case '\t': w = 2; break;
+      default: w = c < 0x20 ? 6 : 1;
+    }
+    if (n + w > budget) break;
+    n += w;
+    /* a cut may fall before the next byte unless that byte continues a character */
+    if (((unsigned char)zIn[i + 1] & 0xc0) != 0x80) cut = i + 1;
+  }
+  return cut;
+}
+
 size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn) {
   /*    {"sql":"...","txn":N[,"mode":K][,"now":T][,"rows_affected":M]},
   ** "mode" and "now" are counted always: the caller does not know it, and 9 bytes
@@ -224,6 +242,7 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
     if (pBatch->aTxns[i].now) {
       sqlite3_str_appendf(pStr, ",\"now\":%lld", (long long)pBatch->aTxns[i].now);
     }
+    if (pBatch->aTxns[i].frag) sqlite3_str_appendf(pStr, ",\"frag\":1");
     if (pBatch->aTxns[i].nRowsAffected >= 0) {
       sqlite3_str_appendf(pStr, ",\"rows_affected\":%lld",
                           (long long)pBatch->aTxns[i].nRowsAffected);
@@ -407,6 +426,7 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         int64_t txn = pBatch->nTxns;  /* Older batches: one group per statement */
         int64_t mode = 0;             /* Batches without it: default connection state */
         int64_t now = 0;              /* Batches without it: the statement did not read the clock */
+        int64_t frag = 0;             /* a whole statement unless it says it is a piece (#59) */
 
         while (*p && *p != '}') {
           p = json_skip_ws(p);
@@ -429,6 +449,8 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
             mode = json_parse_number(&p);
           } else if (strcmp(txKey, "now") == 0) {
             now = json_parse_number(&p);
+          } else if (strcmp(txKey, "frag") == 0) {
+            frag = json_parse_number(&p);
           } else {
             /* Skip unknown value */
             if (*p == '"') {
@@ -448,6 +470,7 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
             /* unknown bits are kept: replay refuses what it cannot apply */
             pBatch->aTxns[pBatch->nTxns - 1].mode = (int)(mode & 0x7fffffff);
             pBatch->aTxns[pBatch->nTxns - 1].now = now;
+            pBatch->aTxns[pBatch->nTxns - 1].frag = frag != 0;
           }
           sqlite3_free(zSql);
         }

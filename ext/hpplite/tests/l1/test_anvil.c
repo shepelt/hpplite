@@ -298,25 +298,34 @@ static void test_edge_sql_end_to_end(void) {
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("corpus batch not posted"); }
 
     /* one statement at exactly the per-statement limit, alone in its batch:
-    ** the largest batch the node will ever post, on the real contract */
+    ** the largest batch the node will ever post, on the real contract; and
+    ** one a byte over it, posted in pieces (#59) */
     sqlite3_exec(w, "CREATE TABLE big(v)", NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("flush before the big statement"); }
+    uint64_t hBig0 = (uint64_t)scalar(w, "SELECT height FROM hpplite_status");
     char *atLimit = sized_insert(stmtLimit);
     char *overLimit = sized_insert(stmtLimit + 1);
     if (!atLimit || !overLimit) { sqlite3_close(w); FAIL("could not build statements of the target size"); }
-    int rcOver = sqlite3_exec(w, overLimit, NULL, NULL, NULL);
     int rcAt = sqlite3_exec(w, atLimit, NULL, NULL, NULL);
+    uint64_t hAt = rcAt == SQLITE_OK ? (uint64_t)scalar(w, "SELECT hpplite_flush()") : 0;
+    int rcOver = sqlite3_exec(w, overLimit, NULL, NULL, NULL);
     free(atLimit); free(overLimit);
-    if (rcOver == SQLITE_OK) { sqlite3_close(w); FAIL("a statement one byte over the limit was accepted"); }
     if (rcAt != SQLITE_OK) { sqlite3_close(w); FAIL("a statement exactly at the limit was refused"); }
+    if (rcOver != SQLITE_OK) { sqlite3_close(w); FAIL("a statement one byte over the limit was refused (#59: pieces)"); }
     uint64_t hBig = (uint64_t)scalar(w, "SELECT hpplite_flush()");
-    if (hBig == 0) { dump_state(nw->l1, nw->instanceId, "big flush"); sqlite3_close(w); FAIL("the contract did not take a batch at the size limit (gas or size)"); }
-    size_t bigLen = 0;
-    uint8_t *raw = hpplite_l1_get_batch(nw->l1, hBig, &bigLen);
-    free(raw);
-    printf("(limit %zu, largest batch %zu) ", limit, bigLen);
+    if (hAt == 0 || hBig == 0) { dump_state(nw->l1, nw->instanceId, "big flush"); sqlite3_close(w); FAIL("the contract did not take the large batches (gas or size)"); }
+    if (hBig < hAt + 2) { sqlite3_close(w); FAIL("the statement over the limit did not span batches"); }
+    size_t bigLen = 0, atLen = 0;
+    for (uint64_t h = hBig0; h <= hBig; h++) {
+        size_t len = 0;
+        uint8_t *raw = hpplite_l1_get_batch(nw->l1, h, &len);
+        free(raw);
+        if (len > bigLen) bigLen = len;
+        if (h == hAt) atLen = len;
+    }
+    printf("(limit %zu, at-limit batch %zu, largest %zu) ", limit, atLen, bigLen);
     if (bigLen > limit) { sqlite3_close(w); FAIL("posted batch over the contract's limit"); }
-    if (bigLen < limit - limit / 20) { sqlite3_close(w); FAIL("the at-limit batch is not near the limit: the test is not exercising it"); }
+    if (bigLen < limit - limit / 20) { sqlite3_close(w); FAIL("no batch near the limit: the test is not exercising it"); }
 
     /* a backlog of escape-heavy rows that fills several batches */
     uint64_t hBefore = (uint64_t)scalar(w, "SELECT height FROM hpplite_status");

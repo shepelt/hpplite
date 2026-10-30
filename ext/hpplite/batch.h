@@ -27,6 +27,7 @@ struct HppliteTxn {
   int64_t txn;             /* Transaction group within the batch (0, 1, ...) */
   int mode;                /* Connection state the statement ran under (HPPLITE_MODE_*) */
   int64_t now;             /* The time it read, Julian day ms (0 = it did not read the clock; #56) */
+  int frag;                /* A piece of a statement that continues in the next entry/batch (#59) */
 };
 
 /*
@@ -53,6 +54,8 @@ struct HppliteBatch {
   int64_t openGroup;                         /* Writer only, not posted: log id of the open group */
   const uint8_t *pPosted;                    /* Writer only: the bytes posted for it (kept for a reorg) */
   size_t nPosted;
+  int64_t fragRow;                           /* Writer only: log id of the statement it ends a piece of */
+  size_t fragOff;                            /* ...and how many bytes of its text are posted after it */
   int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */
 };
 
@@ -83,6 +86,12 @@ typedef enum {
 ** Create a new empty batch
 */
 HppliteBatch *hpplite_batch_new(uint64_t height);
+
+/*
+** The longest prefix of zIn whose JSON-escaped size is at most budget,
+** ending on a UTF-8 character boundary (a statement cut into pieces, #59).
+*/
+size_t hpplite_json_prefix_fit(const char *zIn, size_t budget);
 
 /*
 ** Free a batch and all its transactions

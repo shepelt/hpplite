@@ -50,30 +50,32 @@ having no checkpoint root yet, the status columns), now in the README.
 
 ## Results
 
-Rerun from scratch after the fixes, on a local chain: every replica equal to
-its writer (height, root, schema, every row).
+Rerun from scratch after the fixes; every replica equal to its writer
+(height, root, schema, every row). HPP Sepolia: 2026-10-30, fresh wallet per
+app, ~0.004 ETH of gas per app.
 
-| App | Stack | Local chain (anvil) |
-|-----|-------|---------------------|
-| tasks | FastAPI + SQLAlchemy + Alembic | equal |
-| booking | Django | equal |
-| shortener | Flask + sqlite3 | equal |
-| inventory | Express + Knex | equal |
-| forum | Drizzle on node:sqlite | equal |
-| habits | node:http + node:sqlite | equal |
+| App | Stack | Local chain (anvil) | HPP Sepolia |
+|-----|-------|---------------------|-------------|
+| tasks | FastAPI + SQLAlchemy + Alembic | equal | equal (26 batches) |
+| booking | Django | equal | equal (9) |
+| shortener | Flask + sqlite3 | equal | equal (22) |
+| inventory | Express + Knex | equal | equal (45; its 72 KB import statement in pieces, #59) |
+| forum | Drizzle on node:sqlite | equal | equal (28) |
+| habits | node:http + node:sqlite | equal | equal (21) |
 
-## HPP Sepolia
+## What HPP Sepolia found
 
-The first run on HPP Sepolia failed for all six, and found what anvil could
-not: HPP Sepolia caps a transaction at 32M gas (its block limit is 2^50), so
-any batch over ~44 KB of contract storage ran out of gas, reverted and was
+The first run there failed for all six, and found what anvil could not: HPP
+Sepolia caps a transaction at 32M gas (its block limit is 2^50), so any
+batch over ~44 KB of contract storage ran out of gas, reverted and was
 retried forever, each attempt spending the whole 32M. HPPLite now cuts
-batches at 40 KB there and never sends one whose estimate is over the cap
-(see the README's Gas Costs). A 1000-row, ~120 KB transaction then posted as
-six batches of ~29 KB, every one confirmed. The six apps on HPP Sepolia are
-still to be rerun: they need ~0.03 ETH of testnet gas between them, more
-than the test wallet holds after that first run.
+batches at 40 KB there and never sends one that cannot fit (a2883a157b).
+That made a single statement larger than ~39 KB impossible - inventory's
+500-row Knex insert is one 72 KB statement - so statements now span batches
+too (#59). forum's own script waited 30 s for its 3000-post seed to post
+(tuned on anvil; HPP confirms a batch every ~1.6 s); its wait alone was
+lengthened to 3 minutes, nothing else in the app or its checks changed.
 
-Funding: `newkey_sepolia.sh` funds each wallet with 0.003 ETH (override with
-HPPLITE_STIPEND) and records its key in `.keys` (git-ignored);
-`sweep_sepolia.sh` returns what is left afterwards.
+Funding: `newkey_sepolia.sh` funds each wallet (0.003 ETH, HPPLITE_STIPEND
+overrides) and records its key in `.keys` (git-ignored); `sweep_sepolia.sh`
+returns what is left afterwards.

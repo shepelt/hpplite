@@ -172,7 +172,9 @@ static const char *HPPLITE_SCHEMA =
   "  state_root BLOB NOT NULL,"
   "  last_checkpoint_height INTEGER NOT NULL DEFAULT 0,"
   "  last_checkpoint_root BLOB,"
-  "  open_txn INTEGER NOT NULL DEFAULT 0"   /* writer: group left open by the last posted batch (#57) */
+  "  open_txn INTEGER NOT NULL DEFAULT 0,"  /* writer: group left open by the last posted batch (#57) */
+  "  frag_id INTEGER NOT NULL DEFAULT 0,"   /* writer: log row whose text is posted in part (#59) */
+  "  frag_off INTEGER NOT NULL DEFAULT 0"   /* ...bytes of it posted */
   ");"
   "INSERT OR IGNORE INTO _hpplite_meta(id, next_height, prev_block_hash, state_root)"
   "  VALUES(1, 1, zeroblob(32), zeroblob(32));"
@@ -187,7 +189,8 @@ static const char *HPPLITE_SCHEMA =
   "  seq INTEGER PRIMARY KEY,"
   "  sql TEXT NOT NULL,"
   "  mode INTEGER NOT NULL DEFAULT 0,"
-  "  now INTEGER NOT NULL DEFAULT 0"
+  "  now INTEGER NOT NULL DEFAULT 0,"
+  "  frag INTEGER NOT NULL DEFAULT 0"
   ");"
   "CREATE TABLE IF NOT EXISTS _hpplite_pending("
   "  id INTEGER PRIMARY KEY,"
@@ -246,7 +249,7 @@ static int loadMeta(HppliteCtx *pCtx) {
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT next_height, prev_block_hash, state_root,"
     "       last_checkpoint_height, last_checkpoint_root, open_txn,"
-    "       (SELECT count(*) FROM _hpplite_carry)"
+    "       (SELECT count(*) FROM _hpplite_carry), frag_id, frag_off"
     "  FROM _hpplite_meta WHERE id=1", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) {
@@ -257,6 +260,8 @@ static int loadMeta(HppliteCtx *pCtx) {
       columnHash(pStmt, 4, pCtx->lastCheckpointRoot);
       pCtx->openTxnId = sqlite3_column_int64(pStmt, 5);
       pCtx->nCarry = sqlite3_column_int(pStmt, 6);
+      pCtx->fragId = sqlite3_column_int64(pStmt, 7);
+      pCtx->fragOff = (size_t)sqlite3_column_int64(pStmt, 8);
     }
     sqlite3_finalize(pStmt);
   }
@@ -1287,19 +1292,8 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     refuseStatement(pCtx, "cannot expand bound parameters (out of memory?)", zSql);
     return 0;
   }
-  if (pCtx->maxStmtBytes > 0) {
-    size_t sz = hpplite_batch_stmt_json_size(zExpanded, -1, 0);
-    char why[160];
-    if (sz > pCtx->maxStmtBytes) {
-      snprintf(why, sizeof(why), "statement of %zu bytes (as posted) exceeds what one DA batch can carry (%zu)",
-               sz, pCtx->maxStmtBytes);
-      refuseStatement(pCtx, why, zSql);
-      sqlite3_free(zExpanded);
-      return 0;
-    }
-    /* A transaction larger than a batch is posted across several (#57):
-    ** only a single statement has to fit */
-  }
+  /* No size limit here: a transaction larger than a batch spans several
+  ** (#57), and so does a statement - its text is posted in pieces (#59) */
 
   if (pCtx->bClockPin && slot < 0) {
     int i;
@@ -1499,6 +1493,10 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "open_txn");
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_pending", "now");
   if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "now");
+  /* #59: statements posted in pieces */
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);
     return rc;
@@ -1662,6 +1660,7 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
       sha256_update(&h, (const uint8_t*)"N", 1);
       hashU64(&h, (uint64_t)pBatch->aTxns[i].now);
     }
+    if (pBatch->aTxns[i].frag) sha256_update(&h, (const uint8_t*)"F", 1);
   }
   sha256_final(&h, pOut);
 }
@@ -1767,7 +1766,8 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   sqlite3_stmt *pStmt = NULL;
   sqlite3_int64 *aId = NULL, *aGroup = NULL;   /* per row read: log id, absolute group */
   sqlite3_int64 maxId = 0, lastTxn = -1, txnRel = -1, breakGroup = 0;
-  int rc, nAlloc = 0, nRead = 0, haveBreak = 0;
+  int rc, nAlloc = 0, nRead = 0, haveBreak = 0, split = 0;
+  size_t splitStart = 0;                        /* where in its row's text the last entry starts */
 
   if (!pCtx) return NULL;
   if (bkBegin(pCtx, 0) != SQLITE_OK) return NULL;
@@ -1783,20 +1783,41 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
     -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
+      sqlite3_int64 id = sqlite3_column_int64(pStmt, 0);
       sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
       const char *zSql = (const char*)sqlite3_column_text(pStmt, 2);
+      const char *zText = zSql ? zSql : "";
+      size_t off = 0, pieceLen = 0;
+      int piece = 0;
       if (!pBatch) {
         pBatch = hpplite_batch_new(pCtx->blockHeight);
         if (!pBatch) break;
       }
+      /* the statement the last batch posted part of continues where it stopped (#59) */
+      if (pCtx->fragId && id == pCtx->fragId && pCtx->fragOff <= strlen(zText)) {
+        off = pCtx->fragOff;
+        zText += off;
+      }
       if (maxBytes > 0) {
-        estSize += hpplite_batch_stmt_json_size(zSql, -1, txnRel);
-        if (estSize > maxBytes && pBatch->nTxns > 0) {
-          overLimit = 1;          /* this row starts the next batch */
-          breakGroup = txn;
-          haveBreak = 1;
-          break;
+        size_t sz = hpplite_batch_stmt_json_size(zText, -1, txnRel) + HPPLITE_FRAG_FLAG_BYTES;
+        if (estSize + sz > maxBytes) {
+          /* One that could not fit even an empty batch is cut into pieces:
+          ** this batch carries what fits, the next ones the rest (#59).
+          ** One that fits a batch of its own starts the next batch. */
+          size_t alone = maxBytes > hpplite_batch_json_overhead() ? maxBytes - hpplite_batch_json_overhead() : 0;
+          size_t room = maxBytes > estSize + HPPLITE_FRAG_ENTRY_BYTES ? maxBytes - estSize - HPPLITE_FRAG_ENTRY_BYTES : 0;
+          if (sz > alone && room >= HPPLITE_FRAG_MIN) {
+            pieceLen = hpplite_json_prefix_fit(zText, room);
+            if (pieceLen > 0 && zText[pieceLen]) piece = 1;
+          }
+          if (!piece && pBatch->nTxns > 0) {
+            overLimit = 1;          /* this row starts the next batch */
+            breakGroup = txn;
+            haveBreak = 1;
+            break;
+          }
         }
+        estSize += sz;
       }
       if (pBatch->nTxns >= nAlloc) {
         sqlite3_int64 *aNew, *aNewG;
@@ -1809,17 +1830,32 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
         aGroup = aNewG;
       }
       if (txn != lastTxn) { txnRel++; lastTxn = txn; }
-      hpplite_batch_add_stmt(pBatch, zSql, -1, txnRel);
+      if (piece) {
+        char *zPiece = sqlite3_mprintf("%.*s", (int)pieceLen, zText);
+        hpplite_batch_add_stmt(pBatch, zPiece ? zPiece : "", -1, txnRel);
+        sqlite3_free(zPiece);
+        pBatch->aTxns[pBatch->nTxns - 1].frag = 1;
+      } else {
+        hpplite_batch_add_stmt(pBatch, zText, -1, txnRel);
+      }
       pBatch->aTxns[pBatch->nTxns - 1].mode = sqlite3_column_int(pStmt, 3);
       pBatch->aTxns[pBatch->nTxns - 1].now = sqlite3_column_int64(pStmt, 4);
-      aId[pBatch->nTxns - 1] = sqlite3_column_int64(pStmt, 0);
+      aId[pBatch->nTxns - 1] = id;
       aGroup[pBatch->nTxns - 1] = txn;
       nRead = pBatch->nTxns;
       /* the first group continues the one the last posted batch left open */
       if (pBatch->nTxns == 1 && pCtx->openTxnId != 0 && txn == pCtx->openTxnId) pBatch->contTxn = 1;
+      if (piece) {
+        split = 1;
+        splitStart = off;
+        pBatch->fragRow = id;
+        pBatch->fragOff = off + pieceLen;
+        break;                      /* the rest of it starts the next batch */
+      }
     }
     sqlite3_finalize(pStmt);
   }
+  if (pBatch && split) pBatch->partial = 1;
   if (pBatch && overLimit) {
     /* The size estimate stopped the read inside a transaction group: move
     ** the group whole to the next batch when it began after other groups
@@ -1860,6 +1896,16 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       size_t n = zJson ? strlen(zJson) : 0;
       sqlite3_free(zJson);
       if (n <= maxBytes) break;
+      if (pBatch->aTxns[pBatch->nTxns - 1].frag) {
+        /* the estimate was short: cut the piece shorter, never drop it */
+        HppliteTxn *t = &pBatch->aTxns[pBatch->nTxns - 1];
+        size_t have = strlen(t->zSql), over = n - maxBytes + 64;
+        size_t keep = hpplite_json_prefix_fit(t->zSql, have > over ? have - over : 0);
+        if (keep == 0) { hpplite_batch_free(pBatch); pBatch = NULL; break; }
+        t->zSql[keep] = 0;
+        pBatch->fragOff = splitStart + keep;
+        continue;
+      }
       if (pBatch->nTxns <= 1) {
         pCtx->nLogErrors++;
         fprintf(stderr, "hpplite: statement of %zu bytes exceeds the batch size limit (%zu); left pending\n",
@@ -1877,14 +1923,18 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       pBatch->hasRoot = 0;
       memset(pBatch->postStateRoot, 0, HPPLITE_HASH_SIZE);
     }
-    if (pBatch && pBatch->partial && pBatch->nTxns < nFull
+    if (pBatch && pBatch->partial && pBatch->nTxns < nFull && !split
         && aGroup[pBatch->nTxns] == aGroup[pBatch->nTxns - 1]) {
       /* the serialization cut landed inside a group: same rule */
       cutToGroupStart(pBatch);
     }
   }
 
-  if (pBatch && pBatch->partial) {
+  if (pBatch && split) {
+    /* ends in a piece: its statement, so its group, continues */
+    pBatch->openTxn = 1;
+    pBatch->openGroup = aGroup[pBatch->nTxns - 1];
+  } else if (pBatch && pBatch->partial) {
     /* Open: the first row left out belongs to the last group kept */
     sqlite3_int64 next = 0;
     int haveNext = 0;
@@ -1917,7 +1967,8 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       sqlite3_free(a);
     }
   }
-  if (pBatch) maxId = aId[pBatch->nTxns - 1];
+  /* the rows posted whole; a piece's row stays pending until its last piece */
+  if (pBatch) maxId = split ? (pBatch->nTxns >= 2 ? aId[pBatch->nTxns - 2] : 0) : aId[pBatch->nTxns - 1];
   sqlite3_free(aId);
   sqlite3_free(aGroup);
   if (pMaxId) *pMaxId = maxId;
@@ -1942,7 +1993,7 @@ sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
 ** Advance _hpplite_meta past pBatch and optionally delete pending rows.
 ** Caller holds a bookkeeping write transaction.
 */
-static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
+static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter) {
   unsigned char blockHash[HPPLITE_HASH_SIZE];
   sqlite3_stmt *pStmt;
   int rc;
@@ -1959,7 +2010,7 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     if (rc != SQLITE_DONE) return rc;
   }
 
-  if (maxId > 0 && pBatch->pPosted && pBatch->nPosted) {
+  if (bWriter && pBatch->pPosted && pBatch->nPosted) {
     /* keep the last HPPLITE_POSTED_KEEP batches as posted */
     rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)",
                             -1, &pStmt, NULL);
@@ -1983,7 +2034,7 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     pCtx->nNoClock = k;
     sqlite3_mutex_leave(pCtx->pNoClockMutex);
   }
-  if (maxId > 0 && pCtx->nCarry > 0) {
+  if (bWriter && pCtx->nCarry > 0) {
     /* we post now: a part held from another writer's open transaction will
     ** never be continued (its replicas drop it on this batch too) */
     rc = sqlite3_exec(pCtx->bkDb, "DELETE FROM _hpplite_carry", NULL, NULL, NULL);
@@ -1994,8 +2045,9 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
 
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     pBatch->hasRoot
-      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, state_root=?3 WHERE id=1"
-      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4 WHERE id=1",
+      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6,"
+        " state_root=?3 WHERE id=1"
+      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6 WHERE id=1",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) return rc;
   sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(pBatch->height + 1));
@@ -2004,13 +2056,18 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
   }
   /* writer: the group this batch leaves open, continued by the next one */
-  sqlite3_bind_int64(pStmt, 4, (maxId > 0 && pBatch->openTxn) ? pBatch->openGroup : 0);
+  sqlite3_bind_int64(pStmt, 4, (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0);
+  /* writer: the statement this batch ends a piece of, and how far it is posted */
+  sqlite3_bind_int64(pStmt, 5, bWriter ? pBatch->fragRow : 0);
+  sqlite3_bind_int64(pStmt, 6, bWriter ? (sqlite3_int64)pBatch->fragOff : 0);
   rc = sqlite3_step(pStmt);
   sqlite3_finalize(pStmt);
   if (rc != SQLITE_DONE) return rc;
 
   pCtx->blockHeight = pBatch->height + 1;
-  pCtx->openTxnId = (maxId > 0 && pBatch->openTxn) ? pBatch->openGroup : 0;
+  pCtx->openTxnId = (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0;
+  pCtx->fragId = bWriter ? pBatch->fragRow : 0;
+  pCtx->fragOff = bWriter ? pBatch->fragOff : 0;
   memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
   if (pBatch->hasRoot) {
     memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
@@ -2046,7 +2103,7 @@ int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3
   if (rc != SQLITE_OK) return rc;
   {
     int saved = bkEnter(pCtx);
-    rc = advanceMeta(pCtx, pBatch, maxId);
+    rc = advanceMeta(pCtx, pBatch, maxId, 1);
     bkLeave(pCtx, saved);
   }
   return bkEnd(pCtx, rc);
@@ -2108,21 +2165,21 @@ static int connectionMode(sqlite3 *db) {
 ** transaction is lost, never half of it - as if the writer had crashed
 ** before posting it.
 */
-typedef struct ReplayStmt { const char *zSql; int mode; sqlite3_int64 group; sqlite3_int64 now; } ReplayStmt;
+typedef struct ReplayStmt { const char *zSql; int mode; sqlite3_int64 group; sqlite3_int64 now; int frag; } ReplayStmt;
 
-static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode, sqlite3_int64 **paNow) {
+static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode, sqlite3_int64 **paNow, int **paFrag) {
   sqlite3_stmt *q = NULL;
   int n = 0, cap = 0, rc;
   char **az = NULL;
-  int *am = NULL;
+  int *am = NULL, *af = NULL;
   sqlite3_int64 *an = NULL;
-  *pazSql = NULL; *paMode = NULL; *paNow = NULL;
+  *pazSql = NULL; *paMode = NULL; *paNow = NULL; *paFrag = NULL;
   if (pCtx->nCarry <= 0) return 0;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT sql, mode, now FROM _hpplite_carry ORDER BY seq", -1, &q, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT sql, mode, now, frag FROM _hpplite_carry ORDER BY seq", -1, &q, NULL);
   if (rc != SQLITE_OK) return -1;
   while (sqlite3_step(q) == SQLITE_ROW) {
     if (n == cap) {
-      char **az2; int *am2; sqlite3_int64 *an2;
+      char **az2; int *am2, *af2; sqlite3_int64 *an2;
       cap = cap ? cap * 2 : 64;
       az2 = sqlite3_realloc64(az, sizeof(char*) * cap);
       if (!az2) { n = -1; break; }
@@ -2133,14 +2190,18 @@ static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode, sqlite3_int
       an2 = sqlite3_realloc64(an, sizeof(sqlite3_int64) * cap);
       if (!an2) { n = -1; break; }
       an = an2;
+      af2 = sqlite3_realloc64(af, sizeof(int) * cap);
+      if (!af2) { n = -1; break; }
+      af = af2;
     }
     az[n] = sqlite3_mprintf("%s", (const char*)sqlite3_column_text(q, 0));
     am[n] = sqlite3_column_int(q, 1);
     an[n] = sqlite3_column_int64(q, 2);
+    af[n] = sqlite3_column_int(q, 3);
     n++;
   }
   sqlite3_finalize(q);
-  *pazSql = az; *paMode = am; *paNow = an;
+  *pazSql = az; *paMode = am; *paNow = an; *paFrag = af;
   return n;
 }
 
@@ -2149,12 +2210,13 @@ static int storeCarry(HppliteCtx *pCtx, const ReplayStmt *a, int n) {
   int rc, i;
   rc = sqlite3_exec(pCtx->bkDb, "DELETE FROM _hpplite_carry", NULL, NULL, NULL);
   if (rc != SQLITE_OK || n == 0) return rc;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT INTO _hpplite_carry(seq, sql, mode, now) VALUES(?1, ?2, ?3, ?4)", -1, &q, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT INTO _hpplite_carry(seq, sql, mode, now, frag) VALUES(?1, ?2, ?3, ?4, ?5)", -1, &q, NULL);
   for (i = 0; rc == SQLITE_OK && i < n; i++) {
     sqlite3_bind_int(q, 1, i);
     sqlite3_bind_text(q, 2, a[i].zSql, -1, SQLITE_STATIC);
     sqlite3_bind_int(q, 3, a[i].mode);
     sqlite3_bind_int64(q, 4, a[i].now);
+    sqlite3_bind_int(q, 5, a[i].frag);
     rc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
     sqlite3_reset(q);
   }
@@ -2170,6 +2232,9 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   char **azCarry = NULL;
   int *aCarryMode = NULL;
   sqlite3_int64 *aCarryNow = NULL;
+  int *aCarryFrag = NULL;
+  char **azJoined = NULL;                       /* statements joined from pieces (#59) */
+  int nJoined = 0;
   int nCarry, nRun = 0, nHold, firstEnd, holdFrom, carryChanged;
   sqlite3_int64 savedPin;
   unsigned savedSeen;
@@ -2195,14 +2260,16 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ** joins this batch's first group when it continues it */
   {
     int saved = bkEnter(pCtx);
-    nCarry = loadCarry(pCtx, &azCarry, &aCarryMode, &aCarryNow);
+    nCarry = loadCarry(pCtx, &azCarry, &aCarryMode, &aCarryNow, &aCarryFrag);
     bkLeave(pCtx, saved);
   }
   if (nCarry < 0) return SQLITE_NOMEM;
   aRun = sqlite3_malloc64(sizeof(ReplayStmt) * (size_t)(nCarry + pBatch->nTxns + 1));
   if (!aRun) {
     for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
-    sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
+    sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow); sqlite3_free(aCarryFrag);
+    for (i = 0; i < nJoined; i++) sqlite3_free(azJoined[i]);
+    sqlite3_free(azJoined);
     return SQLITE_NOMEM;
   }
   firstEnd = 0;
@@ -2217,6 +2284,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (nCarry > 0 && pBatch->contTxn) {
     for (i = 0; i < nCarry; i++) {
       aRun[nRun].zSql = azCarry[i]; aRun[nRun].mode = aCarryMode[i]; aRun[nRun].now = aCarryNow[i];
+      aRun[nRun].frag = aCarryFrag[i];
       aRun[nRun].group = pBatch->nTxns > 0 ? pBatch->aTxns[0].txn : 0;
       nRun++;
     }
@@ -2225,6 +2293,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     if (i < firstEnd && pBatch->contTxn && nCarry == 0) continue;   /* a continuation without its head */
     aRun[nRun].zSql = pBatch->aTxns[i].zSql; aRun[nRun].mode = pBatch->aTxns[i].mode;
     aRun[nRun].now = pBatch->aTxns[i].now;
+    aRun[nRun].frag = pBatch->aTxns[i].frag;
     aRun[nRun].group = pBatch->aTxns[i].txn;
     nRun++;
   }
@@ -2232,6 +2301,35 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     pCtx->nTxnsDropped++;
     fprintf(stderr, "hpplite: batch %llu continues a transaction this replica does not hold; "
             "its %d statements here are dropped with it\n", (unsigned long long)pBatch->height, firstEnd);
+  }
+  /* Pieces of a statement (#59) become the statement once its last piece is
+  ** here; pieces whose statement continues in the next batch stay pieces,
+  ** held with their open group */
+  {
+    int r = 0, k = 0;
+    while (r < nRun) {
+      int e = r;
+      if (!aRun[r].frag) { aRun[k++] = aRun[r++]; continue; }
+      while (e < nRun && aRun[e].frag) e++;
+      if (e == nRun) { while (r < nRun) aRun[k++] = aRun[r++]; break; }
+      {
+        sqlite3_str *js = sqlite3_str_new(NULL);
+        char *z;
+        int m;
+        for (m = r; m <= e; m++) sqlite3_str_appendall(js, aRun[m].zSql ? aRun[m].zSql : "");
+        z = sqlite3_str_finish(js);
+        if (z) {
+          char **a2 = sqlite3_realloc64(azJoined, sizeof(char*) * (size_t)(nJoined + 1));
+          if (a2) { azJoined = a2; azJoined[nJoined++] = z; } else { sqlite3_free(z); z = NULL; }
+        }
+        aRun[k] = aRun[e];
+        aRun[k].zSql = z;
+        aRun[k].frag = 0;
+        k++;
+        r = e + 1;
+      }
+    }
+    nRun = k;
   }
   /* An open last group is held back for the next batch */
   holdFrom = nRun;
@@ -2254,7 +2352,9 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       fprintf(stderr, "hpplite: batch %llu has statements that read the clock, and the replay connection "
               "is not on the clock VFS; cannot reproduce them\n", (unsigned long long)pBatch->height);
       for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
-      sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
+      sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow); sqlite3_free(aCarryFrag);
+    for (i = 0; i < nJoined; i++) sqlite3_free(azJoined[i]);
+    sqlite3_free(azJoined);
       sqlite3_free(aRun);
       return SQLITE_MISMATCH;
     }
@@ -2314,14 +2414,16 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       int saved = bkEnter(pCtx);
       /* the held part moves with the height, in one transaction */
       if (carryChanged) rc = storeCarry(pCtx, aRun + holdFrom, nHold);
-      if (rc == SQLITE_OK) rc = advanceMeta(pCtx, pBatch, 0);
+      if (rc == SQLITE_OK) rc = advanceMeta(pCtx, pBatch, 0, 0);
       bkLeave(pCtx, saved);
       rc = bkEnd(pCtx, rc);
       if (rc == SQLITE_OK) pCtx->nCarry = nHold;
     }
   }
   for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
-  sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
+  sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow); sqlite3_free(aCarryFrag);
+    for (i = 0; i < nJoined; i++) sqlite3_free(azJoined[i]);
+    sqlite3_free(azJoined);
   sqlite3_free(aRun);
   if (rc != SQLITE_OK) return rc;
 
@@ -2353,18 +2455,33 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) { bkLeave(pCtx, saved); return rc; }
   sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
+  sqlite3_int64 fragRow = 0;
+  size_t fragOff = 0;
   while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
+    sqlite3_int64 id = sqlite3_column_int64(pStmt, 0);
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
-    if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0
-        || sqlite3_column_int(pStmt, 2) != pBatch->aTxns[i].mode
+    const char *zRow = zSql;
+    const HppliteTxn *t = &pBatch->aTxns[i];
+    /* the statement a previous batch posted part of: compare from where it stopped (#59) */
+    if (zRow && i == 0 && pCtx->fragId && id == pCtx->fragId && pCtx->fragOff <= strlen(zRow)) zRow += pCtx->fragOff;
+    if (!zRow || !t->zSql
+        || (t->frag ? (i != pBatch->nTxns - 1 || strncmp(zRow, t->zSql, strlen(t->zSql)) != 0)
+                    : strcmp(zRow, t->zSql) != 0)
+        || sqlite3_column_int(pStmt, 2) != t->mode
         /* a time in the batch must be the one logged; none means the writer
         ** knew the statement did not read the clock (#56) */
-        || (pBatch->aTxns[i].now && sqlite3_column_int64(pStmt, 4) != pBatch->aTxns[i].now)) {
+        || (t->now && sqlite3_column_int64(pStmt, 4) != t->now)) {
       ok = 0;
       break;
     }
-    maxId = sqlite3_column_int64(pStmt, 0);
     lastGroup = sqlite3_column_int64(pStmt, 3);
+    if (t->frag) {
+      /* a piece: its row stays pending, posted this far */
+      fragRow = id;
+      fragOff = (size_t)(zRow - zSql) + strlen(t->zSql);
+    } else {
+      maxId = id;
+    }
     i++;
   }
   sqlite3_finalize(pStmt);
@@ -2374,6 +2491,8 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
   /* what it left open is the group of its last statement (#57) */
   adopted = *pBatch;
   adopted.openGroup = pBatch->openTxn ? lastGroup : 0;
+  adopted.fragRow = fragRow;
+  adopted.fragOff = fragOff;
   return hpplite_finalize_batch(pCtx, &adopted, maxId);
 }
 
