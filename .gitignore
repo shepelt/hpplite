@@ -30,3 +30,4 @@ ext/hpplite/tests/.env
 
 # macOS
 .DS_Store
+ext/hpplite/tests/agent_apps/.keys

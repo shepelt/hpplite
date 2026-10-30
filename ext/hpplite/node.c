@@ -13,6 +13,8 @@
 */
 
 #include "node.h"
+#include "da_uri.h"
+static void node_cap_batch_limit(HppliteNode *node);
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -99,6 +101,10 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
     node->config.batchIntervalMs = config->batchIntervalMs;
     node->config.maxBatchBytes = config->maxBatchBytes ? config->maxBatchBytes : 128 * 1024;
+    node->config.chainId = config->chainId;
+    node->config.maxTxBytes = config->maxTxBytes;
+    node->config.maxTxGas = config->maxTxGas;
+    node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
 
@@ -457,6 +463,18 @@ void hpplite_node_destroy(HppliteNode *node) {
 /*
 ** Take the DA size limit from the contract's system config, if it has one.
 */
+/* The contract's batch limit is not the only one: the chain's RPC takes so
+** much calldata per transaction (HPP Sepolia: ~84.9 KB, below the contract's
+** 128 KB). submitBatch adds 4 + 5*32 bytes of ABI and pads to 32. */
+#define SUBMIT_ABI_OVERHEAD (4 + 5 * 32 + 31)
+static void node_cap_batch_limit(HppliteNode *node) {
+    size_t tx = node->config.maxTxBytes ? node->config.maxTxBytes
+                                        : hpplite_network_max_tx_bytes(node->config.chainId);
+    if (tx > SUBMIT_ABI_OVERHEAD && node->config.maxBatchBytes > tx - SUBMIT_ABI_OVERHEAD) {
+        node->config.maxBatchBytes = tx - SUBMIT_ABI_OVERHEAD;
+    }
+}
+
 static void node_learn_batch_limit(HppliteNode *node) {
     HppliteSystemConfig *cfg;
     if (!node || !node->l1) return;
@@ -464,9 +482,12 @@ static void node_learn_batch_limit(HppliteNode *node) {
     if (cfg) {
         if (cfg->batchSizeLimit > 0) node->config.maxBatchBytes = (size_t)cfg->batchSizeLimit;
         if (cfg->leaseDuration > 0) node->leaseDuration = cfg->leaseDuration;
-        node_set_stmt_limit(node);
         hpplite_l1_system_config_free(cfg);
     }
+    node_cap_batch_limit(node);
+    node_set_stmt_limit(node);
+    hpplite_l1_set_max_tx_gas(node->l1, node->config.maxTxGas ? node->config.maxTxGas
+                                         : hpplite_network_max_tx_gas(node->config.chainId));
 }
 
 /*
@@ -769,6 +790,22 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             if (payload) {
                 char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height,
                                         payload, payloadLen);
+                if (!txHash && hpplite_l1_submit_was_oversized(node->l1) && payloadLen > 1024) {
+                    /* The RPC takes less per transaction than the contract per
+                    ** batch (an unknown chain's limit): post smaller batches,
+                    ** right away - nothing was sent */
+                    size_t smaller = payloadLen / 4 * 3;
+                    if (smaller < node->config.maxBatchBytes) node->config.maxBatchBytes = smaller;
+                    node_set_stmt_limit(node);
+                    fprintf(stderr, "hpplite: the RPC refused a %zu-byte batch as oversized; posting batches of "
+                            "at most %zu bytes (set maxtx= to the chain's limit)\n",
+                            payloadLen, node->config.maxBatchBytes);
+                    free(sealed);
+                    sqlite3_free(json);
+                    hpplite_batch_free(batch);
+                    *pMore = 1;
+                    return 0;
+                }
                 if (txHash) {
                     confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
                     if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash);

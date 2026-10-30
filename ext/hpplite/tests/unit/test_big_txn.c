@@ -368,6 +368,65 @@ static void test_multi_connection_groups(void) {
     PASS();
 }
 
+/* A chain's transaction size limit can be below the contract's batch limit
+** (HPP Sepolia's RPC rejects calldata over ~84.9 KB with "oversized data",
+** the contract advertises 128 KB): a batch that size can never be posted,
+** so the node must post smaller ones instead of retrying forever */
+static void test_rpc_size_limit_below_contract_limit(void) {
+    TEST("an RPC that rejects batches as oversized: the node posts smaller batches and drains");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/w.db", l1);           /* contract limit: 2000 */
+    if (!w) FAIL("open");
+    hpplite_l1_mock_set_max_tx_bytes(l1, 900);              /* the RPC takes less */
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL);
+    for (int i = 0; i < 40; i++) {
+        char sql[160];
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d, '%060d')", i, i);
+        hpplite_node_exec(w, sql, NULL);
+    }
+    for (int k = 0; k < 20 && hpplite_node_pending_count(w) > 0; k++) hpplite_node_flush_batch(w);
+    int left = hpplite_node_pending_count(w);
+    for (uint64_t h = 1; h < hpplite_node_get_height(w); h++) {
+        size_t len = 0;
+        uint8_t *raw = hpplite_l1_get_batch(l1, h, &len);
+        free(raw);
+        if (len > 900) { hpplite_node_destroy(w); FAIL("a posted batch is over the RPC's limit"); }
+    }
+    HppliteNode *r = open_node(DIR "/r.db", l1);
+    int rows = r ? count_rows(r->db, "t") : -1;
+    int same = r && same_root(w, r);
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    if (left != 0) FAILF("%d statements still pending: the node kept retrying the oversized batch", left);
+    if (rows != 40 || !same) FAIL("replica differs");
+    PASS();
+}
+
+static void test_known_chain_capped(void) {
+    TEST("HPP Sepolia (chain 181228): the batch limit is capped below its RPC's transaction limit");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_batch_size_limit(l1, 128 * 1024);  /* what the contract says */
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "cap";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = DIR "/cap.db";
+    config.chainId = 181228;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_set_l1(n, l1);
+    size_t lim = n->config.maxBatchBytes;
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (lim == 0 || lim > 84864 - 195) FAILF("batch limit %zu: posts would be rejected as oversized", lim);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite transactions across batches (#57) ===\n");
     test_format();
@@ -377,6 +436,8 @@ int main(void) {
     test_lost_confirmation_of_open_batch();
     test_missing_continuation();
     test_multi_connection_groups();
+    test_rpc_size_limit_below_contract_limit();
+    test_known_chain_capped();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

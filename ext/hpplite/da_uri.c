@@ -14,12 +14,34 @@
 ** Factory addresses are per-network constants
 */
 const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d"},
-    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL},  /* Not deployed yet */
-    {"ethereum",    1,      "https://eth.llamarpc.com", NULL},
-    {"sepolia",     11155111, "https://sepolia.drpc.org", NULL},
-    {NULL, 0, NULL, NULL}
+    /* Measured on HPP Sepolia 2026-10-30, below what the contract allows
+    ** (128 KB batches): a transaction may use at most 32M gas (its block gas
+    ** limit is 2^50; the transaction cap is what binds - batches in contract
+    ** storage cost ~700 gas/byte, so ~44 KB is the most one can carry), and
+    ** its RPC answers "oversized data" above 84864 bytes of calldata. Ethereum:
+    ** EIP-7825 caps a transaction at 2^24 gas; geth's txpool takes 128 KB. */
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d", 40000, 32000000},
+    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000},  /* Not deployed yet */
+    {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216},
+    {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216},
+    {NULL, 0, NULL, NULL, 0, 0}
 };
+
+uint64_t hpplite_network_max_tx_gas(uint64_t chainId) {
+    int i;
+    for (i = 0; HPPLITE_NETWORKS[i].alias; i++) {
+        if (HPPLITE_NETWORKS[i].chainId == chainId) return HPPLITE_NETWORKS[i].maxTxGas;
+    }
+    return 0;
+}
+
+size_t hpplite_network_max_tx_bytes(uint64_t chainId) {
+    int i;
+    for (i = 0; HPPLITE_NETWORKS[i].alias; i++) {
+        if (HPPLITE_NETWORKS[i].chainId == chainId) return HPPLITE_NETWORKS[i].maxTxBytes;
+    }
+    return 0;
+}
 
 const int HPPLITE_NETWORKS_COUNT = 4;
 

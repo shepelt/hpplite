@@ -63,6 +63,8 @@ struct HppliteL1 {
     int txPending;               /* Test hook: wait_for_tx never confirms */
     int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
     size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
+    size_t maxTxBytes;           /* Test hook: the RPC's transaction size limit (0 = none) */
+    int lastOversized;           /* the last submission failed for that */
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
@@ -598,6 +600,18 @@ void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
     if (l1) { l1->failSubmit = fail; l1->failAfterPlus1 = 0; }
 }
 
+void hpplite_l1_mock_set_max_tx_bytes(HppliteL1 *l1, size_t n) {
+    if (l1) l1->maxTxBytes = n;
+}
+
+int hpplite_l1_submit_was_oversized(HppliteL1 *l1) {
+    return l1 ? l1->lastOversized : 0;
+}
+
+void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
+    (void)l1; (void)gas;                 /* the mock charges no gas */
+}
+
 void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n) {
     if (l1) l1->failAfterPlus1 = n + 1;
 }
@@ -738,8 +752,10 @@ char *hpplite_l1_submit_batch(
 ) {
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
+    l1->lastOversized = 0;
     if (l1->failSubmit) return NULL;
     if (l1->failAfterPlus1 == 1) return NULL;
+    if (l1->maxTxBytes && data_len > l1->maxTxBytes) { l1->lastOversized = 1; return NULL; }
     if (data_len > (l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024)) {
         return NULL;  /* "Batch too large" */
     }

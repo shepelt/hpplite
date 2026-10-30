@@ -160,7 +160,10 @@ Flushing a batch:
 ```
 
 The DA contract caps a batch at `batchSizeLimit` (128 KB by default, read
-from the contract's system config on connect). Pending SQL beyond that is
+from the contract's system config on connect); the chain may cap it lower
+(HPP Sepolia: 32M gas per transaction, ~44 KB of contract storage; HPPLite
+cuts at 40 KB there, `maxtx=`/`maxtxgas=` elsewhere, and shrinks batches
+the RPC refuses as oversized). Pending SQL beyond that is
 submitted as a series of batches, each cut at a transaction boundary when
 possible and marked `"partial": 1` except the last. Only the last batch of
 a series carries a state root, so verification compares roots at non-partial

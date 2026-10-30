@@ -292,9 +292,20 @@ gas, `submitCheckpoint` 3%, lease claim/renew/release 3%.
 | Factory deploy (VERSION 6, optimizer on) | 2.8M | 0.000028 |
 | Rollup creation (`getOrCreateRollup`) | ~2.5M | 0.000025 |
 | Batch submit (~250 B sealed; ~0.7k gas per further byte) | 323k | 0.0000032 |
-| Batch submit (128 KB, the limit) | ~92M | 0.0009 |
+| Batch submit (29 KB sealed, as cut on HPP Sepolia) | 20.7M | 0.00023 |
 | Checkpoint | 50k | 0.0000005 |
 | Lease claim / renew / release | 28-37k | 0.0000003 |
+
+**Batch size on HPP Sepolia is set by the chain, not the contract.** The
+contract allows 128 KB, but a transaction may use at most 32M gas there
+(measured 2026-10-30; the block gas limit is 2^50, the per-transaction cap
+binds), and contract storage costs ~0.7k gas per byte: ~44 KB is the most a
+batch can carry. Its RPC also refuses more than ~84.9 KB of calldata
+("oversized data"). HPPLite knows both for HPP Sepolia (by chain id) and
+cuts batches at 40 KB; elsewhere set `maxtx=` (bytes) and `maxtxgas=`, or
+let it learn: a batch the RPC refuses as oversized, or whose gas estimate
+is over the cap, is never sent, and later batches are cut smaller. Bulk
+data costs ~0.008 ETH per MB of SQL at 0.01 gwei.
 
 | Usage | Batches/day | ETH/day on HPP Sepolia |
 |-------|-------------|------------------------|

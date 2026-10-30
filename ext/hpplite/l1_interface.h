@@ -386,6 +386,17 @@ uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
 ** Make hpplite_l1_submit_batch() fail (for testing retry behaviour)
 */
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
+/* The RPC's transaction size limit, below the contract's batch limit: larger
+** submissions fail as the real RPC's "oversized data" does */
+void hpplite_l1_mock_set_max_tx_bytes(HppliteL1 *l1, size_t n);
+/* Did the last hpplite_l1_submit_batch() fail because the transaction was too
+** large for the chain - its RPC's size limit, or more gas than a transaction
+** may use (never sent; posting smaller batches will work)? */
+int hpplite_l1_submit_was_oversized(HppliteL1 *l1);
+/* The chain's gas cap per transaction (0 = unknown): a batch whose estimate
+** is above it is not sent, a sent one never asks for more */
+void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas);
+
 /* Accept n more submissions, then fail them all (a crash in the middle of a series) */
 void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n);
 

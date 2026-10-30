@@ -26,6 +26,7 @@
 #ifndef HPPLITE_CONFIG_H
 #define HPPLITE_CONFIG_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -48,6 +49,8 @@ extern "C" {
 #define HPPLITE_ENV_ENCRYPT       "HPPLITE_ENCRYPT"
 #define HPPLITE_ENV_CHECKPOINT    "HPPLITE_CHECKPOINT_INTERVAL"
 #define HPPLITE_ENV_DETERMINISM   "HPPLITE_DETERMINISM"
+#define HPPLITE_ENV_MAX_TX        "HPPLITE_MAX_TX_BYTES"
+#define HPPLITE_ENV_MAX_TX_GAS    "HPPLITE_MAX_TX_GAS"
 
 /*
 ** URI parameter names (same as env vars but lowercase, no prefix)
@@ -64,6 +67,8 @@ extern "C" {
 #define HPPLITE_URI_ENCRYPT       "encrypt"
 #define HPPLITE_URI_CHECKPOINT    "checkpoint"
 #define HPPLITE_URI_DETERMINISM   "determinism"
+#define HPPLITE_URI_MAX_TX        "maxtx"
+#define HPPLITE_URI_MAX_TX_GAS    "maxtxgas"
 #define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
 
@@ -110,6 +115,8 @@ typedef struct HppliteConfig {
     int encrypt;                     /* Seal batches before posting (default 1) */
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
+    size_t maxTxBytes;               /* Largest batch per transaction (0 = by chain id, else unknown) */
+    uint64_t maxTxGas;               /* Gas cap per transaction (0 = by chain id, else unknown) */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */

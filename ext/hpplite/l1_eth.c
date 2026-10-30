@@ -25,6 +25,9 @@ struct HppliteL1 {
     uint8_t privkey[32];
     int has_privkey;
 
+    int lastOversized;         /* the last batch submission was too large for the chain */
+    uint64_t maxTxGas;         /* the chain's gas cap per transaction (0 = unknown) */
+
     /* Network info */
     uint64_t chainId;
     char *rpcUrl;
@@ -710,6 +713,7 @@ char *hpplite_l1_submit_batch(
     const uint8_t *data,
     size_t data_len
 ) {
+    if (l1) l1->lastOversized = 0;
     if (!l1 || !l1->has_privkey || !instanceId || !data || data_len == 0) return NULL;
     if (!ensure_da_contract(l1)) return NULL;  /* Need DA contract */
 
@@ -760,14 +764,27 @@ char *hpplite_l1_submit_batch(
     ** old 700 ran out of gas on larger batches). 25% margin; the formula
     ** is only the fallback when the estimate call fails. */
     uint64_t gas_estimate = eth_client_estimate_gas(l1->eth, l1->da_contract, calldata, calldata_len);
+    if (gas_estimate != (uint64_t)-1 && l1->maxTxGas && gas_estimate > l1->maxTxGas) {
+        /* more than a transaction may use (HPP Sepolia: 32M): sent, it would
+        ** run out of gas and revert with all of it spent - do not send */
+        free(calldata);
+        l1->lastOversized = 1;
+        return NULL;
+    }
     if (gas_estimate == (uint64_t)-1) gas_estimate = 300000 + data_len * 1000;
     else gas_estimate += gas_estimate / 4;
     if (gas_estimate < 3000000) gas_estimate = 3000000;
+    if (l1->maxTxGas && gas_estimate > l1->maxTxGas) gas_estimate = l1->maxTxGas;
     uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->da_contract, calldata, calldata_len,
                                            gas_estimate, 0);
     free(calldata);
 
-    if (!tx_hash) return NULL;
+    if (!tx_hash) {
+        /* geth's txpool answers "oversized data": never sent, will never be */
+        const char *e = eth_client_error(l1->eth);
+        if (e && strstr(e, "oversized")) l1->lastOversized = 1;
+        return NULL;
+    }
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -895,3 +912,11 @@ int hpplite_l1_get_da_state(
 /* ============ Peer Discovery Functions ============ */
 
 /* Endpoint functions removed in singleton model - no peer discovery needed */
+
+int hpplite_l1_submit_was_oversized(HppliteL1 *l1) {
+    return l1 ? l1->lastOversized : 0;
+}
+
+void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
+    if (l1) l1->maxTxGas = gas;
+}
