@@ -435,6 +435,45 @@ static void test_lease_on_close(void) {
     PASS();
 }
 
+/* Another connection changes the schema; this connection's next statement
+** finds its schema stale, and SQLite prepares it again and reruns it - the
+** first run's log row rolled back with it. The rerun must be logged: it was
+** taken for a trigger's sub-program (same statement, same step count) and the
+** write never reached the log. */
+static void test_rerun_after_foreign_schema_change(void) {
+    TEST("a statement SQLite reruns after another connection's schema change is still captured");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/stale.db", l1);
+    HppliteNode *b = open_node(DIR "/stale.db", l1);
+    if (!a || !b) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    sqlite3_stmt *ins;
+    if (sqlite3_prepare_v2(b->db, "INSERT INTO t(v) VALUES('prepared before the ALTER')", -1, &ins, NULL) != SQLITE_OK) FAIL("prepare");
+    hpplite_node_exec(a, "ALTER TABLE t ADD COLUMN w DEFAULT 'x'", NULL);   /* b's schema is now stale */
+    int rc1 = sqlite3_step(ins); sqlite3_finalize(ins);
+    hpplite_node_exec(a, "CREATE TABLE u(x)", NULL);
+    int rc2 = sqlite3_exec(b->db, "CREATE TABLE w(y)", NULL, NULL, NULL);   /* DDL on a stale schema */
+    int rc3 = sqlite3_exec(b->db, "INSERT INTO u VALUES(1)", NULL, NULL, NULL);
+    hpplite_node_destroy(b);
+    while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
+    const char *why = replica_differs(a, l1, DIR "/stale_replica.db");
+    HppliteNode *r = open_node(DIR "/stale_replica2.db", l1);
+    sqlite3_int64 hasW = -1;
+    if (r) {
+        sqlite3_stmt *q;
+        if (sqlite3_prepare_v2(r->db, "SELECT count(*) FROM sqlite_schema WHERE name IN ('w', 'u')", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) hasW = sqlite3_column_int64(q, 0);
+        sqlite3_finalize(q);
+        hpplite_node_destroy(r);
+    }
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    if (rc1 != SQLITE_DONE || rc2 != SQLITE_OK || rc3 != SQLITE_OK) FAIL("writes failed");
+    if (hasW != 2) FAIL("the replica lacks a table created on a stale schema");
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc == 5 && strcmp(argv[1], "--hold") == 0) return holder_main(argv);
@@ -445,6 +484,7 @@ int main(int argc, char **argv) {
     test_mixed_threads_and_processes();
     test_sequencer_across_processes();
     test_lease_on_close();
+    test_rerun_after_foreign_schema_change();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
