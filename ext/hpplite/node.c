@@ -24,6 +24,9 @@ static int node_check_rollup(HppliteNode *node);
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/file.h>
+#include <fcntl.h>
+#include "eth/keccak256.h"
 
 /*
 ** Helper: duplicate a string using sqlite3_malloc
@@ -109,8 +112,11 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
 
-    /* Generate unique instance ID */
+    /* Generate unique instance ID (a file's sequencer replaces it with the
+    ** file's own, node_take_file_lock) */
     generate_instance_id(node->instanceId);
+    node->lockFd = -1;
+    node->usersFd = -1;
     node->leaseDuration = 300;
 
     /* One flush at a time, timer or not (two hpplite_flush() calls from two
@@ -169,21 +175,69 @@ static void node_set_stmt_limit(HppliteNode *node) {
 }
 
 /*
-** Is another connection in this process already sequencing this file? Then
-** this one only captures: the log lives in the file and is shared, the
-** sequencer's flush posts everyone's rows. No L1, lease or timer here.
+** Across processes, a file's sequencer is whoever holds an exclusive flock on
+** <file>-hpplite: a file of its own, since SQLite's POSIX locks on the
+** database are dropped when any descriptor of it is closed. The OS lets go
+** when the holder exits or crashes. The lock file keeps a random seed, and
+** the instance id is keccak(seed, host name): every process on this host is
+** the same sequencer to L1 - a handover needs no lease transaction - while a
+** copy of the file on another host is a different one. Returns 1 if this
+** node may sequence (lock held, or no lock possible: then as before), 0 if
+** another process holds it.
+*/
+static void node_file_instance_id(HppliteNode *node, const unsigned char seed[32]) {
+    unsigned char buf[32 + 256];
+    memcpy(buf, seed, 32);
+    if (gethostname((char *)buf + 32, 255) != 0) buf[32] = 0;
+    buf[32 + 255] = 0;
+    keccak256(buf, 32 + strlen((char *)buf + 32), node->instanceId);
+}
+static int node_take_file_lock(HppliteNode *node) {
+    char path[PATH_MAX + 16];
+    unsigned char seed[32];
+    int fd;
+    if (node->lockFd >= 0 || !node->canonicalPath) return 1;
+    snprintf(path, sizeof(path), "%s-hpplite", node->canonicalPath);
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return 1;                     /* no lock possible here (read-only directory) */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        /* a follower: the file's id already, for when it takes over (the
+        ** holder wrote the seed when it took the lock) */
+        if (pread(fd, seed, 32, 0) == 32) node_file_instance_id(node, seed);
+        close(fd);
+        return 0;
+    }
+    if (pread(fd, seed, 32, 0) != 32) {
+        generate_instance_id(seed);
+        if (pwrite(fd, seed, 32, 0) != 32) fprintf(stderr, "hpplite: could not write %s\n", path);
+        fsync(fd);
+    }
+    node_file_instance_id(node, seed);
+    node->lockFd = fd;
+    return 1;
+}
+
+/*
+** Is another connection already sequencing this file - in this process (the
+** registry) or in another (the lock file)? Then this one only captures: the
+** log lives in the file and is shared, the sequencer's flush posts everyone's
+** rows. No L1 or lease here; a timer, if any, only waits to take over.
 */
 static void node_detect_follower(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
-    char resolved[PATH_MAX];
+    char resolved[PATH_MAX], users[PATH_MAX + 24];
     if (!zFile || !zFile[0]) return;
     if (!realpath(zFile, resolved)) return;
     node->canonicalPath = node_strdup(resolved);
-    if (hpplite_find_sequencer(resolved)) {
-        node->follower = 1;
-        fprintf(stderr, "hpplite: %s is already sequenced by another connection in this process; "
-                        "this connection captures only\n", zFile);
+    /* Every connection holds <file>-hpplite-users shared while open: a
+    ** sequencer that closes can tell whether anyone is left to take over */
+    snprintf(users, sizeof(users), "%s-hpplite-users", resolved);
+    node->usersFd = open(users, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (node->usersFd >= 0 && flock(node->usersFd, LOCK_SH | LOCK_NB) != 0) {
+        /* a closing sequencer is looking: wait for it rather than be missed */
+        if (flock(node->usersFd, LOCK_SH) != 0) { close(node->usersFd); node->usersFd = -1; }
     }
+    if (hpplite_find_sequencer(resolved) || !node_take_file_lock(node)) node->follower = 1;
 }
 
 static int node_init_tracking(HppliteNode *node) {
@@ -307,6 +361,50 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
 }
 
 /*
+** Is any other connection on this file left (one that would take over the
+** sequencer)? Our shared lock on the users file goes; if an exclusive one is
+** then granted, nobody else holds it.
+*/
+static int node_others_on_file(HppliteNode *node) {
+    int others;
+    if (node->usersFd < 0) return 0;
+    flock(node->usersFd, LOCK_UN);
+    others = flock(node->usersFd, LOCK_EX | LOCK_NB) != 0;
+    if (!others) flock(node->usersFd, LOCK_UN);
+    return others;
+}
+
+/*
+** A follower whose sequencer is gone (its process exited or crashed, or it
+** closed) takes over: the lock, then what the sequencer moved on in the file
+** since this connection opened (height, checkpoint, carry: our copy is from
+** then), then L1 and the lease - the same instance id, so the lease is ours
+** if it is still running. Called under the flush mutex. Returns 1 if this
+** node now sequences.
+*/
+static int node_try_promote(HppliteNode *node) {
+    if (!node->follower || !node->canonicalPath || !node->ctx) return 0;
+    if (hpplite_find_sequencer(node->canonicalPath)) return 0;
+    if (node->lockFd < 0 && !node_take_file_lock(node)) return 0;
+    if (node->lockFd < 0) return 0;
+    node->follower = 0;
+    hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
+    node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
+    memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
+    node->batchesSinceCheckpoint = node->ctx->blockHeight > node->lastCheckpointHeight + 1
+        ? (int)(node->ctx->blockHeight - 1 - node->lastCheckpointHeight) : 0;
+    if (!node->l1) {
+        node_auto_connect_l1(node, &node->config);
+    } else if (hpplite_node_sync_from_l1(node, 1) < 0) {
+        node->state = HPPLITE_STATE_ERROR;
+    } else {
+        node->leaseRecheckAt = 0;
+        node_ensure_lease(node);
+    }
+    return 1;
+}
+
+/*
 ** Initialize a node with configuration.
 */
 HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
@@ -394,6 +492,15 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* Stop timer thread first */
     hpplite_node_stop_timer(node);
 
+    /* A follower whose sequencer is gone takes over to post what is left:
+    ** the last connection out posts */
+    if (node->follower && node->ctx && !node->ctx->bDbClosed
+        && hpplite_pending_count(node->ctx) > 0 && node->flushMutex) {
+        pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
+        node_try_promote(node);
+        pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
+    }
+
     /* Flush any pending data before cleanup (not when bookkeeping shared a
     ** connection that is already closed: nothing can run there any more) */
     if (node->ctx && !(node->ctx->bDbClosed && node->ctx->bkDb == node->ctx->db)
@@ -406,8 +513,11 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_node_stop(node);
     }
 
-    /* Let go of the sequencer lease so a restart need not wait it out */
-    if (node->l1 && node->hasLease) {
+    /* Let go of the sequencer lease so a restart need not wait it out (a
+    ** database rebuilt into a fresh file, another host) - unless another
+    ** connection to this file is still open: it takes over as the same
+    ** sequencer (the id is the file's), and a release would only cost it a claim */
+    if (node->l1 && node->hasLease && !(node->lockFd >= 0 && node_others_on_file(node))) {
         hpplite_node_release_lease(node);
     }
 
@@ -430,6 +540,16 @@ void hpplite_node_destroy(HppliteNode *node) {
     if (node->db && node->ownsDb) {
         hpplite_unregister_node(node->db);
         sqlite3_close(node->db);
+    }
+
+    /* The locks last: everything this sequencer had to do in the file is done */
+    if (node->lockFd >= 0) {
+        close(node->lockFd);
+        node->lockFd = -1;
+    }
+    if (node->usersFd >= 0) {
+        close(node->usersFd);
+        node->usersFd = -1;
     }
 
     /* Free crypto */
@@ -958,7 +1078,8 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     int more;
 
     if (!node->ctx) return 0;
-    if (node->follower) return 0;          /* the sequencer connection posts */
+    /* the sequencer connection posts - unless it is gone: then this one does */
+    if (node->follower && !node_try_promote(node)) return 0;
     if (node->l1 && node_check_rollup(node) < 0) return 0;
     node->lastFlushTime = node_current_time_ms();
 
@@ -1098,6 +1219,16 @@ static void *node_timer_thread_func(void *arg) {
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
             hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2);
 
+        if (node->follower) {
+            /* capture only; every second, see whether the sequencer is gone */
+            if (now < node->promoteAt) continue;
+            node->promoteAt = now + 1000;
+            pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+            pthread_mutex_lock(mutex);
+            if (node->timerRunning) node_try_promote(node);
+            pthread_mutex_unlock(mutex);
+            continue;
+        }
         if (now < node->retryAt) continue;           /* backing off after L1 failures */
         if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
@@ -1121,7 +1252,6 @@ void hpplite_node_start_timer(HppliteNode *node) {
     if (!node) return;
     if (node->config.batchIntervalMs <= 0) return;
     if (node->timerRunning) return;
-    if (node->follower) return;
     if (!node->bkDb) {
         /* In-memory databases have no bookkeeping connection: a timer would
         ** run BEGIN/COMMIT on the application's connection from another

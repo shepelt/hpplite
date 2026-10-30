@@ -128,10 +128,15 @@ typedef struct HppliteNode {
     int ownsDb;
     int ownsL1;
 
-    /* One sequencer per file per process: later hpplite=on connections to
-    ** the same file capture into the shared log and post nothing */
+    /* One sequencer per file: later hpplite=on connections to the same file,
+    ** in this process or another, capture into the shared log and post
+    ** nothing. Across processes the sequencer is whoever holds an flock on
+    ** <file>-hpplite; a follower takes over when it is gone. */
     char *canonicalPath;
     int follower;
+    int lockFd;                     /* the held lock file, -1 if none */
+    int usersFd;                    /* shared lock on <file>-hpplite-users while open, -1 if none */
+    int64_t promoteAt;              /* follower: next try to take over */
 } HppliteNode;
 
 /*

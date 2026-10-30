@@ -574,6 +574,18 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
       return;   /* no row changed, but sqlite_sequence did: keep */
     }
   }
+  /* No effect. Inside a transaction its row goes before anyone can see it:
+  ** a statement that failed there must not reach the chain (in autocommit a
+  ** failed statement's rollback took the row already), and a no-op need not.
+  ** In autocommit the row committed with the statement and may already be in
+  ** a snapshot - a batch being built in this process or another; removing it
+  ** now would leave that batch carrying a row the log no longer has. It stays:
+  ** a statement that changed nothing on the writer changes nothing on a
+  ** replica with the same state. */
+  if (sqlite3_get_autocommit(pCtx->db)) {
+    pCtx->bInternal = 0;
+    return;
+  }
   if (!pCtx->pUnlogStmt) {
     if (sqlite3_prepare_v3(pCtx->db, "DELETE FROM _hpplite_pending WHERE id = ?1",
                            -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pUnlogStmt, NULL) != SQLITE_OK) {
@@ -1215,10 +1227,6 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
-    if (!pCtx->pLastLogged) {
-      unsigned g = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_RELAXED);
-      if (g & 1) __atomic_store_n(&pCtx->nUnsettled, g + 1, __ATOMIC_RELEASE);
-    }
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
     ** closing read just before this callback. With no other read, the
@@ -1337,14 +1345,6 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     {
       /* our row's id is not the application's last_insert_rowid() */
       sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
-      /* In autocommit our row commits now, on its own, before the statement
-      ** runs; if the statement changes nothing it is removed after. Until its
-      ** end (PROFILE) the row is unsettled (see bkBegin) - marked before it
-      ** can be seen. */
-      if (sqlite3_get_autocommit(pCtx->db)) {
-        unsigned g = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_RELAXED);
-        if (!(g & 1)) __atomic_store_n(&pCtx->nUnsettled, g + 1, __ATOMIC_RELEASE);
-      }
       rc = sqlite3_step(pCtx->pLogStmt);
       if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
@@ -1732,23 +1732,6 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
     if (rc != SQLITE_OK && pCtx->bBkGate) {
       pCtx->bBkGate = 0;
       __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
-    }
-    if (rc == SQLITE_OK && !bWrite && pCtx->bkDb != pCtx->db) {
-      /* An autocommit statement's log row commits before the statement
-      ** runs; if it changed nothing, the row is removed only afterwards. A
-      ** snapshot taken in between would hold a row the log is about to lose
-      ** (a batch built from it fails adoption later). Looking after the
-      ** snapshot is not enough - the row may be settled by then, yet still in
-      ** it - so look before and after: unless nothing was unsettled across
-      ** the whole time (same even count), try later. */
-      unsigned g1 = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE), g2;
-      internalExec(pCtx, pCtx->bkDb, "SELECT 1 FROM _hpplite_meta LIMIT 1");
-      __atomic_thread_fence(__ATOMIC_SEQ_CST);
-      g2 = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE);
-      if ((g1 & 1) || g1 != g2) {
-        internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
-        return SQLITE_BUSY;
-      }
     }
     return rc;
   }
@@ -2726,7 +2709,9 @@ static void hpplite_on_close(sqlite3 *db);
 ** One row: height, pending, state_root, prev_block_hash,
 ** last_checkpoint_height, lease, log_errors, replay_skipped, encryption,
 ** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches,
-** hooks_replaced, roots_compared, root_mismatches, txns_dropped, last_refusal.
+** hooks_replaced, roots_compared, root_mismatches, txns_dropped, last_refusal,
+** sequencer (1 if this connection posts the file's batches; 0 if another
+** connection, in this process or another, does and this one captures only).
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -2763,6 +2748,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_ROOT_MISMATCHES  17
 #define STATUS_COL_TXNS_DROPPED     18
 #define STATUS_COL_LAST_REFUSAL     19
+#define STATUS_COL_SEQUENCER        20
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -2775,7 +2761,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER, last_refusal TEXT)");
+        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -2933,6 +2919,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_LAST_REFUSAL:
             if (node->ctx->zLastRefusal[0]) sqlite3_result_text(ctx, node->ctx->zLastRefusal, -1, SQLITE_TRANSIENT);
             else sqlite3_result_null(ctx);
+            break;
+        case STATUS_COL_SEQUENCER:
+            sqlite3_result_int(ctx, node->follower ? 0 : 1);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);

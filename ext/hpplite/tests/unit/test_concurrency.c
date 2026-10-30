@@ -1,0 +1,450 @@
+/*
+** HPPLite with several writers on one file at once: threads with their own
+** connections (a pool), and processes (php-fpm, gunicorn workers, a cron job
+** beside a server). SQLite serializes their commits; the log must hold their
+** statements in that same order, or a replica replaying it diverges (two
+** INSERTs with automatic ids, swapped, give swapped rows). The invariant
+** every test ends with: a replica rebuilt from L1 alone equals the writer,
+** row for row.
+*/
+
+#include "node.h"
+#include "batch.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+
+static int tests_run = 0, tests_passed = 0;
+#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
+#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
+
+static const unsigned char PRIVKEY[32] = {
+    0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xa9,0xaa,0xab,0xac,0xad,0xae,0xaf,0xb0,
+    0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xbb,0xbc,0xbd,0xbe,0xbf,0xc0
+};
+#define DIR "/tmp/hpplite_test_concurrency"
+#define N 1500
+
+static const char *self_path;
+/* A writer process: this binary run again, so nothing of the parent's SQLite
+** (open files, lock bookkeeping, HPPLite's in-process registry) is inherited -
+** SQLite must not be carried across fork() */
+static pid_t spawn_writer(const char *mode, const char *db, const char *who, int n) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char ns[16]; snprintf(ns, sizeof(ns), "%d", n);
+        execl(self_path, self_path, mode, db, who, ns, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
+
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "conc";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = (char *)dbPath;
+    config.checkpointInterval = 1000;
+    node = hpplite_node_create(&config);
+    if (node && l1) {
+        hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
+        hpplite_node_set_l1(node, l1);
+        hpplite_node_sync_from_l1(node, 1);
+        hpplite_node_start(node);
+    }
+    return node;
+}
+
+/* A full node - L1 configured, as an application's connection is - on the
+** file-backed mock, which every process sees as one chain */
+#define L1DIR DIR "/l1"
+static HppliteNode *open_shared(const char *dbPath, HppliteL1 **pl1) {
+    *pl1 = hpplite_l1_create_mock_dir(L1DIR);
+    return open_node(dbPath, *pl1);
+}
+static void hex32(const unsigned char *p, char *out) { for (int i = 0; i < 32; i++) sprintf(out + 2 * i, "%02x", p[i]); }
+static int wait_file(const char *path, int ms) {
+    for (int i = 0; i < ms / 10; i++) { if (access(path, F_OK) == 0) return 1; usleep(10000); }
+    return 0;
+}
+static int lease_holder(HppliteL1 *l1, unsigned char out[32]) {
+    HppliteL1State *st = hpplite_l1_get_state(l1);
+    int held = 0;
+    if (!st) return -1;
+    uint64_t now = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
+    held = st->leaseExpiry > now;
+    if (held) memcpy(out, st->sequencerInstance, 32);
+    hpplite_l1_state_free(st);
+    return held;
+}
+
+/* every row of t, in id order, as one string: the writer's and the replica's must be equal */
+static char *dump(sqlite3 *db) {
+    sqlite3_stmt *st; size_t cap = 1 << 16, len = 0; char *out = malloc(cap);
+    out[0] = 0;
+    if (sqlite3_prepare_v2(db, "SELECT id, who, k FROM t ORDER BY id", -1, &st, NULL) != SQLITE_OK) return out;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        char row[96];
+        int n = snprintf(row, sizeof(row), "%lld:%s:%lld;", (long long)sqlite3_column_int64(st, 0),
+                         (const char *)sqlite3_column_text(st, 1), (long long)sqlite3_column_int64(st, 2));
+        if (len + n + 1 > cap) { cap *= 2; out = realloc(out, cap); }
+        memcpy(out + len, row, n + 1); len += n;
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* the replica check: rebuild from L1 into an empty file, compare root and rows */
+static const char *replica_differs(HppliteNode *w, HppliteL1 *l1, const char *path) {
+    static char why[160];
+    unsigned char ra[32], rb[32];
+    HppliteNode *r = open_node(path, l1);
+    if (!r) return "replica open";
+    hpplite_node_get_state_root(w, ra);
+    hpplite_node_get_state_root(r, rb);
+    char *a = dump(w->db), *b = dump(r->db);
+    int rows = strcmp(a, b) != 0, root = memcmp(ra, rb, 32) != 0;
+    if (rows) {
+        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
+        while (i > 0 && a[i - 1] != ';') i--;
+        snprintf(why, sizeof(why), "replica rows differ at writer [%.40s] replica [%.40s]", a + i, b + i);
+    } else if (root) snprintf(why, sizeof(why), "replica root differs");
+    free(a); free(b);
+    hpplite_node_destroy(r);
+    return rows || root ? why : NULL;
+}
+
+typedef struct { sqlite3 *db; const char *who; int n; int failed; } Writer;
+static void *write_autocommit(void *arg) {
+    Writer *w = arg;
+    for (int i = 0; i < w->n; i++) {
+        char sql[96];
+        snprintf(sql, sizeof(sql), "INSERT INTO t(who, k) VALUES('%s', %d)", w->who, i);
+        if (sqlite3_exec(w->db, sql, NULL, NULL, NULL) != SQLITE_OK) w->failed++;
+    }
+    return NULL;
+}
+/* What a pool of request handlers does to one table: autocommit inserts,
+** short transactions, no-op updates, upserts on a shared key, deletes,
+** counters - every shape whose replay depends on order */
+static void *write_mixed(void *arg) {
+    Writer *w = arg;
+    int effectsOnly = getenv("CONC_EFFECTS_ONLY") != NULL;   /* diagnosis: no statement that can be a no-op */
+    for (int i = 0; i < w->n; i++) {
+        char sql[256];
+        if (effectsOnly && (i % 6 == 2 || i % 6 == 4 || i % 6 == 5)) continue;
+        switch (i % 6) {
+        case 0: snprintf(sql, sizeof(sql), "INSERT INTO t(who, k) VALUES('%s', %d)", w->who, i); break;
+        case 1: snprintf(sql, sizeof(sql), "BEGIN; INSERT INTO t(who, k) VALUES('%s', %d); "
+                         "UPDATE c SET v = v + 1 WHERE id = 1; INSERT INTO s(who) VALUES('%s'); COMMIT", w->who, i, w->who); break;
+        case 2: snprintf(sql, sizeof(sql), "UPDATE t SET k = k WHERE id < 0"); break;   /* no-op: logged, then unlogged */
+        case 3: snprintf(sql, sizeof(sql), "INSERT INTO u(key, v, who) VALUES(%d, 1, '%s') "
+                         "ON CONFLICT(key) DO UPDATE SET v = v + 1, who = excluded.who", i % 17, w->who); break;
+        case 4: snprintf(sql, sizeof(sql), "DELETE FROM t WHERE id = (SELECT max(id) FROM t WHERE who = '%s')", w->who); break;
+        default: snprintf(sql, sizeof(sql), "INSERT OR IGNORE INTO u(key, v, who) VALUES(%d, 100, '%s')", i % 23, w->who); break;
+        }
+        if (sqlite3_exec(w->db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+            w->failed++;
+            sqlite3_exec(w->db, "ROLLBACK", NULL, NULL, NULL);
+        }
+    }
+    return NULL;
+}
+static char *dump_all(sqlite3 *db) {
+    static const char *q[] = { "SELECT group_concat(id||':'||who||':'||k, ';') FROM (SELECT * FROM t ORDER BY id)",
+        "SELECT group_concat(id||':'||who, ';') FROM (SELECT * FROM s ORDER BY id)",
+        "SELECT group_concat(key||':'||v||':'||who, ';') FROM (SELECT * FROM u ORDER BY key)",
+        "SELECT v FROM c", "SELECT group_concat(name||':'||seq, ';') FROM sqlite_sequence", NULL };
+    size_t cap = 1 << 20, len = 0; char *out = malloc(cap); out[0] = 0;
+    for (int i = 0; q[i]; i++) {
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(db, q[i], -1, &st, NULL) != SQLITE_OK) continue;
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+            const char *v = (const char *)sqlite3_column_text(st, 0); size_t n = strlen(v);
+            while (len + n + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+            memcpy(out + len, v, n); len += n; out[len++] = '|'; out[len] = 0;
+        }
+        sqlite3_finalize(st);
+    }
+    return out;
+}
+static const char *mixed_replica_differs(HppliteNode *w, HppliteL1 *l1, const char *path) {
+    static char why[200];
+    unsigned char ra[32], rb[32];
+    HppliteNode *r = open_node(path, l1);
+    if (!r) return "replica open";
+    hpplite_node_get_state_root(w, ra);
+    hpplite_node_get_state_root(r, rb);
+    char *a = dump_all(w->db), *b = dump_all(r->db);
+    int rows = strcmp(a, b) != 0, root = memcmp(ra, rb, 32) != 0;
+    if (rows) {
+        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
+        snprintf(why, sizeof(why), "replica differs at writer [%.50s] replica [%.50s]", a + i, b + i);
+    } else if (root) snprintf(why, sizeof(why), "replica root differs");
+    free(a); free(b);
+    hpplite_node_destroy(r);
+    return rows || root ? why : NULL;
+}
+#define SCHEMA "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k); " \
+    "CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT, who); " \
+    "CREATE TABLE u(key INTEGER PRIMARY KEY, v, who); CREATE TABLE c(id INTEGER PRIMARY KEY, v); INSERT INTO c VALUES(1, 0)"
+
+typedef struct { HppliteNode *n; volatile int stop; int flushes; } Flusher;
+static void *flusher(void *arg) {
+    Flusher *f = arg;
+    while (!f->stop) { hpplite_node_flush_batch(f->n); f->flushes++; usleep(200); }
+    return NULL;
+}
+
+static void test_two_connections_two_threads(void) {
+    TEST("two connections on two threads, interleaved autocommit INSERTs: the replica equals the writer");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/pool.db", l1);
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    HppliteNode *b = open_node(DIR "/pool.db", l1);
+    if (!b || !b->follower) FAIL("b should be a follower");
+    Writer wa = { a->db, "a", N, 0 }, wb = { b->db, "b", N, 0 };
+    Flusher f = { a, 0, 0 };
+    pthread_t ta, tb, tf;
+    pthread_create(&tf, NULL, flusher, &f);
+    pthread_create(&ta, NULL, write_autocommit, &wa);
+    pthread_create(&tb, NULL, write_autocommit, &wb);
+    pthread_join(ta, NULL); pthread_join(tb, NULL);
+    f.stop = 1; pthread_join(tf, NULL);
+    hpplite_node_destroy(b);
+    while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
+    const char *why = replica_differs(a, l1, DIR "/pool_replica.db");
+    int left = hpplite_node_pending_count(a);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    printf("(%d flushes, %d/%d failed) ", f.flushes, wa.failed, wb.failed);
+    if (wa.failed || wb.failed) FAIL("writes failed");
+    if (left) FAIL("pending left");
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* A second process writing the same file: it captures into the shared log
+** and posts nothing (no L1 of its own - what a follower process does) */
+static void test_two_processes(void) {
+    TEST("a second process writing the same file at once: the replica equals the writer");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/proc.db", l1);
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    hpplite_node_flush_batch(a);
+    pid_t pid = spawn_writer("--autocommit", DIR "/proc.db", "c", N);
+    Writer wa = { a->db, "a", N, 0 };
+    Flusher f = { a, 0, 0 };
+    pthread_t tf;
+    pthread_create(&tf, NULL, flusher, &f);
+    write_autocommit(&wa);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    f.stop = 1; pthread_join(tf, NULL);
+    while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
+    const char *why = replica_differs(a, l1, DIR "/proc_replica.db");
+    int left = hpplite_node_pending_count(a);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    printf("(%d flushes) ", f.flushes);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) FAIL("child writes failed");
+    if (wa.failed) FAIL("parent writes failed");
+    if (left) FAIL("pending left");
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* Four threads on four connections and three processes, all writing the
+** mixed workload at once while the sequencer flushes continuously */
+#define THREADS 4
+#define PROCS 3
+#define MIXED 1200
+static void test_mixed_threads_and_processes(void) {
+    TEST("4 threads and 3 processes, mixed workload at once, flushing throughout: the replica equals the writer");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/mixed.db", l1);
+    if (!a) FAIL("open");
+    if (hpplite_node_exec(a, SCHEMA, NULL) != 0) FAIL("schema");
+    hpplite_node_flush_batch(a);
+    pid_t pids[PROCS];
+    int nprocs = getenv("CONC_PROCS") ? atoi(getenv("CONC_PROCS")) : PROCS;
+    int nthreads = getenv("CONC_THREADS") ? atoi(getenv("CONC_THREADS")) : THREADS;
+    for (int p = 0; p < nprocs; p++) {
+        char who[8]; snprintf(who, sizeof(who), "p%d", p);
+        pids[p] = spawn_writer("--mixed", DIR "/mixed.db", who, MIXED);
+    }
+    HppliteNode *conn[THREADS]; Writer w[THREADS]; pthread_t th[THREADS];
+    char names[THREADS][8];
+    for (int i = 0; i < nthreads; i++) {
+        conn[i] = i == 0 ? a : open_node(DIR "/mixed.db", l1);
+        if (!conn[i]) FAIL("open thread connection");
+        sqlite3_busy_timeout(conn[i]->db, 20000);
+        snprintf(names[i], sizeof(names[i]), "t%d", i);
+        w[i] = (Writer){ conn[i]->db, names[i], MIXED, 0 };
+    }
+    Flusher f = { a, 0, 0 };
+    pthread_t tf;
+    pthread_create(&tf, NULL, flusher, &f);
+    for (int i = 1; i < nthreads; i++) pthread_create(&th[i], NULL, write_mixed, &w[i]);
+    if (nthreads > 0) write_mixed(&w[0]);
+    int failed = 0, childFailed = 0;
+    for (int i = 0; i < nthreads; i++) { if (i > 0) pthread_join(th[i], NULL); failed += w[i].failed; }
+    for (int p = 0; p < nprocs; p++) {
+        int status = 0; waitpid(pids[p], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) childFailed++;
+    }
+    f.stop = 1; pthread_join(tf, NULL);
+    for (int i = 1; i < nthreads; i++) hpplite_node_destroy(conn[i]);
+    while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
+    const char *why = mixed_replica_differs(a, l1, DIR "/mixed_replica.db");
+    int left = hpplite_node_pending_count(a);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    printf("(%d flushes) ", f.flushes);
+    if (failed) FAILF("%d thread statements failed", failed);
+    if (childFailed) FAILF("%d processes had failures", childFailed);
+    if (left) FAIL("pending left");
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* --hold <db> <dir> <n>: a full node that writes n rows, says who it is in
+** <dir>/ready (sequencer flag, instance id), and closes when <dir>/stop appears */
+static int holder_main(char **argv) {
+    HppliteL1 *l1;
+    char path[512], id[65];
+    HppliteNode *n = open_shared(argv[2], &l1);
+    if (!n) return 1;
+    hpplite_node_exec(n, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    Writer w = { n->db, "h", atoi(argv[4]), 0 };
+    write_autocommit(&w);
+    hex32(n->instanceId, id);
+    snprintf(path, sizeof(path), "%s/ready.tmp", argv[3]);
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "%d %s\n", n->follower ? 0 : 1, id); fclose(f); }
+    char ready[512]; snprintf(ready, sizeof(ready), "%s/ready", argv[3]);
+    rename(path, ready);
+    snprintf(path, sizeof(path), "%s/stop", argv[3]);
+    wait_file(path, 60000);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    return w.failed ? 1 : 0;
+}
+
+/* a writer process (spawn_writer): captures into the shared log, no L1 of its own */
+static int writer_main(char **argv) {
+    HppliteNode *c = open_node(argv[2], NULL);
+    if (!c) return 1;
+    sqlite3_busy_timeout(c->db, 20000);
+    Writer w = { c->db, argv[3], atoi(argv[4]), 0 };
+    if (strcmp(argv[1], "--mixed") == 0) write_mixed(&w); else write_autocommit(&w);
+    hpplite_node_destroy(c);
+    if (w.failed) fprintf(stderr, "writer %s: %d statements failed\n", argv[3], w.failed);
+    return w.failed ? 1 : 0;
+}
+
+/* The election across processes: the first full node on a file sequences;
+** one opened by another process meanwhile is a follower - it captures, it does
+** not post - and has the same instance id (the file's): when the sequencer
+** process closes, the follower takes over the lease it left, no claim needed */
+static void test_sequencer_across_processes(void) {
+    TEST("one sequencer per file across processes; a follower takes over when it exits, as the same sequencer");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    pid_t pid = spawn_writer("--hold", DIR "/seq.db", DIR, 40);
+    if (!wait_file(DIR "/ready", 20000)) { kill(pid, SIGKILL); FAIL("holder did not start"); }
+    int hSeq = 0; char hId[65] = {0};
+    FILE *f = fopen(DIR "/ready", "r");
+    if (!f || fscanf(f, "%d %64s", &hSeq, hId) != 2) { if (f) fclose(f); kill(pid, SIGKILL); FAIL("holder report"); }
+    fclose(f);
+    HppliteL1 *l1;
+    HppliteNode *b = open_shared(DIR "/seq.db", &l1);
+    if (!b) { kill(pid, SIGKILL); FAIL("open b"); }
+    char bId[65]; hex32(b->instanceId, bId);
+    Writer wb = { b->db, "b", 40, 0 };
+    write_autocommit(&wb);
+    int bFollower = b->follower, bPosted = hpplite_node_flush_batch(b) != 0;
+    unsigned char holder[32]; int held = lease_holder(l1, holder);
+    char holderHex[65] = {0}; if (held == 1) hex32(holder, holderHex);
+    (void)!system("touch " DIR "/stop");
+    int status = 0; waitpid(pid, &status, 0);
+    unsigned char after[32]; int heldAfter = lease_holder(l1, after);
+    char afterHex[65] = {0}; if (heldAfter == 1) hex32(after, afterHex);
+    hpplite_node_exec(b, "INSERT INTO t(who, k) VALUES('b', 1000)", NULL);
+    uint64_t h = hpplite_node_flush_batch(b);
+    int bSeq = !b->follower, bLease = b->hasLease, left = hpplite_node_pending_count(b);
+    const char *why = replica_differs(b, l1, DIR "/seq_replica.db");
+    hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    if (hSeq != 1) FAIL("the first process should sequence");
+    if (!bFollower) FAIL("a second process should be a follower");
+    if (bPosted) FAIL("a follower must not post");
+    if (strcmp(hId, bId) != 0) FAIL("both processes should be the same sequencer (the file's id)");
+    if (held != 1 || strcmp(holderHex, hId) != 0) FAIL("the lease should be the holder's");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) FAIL("holder failed");
+    if (heldAfter != 1 || strcmp(afterHex, bId) != 0) FAIL("with a follower still open, the lease is kept, not released");
+    if (!h || !bSeq || !bLease) FAIL("the follower should take over and post");
+    if (left) FAIL("pending left");
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* Close, alone vs. with company: the lease goes so a rebuilt database (another
+** file, another sequencer id) need not wait it out - unless a connection to
+** the same file is still open to take over */
+static void test_lease_on_close(void) {
+    TEST("a sequencer closing alone releases the lease; with another connection open it keeps it");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    HppliteL1 *l1;
+    HppliteNode *a = open_shared(DIR "/rel.db", &l1);
+    if (!a) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    hpplite_node_flush_batch(a);
+    hpplite_node_destroy(a);
+    unsigned char who[32];
+    int heldAlone = lease_holder(l1, who);
+    HppliteNode *s = open_node(DIR "/rel.db", l1);
+    HppliteNode *f = open_node(DIR "/rel.db", l1);
+    int fFollower = f ? f->follower : 0;
+    if (s) hpplite_node_exec(s, "INSERT INTO t(who, k) VALUES('s', 1)", NULL);
+    if (s) hpplite_node_destroy(s);
+    int heldWithCompany = lease_holder(l1, who);
+    if (f) hpplite_node_destroy(f);
+    hpplite_l1_disconnect(l1);
+    if (heldAlone != 0) FAIL("closing alone should release the lease");
+    if (!s || !f || !fFollower) FAIL("second connection should be a follower");
+    if (heldWithCompany != 1) FAIL("closing with a connection still open should keep the lease");
+    PASS();
+}
+
+int main(int argc, char **argv) {
+    self_path = argv[0];
+    if (argc == 5 && strcmp(argv[1], "--hold") == 0) return holder_main(argv);
+    if (argc == 5 && strncmp(argv[1], "--", 2) == 0) return writer_main(argv);
+    printf("HPPLite concurrent writers\n");
+    test_two_connections_two_threads();
+    test_two_processes();
+    test_mixed_threads_and_processes();
+    test_sequencer_across_processes();
+    test_lease_on_close();
+    printf("\n%d/%d passed\n", tests_passed, tests_run);
+    return tests_passed == tests_run ? 0 : 1;
+}

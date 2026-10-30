@@ -247,11 +247,16 @@ static void test_statement_classification(void) {
     if (pending_has(ctx, "VALUES(1, 'p')")) FAIL("failed prepared statement was logged");
     if (pending_has(ctx, "VALUES(40, 'p')") != 1) FAIL("successful prepared statement not logged");
 
-    /* statements with no effect are not worth replaying; DDL is kept */
-    exec(db, "UPDATE t SET v='none' WHERE id=99999");
-    if (pending_has(ctx, "'none'")) FAIL("no-op UPDATE should not be logged");
-    exec(db, "INSERT OR IGNORE INTO t VALUES(1,'ignored')");
-    if (pending_has(ctx, "'ignored'")) FAIL("ignored INSERT should not be logged");
+    /* statements with no effect: inside a transaction their rows go before
+    ** the commit; in autocommit the row committed with the statement and may
+    ** be in a batch already (another connection's flush), so it stays - a
+    ** statement that changed nothing replays as nothing */
+    exec(db, "BEGIN; UPDATE t SET v='none' WHERE id=99999; INSERT OR IGNORE INTO t VALUES(1,'ignored'); COMMIT;");
+    if (pending_has(ctx, "'none'")) FAIL("no-op UPDATE in a transaction should not be logged");
+    if (pending_has(ctx, "'ignored'")) FAIL("ignored INSERT in a transaction should not be logged");
+    exec(db, "UPDATE t SET v='none-auto' WHERE id=99999");
+    if (pending_has(ctx, "'none-auto'") != 1) FAIL("an autocommit no-op keeps its row");
+    if (sqlite3_changes(db) != 0) FAIL("changes() after an autocommit no-op is 0");
     exec(db, "CREATE INDEX t_v ON t(v)");
     if (pending_has(ctx, "CREATE INDEX t_v") != 1) FAIL("DDL must be logged");
     /* a multi-row INSERT aborted mid-way (table without triggers: with a

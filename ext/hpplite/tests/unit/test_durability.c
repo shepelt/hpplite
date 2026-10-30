@@ -1068,15 +1068,15 @@ static void test_second_connection_is_follower(void) {
     hpplite_batch_free(batch);
 
     /* the sequencer closes first; the follower keeps capturing into the file,
-    ** and the next sequencer to open posts what it left */
+    ** and - the last connection out - posts what is left when it closes */
     hpplite_node_destroy(a);
     hpplite_node_exec(b, "INSERT INTO t VALUES(8,'b-after')", NULL);
-    if (hpplite_node_flush_batch(b) != 0 || hpplite_node_pending_count(b) != 1) FAIL("follower still posts nothing");
+    if (!b->follower || hpplite_node_pending_count(b) != 1) FAIL("b is still a follower until it acts");
     hpplite_node_destroy(b);
     HppliteNode *c = open_node(DIR "/pool.db", l1);
     if (!c) FAIL("reopen");
     if (c->follower) FAIL("with a and b gone, c is the sequencer");
-    if (hpplite_node_pending_count(c) != 1 || hpplite_node_flush_batch(c) != 2) FAIL("c posts the follower's leftover");
+    if (hpplite_node_pending_count(c) != 0 || hpplite_node_get_height(c) != 3) FAIL("b posted its leftover as it closed");
     unsigned char rootC[32], rootR[32];
     hpplite_node_get_state_root(c, rootC);
     hpplite_node_destroy(c);
