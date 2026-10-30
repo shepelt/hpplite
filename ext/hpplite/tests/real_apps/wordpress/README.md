@@ -78,6 +78,14 @@ comments through the REST API, API and page reads.
 - Same load without HPPLite: 21.4 s and a write p50 of ~430 ms; with it,
   22.2 s and ~440 ms (~4%).
 
+The same on HPP Sepolia (fresh site, fresh wallet): every write succeeded
+(16 clients x 50, 20.1 s), the replica rebuilt from HPP Sepolia equals
+WordPress's database (22 tables, 1714 rows, 70 batches), 82 transactions,
+0.0267 ETH. The cost is WordPress's own write volume: 2.18 MB of SQL in 3142
+statements, ~4.3 KB per web write - 46% `INSERT INTO wp_posts` (each post and
+the revision WordPress keeps on every edit, all 23 columns spelled out by the
+plugin), 18% post updates, 11% comments, 5% the plugin's schema bookkeeping.
+
 Found on the way, fixed: a second process on the file was not a follower
 (each sequenced on its own); no-op statements from other connections could
 vanish from under a batch being built; and closing a connection waited out
