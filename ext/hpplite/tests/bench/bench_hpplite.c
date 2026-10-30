@@ -71,7 +71,12 @@ static double insert_rows(sqlite3 *db, int rows, int txnSize) {
         int id = nextId++;
         if (txnSize > 1 && i % txnSize == 0) sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
         snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d,'row-%08d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',%d.5)", id, id, i);
-        sqlite3_exec(db, sql, NULL, NULL, NULL);
+        if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+            /* a refused statement rolls its transaction back and the rest
+            ** runs in autocommit: the figure would be wrong, so stop */
+            fprintf(stderr, "bench: INSERT %d failed: %s\n", i, sqlite3_errmsg(db));
+            exit(1);
+        }
         if (txnSize > 1 && (i % txnSize == txnSize - 1 || i == rows - 1)) sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     }
     return now_ms() - t0;

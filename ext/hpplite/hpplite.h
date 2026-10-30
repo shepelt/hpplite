@@ -57,6 +57,14 @@ struct HppliteCtx {
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
   sqlite3_stmt *pRecTrigStmt; /* Cached PRAGMA recursive_triggers (read) */
   int bRecTrigSeen;           /* The application prepared PRAGMA recursive_triggers: read it per statement */
+  int bCollectFns;            /* Authorizer is checking the functions of a write (#53, #54) */
+  char zCollectWhy[160];      /* ...first reason it cannot replay ("" = none) */
+  char **azReplicaFns;        /* Functions a replica has (fresh connection), sorted, lower case */
+  int nReplicaFns;            /* ...count; -1 = unknown (pragma_function_list unavailable) */
+  int nDdlGen;                /* DDL captured on this connection (invalidates the verdicts) */
+  struct HppliteFnVerdict {   /* Function check of a write, by statement text and schema */
+    char *zSql; int schema; char zWhy[160];
+  } aFnVerdict[64];
   sqlite3_stmt *aActiveStmt[16]; /* Application statements between their STMT and PROFILE trace */
   int nActiveStmt;
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */

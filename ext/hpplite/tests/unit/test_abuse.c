@@ -152,6 +152,8 @@ static const char *aRefused[] = {
     "INSERT INTO t VALUES(changes())",
     "INSERT INTO t VALUES(total_changes())",
     "INSERT INTO t VALUES(sqlite_version())",
+    "INSERT INTO t VALUES(sqlite_source_id())",
+    "INSERT INTO t VALUES(sqlite_compileoption_used('THREADSAFE'))",
     "INSERT INTO t VALUES(datetime('now'))",
     "INSERT INTO t VALUES(DATETIME ( 'now' ))",
     "INSERT INTO t VALUES(datetime('NOW'))",
@@ -232,6 +234,22 @@ static const char *aAllowed[] = {
     "PRAGMA recursive_triggers = 0",
     "PRAGMA journal_mode",
     "PRAGMA user_version = 3",
+    /* ALTER runs SQLite's internal functions (sqlite_rename_table ...),
+    ** which are not in pragma_function_list: still SQLite's, not the app's */
+    "CREATE TABLE alt(a, b, c)",
+    "ALTER TABLE alt RENAME COLUMN b TO bb",
+    "ALTER TABLE alt RENAME TO alt2",
+    "ALTER TABLE alt2 DROP COLUMN c",
+    "ALTER TABLE alt2 ADD COLUMN d DEFAULT 4",
+    /* reads never reach the log: nothing to replay, nothing to refuse (#54) */
+    "SELECT random()",
+    "SELECT randomblob(4)",
+    "SELECT x FROM t ORDER BY random()",
+    "SELECT last_insert_rowid()",
+    "SELECT changes(), total_changes()",
+    "SELECT sqlite_version()",
+    "WITH r(v) AS (SELECT random()) SELECT v FROM r",
+    "SELECT * FROM t WHERE x > abs(random()) % 2",
     /* a cascade with foreign keys on is replayed in that mode (#52) */
     "PRAGMA foreign_keys = ON",
     "CREATE TABLE ap(id INTEGER PRIMARY KEY)",
@@ -290,6 +308,98 @@ static void test_guard_spellings(void) {
     hpplite_node_destroy(r);
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* An application-defined function (Django registers ~40 on every
+** connection) is not on the replica: a write that calls it, directly or
+** through a view or trigger, cannot replay and must be refused at the
+** write; so must a generated column or index that would call it. Reads that call it are fine (#53). */
+static void appFn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    sqlite3_result_int64(ctx, sqlite3_value_int64(argv[0]) * 7);
+}
+static const char *aAppRefused[] = {
+    "INSERT INTO t VALUES(app_fn(1))",
+    "INSERT INTO t VALUES(APP_FN(1))",
+    "INSERT INTO t SELECT app_fn(x) FROM t",
+    "UPDATE t SET x = app_fn(x)",
+    "UPDATE t SET x = x + 1 WHERE app_fn(x) = 7",
+    "DELETE FROM t WHERE app_fn(x) = 14",
+    "INSERT INTO t VALUES(1) RETURNING app_fn(x)",
+    "INSERT INTO t SELECT y FROM v_app",                     /* through a view */
+    "INSERT INTO trig_src VALUES(1)",                        /* through a trigger body */
+    /* a generated column or expression index calls it on every later write,
+    ** where the authorizer does not look: so the CREATE itself is refused */
+    "CREATE TABLE d(x, y AS (app_fn(x)))",
+    "CREATE INDEX ix_app ON t(app_fn(x))",
+    NULL
+};
+static void test_app_defined_functions(void) {
+    TEST("writes that call an application-defined function are refused; reads are not");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/appfn.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    /* the objects that hide a call; created before the function exists, as a
+    ** replica would see them, so their creation itself is a legal write */
+    hpplite_node_exec(n, "CREATE VIEW v_app AS SELECT app_fn(x) AS y FROM t", NULL);
+    hpplite_node_exec(n, "CREATE TABLE trig_src(a)", NULL);
+    hpplite_node_exec(n, "CREATE TRIGGER tr_app AFTER INSERT ON trig_src BEGIN INSERT INTO t VALUES(app_fn(new.a)); END", NULL);
+    if (sqlite3_create_function(n->db, "app_fn", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, appFn, NULL, NULL) != SQLITE_OK)
+        FAIL("register app_fn");
+    int pendingBefore = hpplite_node_pending_count(n);
+    int rowsBefore = count_rows(n->db, "t");
+    for (int i = 0; aAppRefused[i]; i++) {
+        char *err = NULL;
+        int rc = sqlite3_exec(n->db, aAppRefused[i], NULL, NULL, &err);
+        if (rc == SQLITE_OK) FAILF("accepted: %s", aAppRefused[i]);
+        sqlite3_free(err);
+        if (hpplite_node_pending_count(n) != pendingBefore) FAILF("pending log changed by: %s", aAppRefused[i]);
+        if (count_rows(n->db, "t") != rowsBefore) FAILF("rows changed by: %s", aAppRefused[i]);
+        if (sqlite3_get_autocommit(n->db) == 0) FAILF("left a transaction open: %s", aAppRefused[i]);
+    }
+    /* reads may call it */
+    static const char *aRead[] = { "SELECT app_fn(x) FROM t", "SELECT * FROM v_app",
+                                   "SELECT x FROM t WHERE app_fn(x) = 7", NULL };
+    for (int i = 0; aRead[i]; i++) {
+        char *err = NULL;
+        if (sqlite3_exec(n->db, aRead[i], NULL, NULL, &err) != SQLITE_OK) FAILF("read refused: %s (%s)", aRead[i], err ? err : "?");
+        sqlite3_free(err);
+    }
+    /* a prepared write is checked on every run, not only the first: the
+    ** same text is fine until a trigger that calls the function appears */
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(n->db, "INSERT INTO t VALUES(?1)", -1, &ins, NULL) != SQLITE_OK) FAIL("prepare");
+    sqlite3_bind_int(ins, 1, 5);
+    if (sqlite3_step(ins) != SQLITE_DONE) FAIL("plain prepared insert refused");
+    sqlite3_reset(ins);
+    hpplite_node_exec(n, "CREATE TRIGGER tr_t AFTER INSERT ON t WHEN new.x = 6 BEGIN INSERT INTO trig_src VALUES(0); END", NULL);
+    sqlite3_finalize(ins);
+    ins = NULL;
+    if (sqlite3_prepare_v2(n->db, "INSERT INTO t VALUES(?1)", -1, &ins, NULL) != SQLITE_OK) FAIL("prepare 2");
+    sqlite3_bind_int(ins, 1, 6);
+    if (sqlite3_step(ins) == SQLITE_DONE) FAIL("insert that fires a trigger calling app_fn was accepted");
+    sqlite3_finalize(ins);
+    hpplite_node_exec(n, "DROP TRIGGER tr_t", NULL);
+    /* everything accepted replays to the writer's root */
+    if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
+    unsigned char rootA[32], rootB[32];
+    hpplite_node_get_state_root(n, rootA);
+    HppliteNode *r = open_node(DIR "/appfn_replica.db", l1);
+    if (!r) FAIL("open replica");
+    if (r->state == HPPLITE_STATE_ERROR) FAIL("replica sync failed");
+    if (r->ctx->nReplaySkipped != 0) FAIL("replica skipped a statement");
+    hpplite_node_get_state_root(r, rootB);
+    int rowsR = count_rows(r->db, "t"), rowsW = count_rows(n->db, "t");
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (memcmp(rootA, rootB, 32) != 0) FAIL("replica root differs");
+    if (rowsR != rowsW) FAIL("replica row count differs");
     PASS();
 }
 
@@ -710,6 +820,7 @@ static void test_oversized_transaction(void) {
 int main(void) {
     printf("=== HPPLite abuse tests ===\n");
     test_guard_spellings();
+    test_app_defined_functions();
     test_wrong_height_batch();
     test_plaintext_on_encrypting_rollup();
     test_plaintext_at_height_1();

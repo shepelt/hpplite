@@ -591,6 +591,170 @@ static int isNondeterministicSql(const char *zIn) {
   return 0;
 }
 
+static int isIdentChar(char c);
+/*
+** Functions in writes (#53, #54). A captured write is replayed on a
+** connection that has SQLite's built-in functions and nothing the
+** application registered (Django adds ~40 on every connection). Its
+** functions are found by preparing its text again on the application
+** connection with the authorizer collecting (prepare walks views, triggers,
+** generated columns and indexes too); the verdict is cached by text and
+** schema version. Reads are never checked: they are not logged.
+*/
+static int cmpFnName(const void *a, const void *b) {
+  return strcmp(*(const char *const*)a, *(const char *const*)b);
+}
+static void loadReplicaFunctions(HppliteCtx *pCtx) {
+  sqlite3 *m = NULL;
+  sqlite3_stmt *st = NULL;
+  int n = 0, cap = 0;
+  char **a = NULL;
+  pCtx->nReplicaFns = -1;
+  if (sqlite3_open_v2(":memory:", &m, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK
+      || sqlite3_prepare_v2(m, "SELECT DISTINCT lower(name) FROM pragma_function_list", -1, &st, NULL) != SQLITE_OK) {
+    sqlite3_finalize(st);
+    sqlite3_close(m);
+    return;
+  }
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    const char *z = (const char*)sqlite3_column_text(st, 0);
+    if (!z) continue;
+    if (n == cap) {
+      char **b = sqlite3_realloc64(a, sizeof(char*) * (cap = cap ? cap * 2 : 256));
+      if (!b) break;
+      a = b;
+    }
+    a[n++] = sqlite3_mprintf("%s", z);
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(m);
+  if (n > 0) {
+    qsort(a, n, sizeof(char*), cmpFnName);
+    pCtx->azReplicaFns = a;
+    pCtx->nReplicaFns = n;
+  } else {
+    sqlite3_free(a);
+  }
+}
+static void freeFunctionChecks(HppliteCtx *pCtx) {
+  int i;
+  for (i = 0; i < pCtx->nReplicaFns; i++) sqlite3_free(pCtx->azReplicaFns[i]);
+  sqlite3_free(pCtx->azReplicaFns);
+  pCtx->azReplicaFns = NULL;
+  pCtx->nReplicaFns = 0;
+  for (i = 0; i < (int)(sizeof(pCtx->aFnVerdict) / sizeof(pCtx->aFnVerdict[0])); i++) {
+    sqlite3_free(pCtx->aFnVerdict[i].zSql);
+    pCtx->aFnVerdict[i].zSql = NULL;
+  }
+}
+static void collectFunction(HppliteCtx *pCtx, const char *zName) {
+  static const char *aNondet[] = { "random", "randomblob", "last_insert_rowid", "changes", "total_changes",
+                                   "sqlite_version", "sqlite_source_id", "sqlite_compileoption_used",
+                                   "sqlite_compileoption_get", "load_extension", NULL };
+  char lower[64];
+  const char *pLower = lower;
+  size_t i, n = strlen(zName);
+  if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+  for (i = 0; i < n; i++) lower[i] = (zName[i] >= 'A' && zName[i] <= 'Z') ? (char)(zName[i] + 32) : zName[i];
+  lower[n] = 0;
+  for (i = 0; aNondet[i]; i++) {
+    if (strcmp(lower, aNondet[i]) == 0) {
+      snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy),
+               "non-deterministic function %s() in a write; replay cannot reproduce it", lower);
+      return;
+    }
+  }
+  /* SQLite's internal functions (sqlite_rename_table ... for ALTER) are
+  ** hidden from pragma_function_list and callable only by SQLite itself */
+  if (strncmp(lower, "sqlite_", 7) == 0) return;
+  if (pCtx->nReplicaFns == 0) loadReplicaFunctions(pCtx);
+  if (pCtx->nReplicaFns > 0
+      && !bsearch(&pLower, pCtx->azReplicaFns, pCtx->nReplicaFns, sizeof(char*), cmpFnName)) {
+    snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy),
+             "%s() is defined by the application, not SQLite: a replica does not have it, so a write "
+             "that calls it cannot replay", lower);
+  }
+}
+/* The statement's shape: string and number literals blanked. Which
+** functions a statement calls cannot depend on a literal's value, so a loop
+** of INSERTs with different values shares one verdict. Caller frees. */
+static char *statementShape(const char *z) {
+  char *out = sqlite3_malloc64(strlen(z) + 1), *o = out;
+  char prev = ' ';
+  if (!out) return NULL;
+  while (*z) {
+    if (*z == '\'') {                                  /* 'string' ('' escapes) */
+      z++;
+      while (*z && !(*z == '\'' && z[1] != '\'')) z += (*z == '\'') ? 2 : 1;
+      if (*z) z++;
+      *o++ = '?'; prev = '?';
+    } else if (*z == '"' || *z == '`' || *z == '[') {   /* quoted identifier: kept */
+      char q = (*z == '[') ? ']' : *z;
+      *o++ = *z++;
+      while (*z && *z != q) *o++ = *z++;
+      if (*z) *o++ = *z++;
+      prev = 'x';
+    } else if (*z >= '0' && *z <= '9' && !isIdentChar(prev)) {
+      while (isIdentChar(*z) || *z == '.') z++;         /* 12, 1.5, 0x1F, 1e5 */
+      if ((z[-1] == 'e' || z[-1] == 'E') && (*z == '+' || *z == '-')) { z++; while (*z >= '0' && *z <= '9') z++; }
+      *o++ = '#'; prev = '#';
+    } else {
+      prev = *o++ = *z++;
+    }
+  }
+  *o = 0;
+  return out;
+}
+/* Returns the reason the write cannot replay, or NULL */
+static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  const char *zSql = sqlite3_sql(pS);
+  struct HppliteFnVerdict *v;
+  sqlite3_stmt *p = NULL;
+  int schema, rc;
+  uint64_t h = 1469598103934665603ULL;
+  const char *c;
+  char *zShape;
+  if (!zSql) return NULL;
+  zShape = statementShape(zSql);
+  if (!zShape) {
+    snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy), "could not check the functions of a write (out of memory)");
+    return pCtx->zCollectWhy;
+  }
+  for (c = zShape; *c; c++) h = (h ^ (unsigned char)*c) * 1099511628211ULL;
+  /* The key must not read the file: a read of our own here, while the
+  ** application statement is starting, races a bookkeeping commit (WAL
+  ** snapshot, see bkBegin). The data version is in memory and moves when
+  ** another connection commits; our own DDL is counted as it is captured.
+  ** Left open: another connection adding a trigger that calls an
+  ** application function, between our last lock and this statement. */
+  {
+    unsigned int dv = 0;
+    sqlite3_file_control(pCtx->db, "main", SQLITE_FCNTL_DATA_VERSION, &dv);
+    schema = (int)(dv * 2654435761u) ^ pCtx->nDdlGen;
+  }
+  v = &pCtx->aFnVerdict[h % (sizeof(pCtx->aFnVerdict) / sizeof(pCtx->aFnVerdict[0]))];
+  if (v->zSql && v->schema == schema && strcmp(v->zSql, zShape) == 0) {
+    sqlite3_free(zShape);
+    return v->zWhy[0] ? v->zWhy : NULL;
+  }
+  pCtx->zCollectWhy[0] = 0;
+  pCtx->bCollectFns = 1;
+  rc = sqlite3_prepare_v2(pCtx->db, zSql, -1, &p, NULL);
+  pCtx->bCollectFns = 0;
+  sqlite3_finalize(p);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(zShape);
+    snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy), "could not check the functions of a write (%s)",
+             sqlite3_errstr(rc));
+    return pCtx->zCollectWhy;             /* not cached: may be transient */
+  }
+  sqlite3_free(v->zSql);
+  v->zSql = zShape;
+  v->schema = schema;
+  memcpy(v->zWhy, pCtx->zCollectWhy, sizeof(v->zWhy));
+  return v->zWhy[0] ? v->zWhy : NULL;
+}
+
 /*
 ** Authorizer: the parser's view, so quoting, case and comments cannot hide
 ** anything. Application statements (bInternal clear) may not write our
@@ -639,21 +803,10 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       ** connection flags, recursive_triggers only after it was touched */
       if (z1 && sqlite3_stricmp(z1, "recursive_triggers") == 0) pCtx->bRecTrigSeen = 1;
       return SQLITE_OK;
-    case SQLITE_FUNCTION: {
-      static const char *aFn[] = { "random", "randomblob", "last_insert_rowid", "changes", "total_changes",
-                                   "sqlite_version", "load_extension", NULL };
-      int i;
-      for (i = 0; aFn[i]; i++) {
-        if (z2 && sqlite3_stricmp(z2, aFn[i]) == 0) {
-          pCtx->nNondeterministic++;
-          if (pCtx->bDeterminismWarn) return SQLITE_OK;
-          pCtx->zDenyWhy = "non-deterministic function; replay cannot reproduce it (unsupported in v0.1, bind the value)";
-          pCtx->nAuthDenied++;
-          return SQLITE_DENY;
-        }
-      }
+    case SQLITE_FUNCTION:
+      /* Checked when a write is captured (functionVerdict), not here: a
+      ** read that calls random() never reaches the log (#54) */
       return SQLITE_OK;
-    }
     default:
       return SQLITE_OK;
   }
@@ -662,7 +815,12 @@ static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2,
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   int rc;
   (void)z3; (void)z4;
-  if (!pCtx || pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  if (!pCtx) return SQLITE_OK;
+  if (pCtx->bCollectFns) {
+    if (op == SQLITE_FUNCTION && z2 && !pCtx->zCollectWhy[0]) collectFunction(pCtx, z2);
+    return SQLITE_OK;
+  }
+  if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
   rc = hppliteAuthorizerInner(pCtx, op, z1, z2);
   if (rc == SQLITE_DENY) {
     fprintf(stderr, "hpplite: %s; statement refused (SQLITE_AUTH)\n", pCtx->zDenyWhy ? pCtx->zDenyWhy : "not authorized");
@@ -812,6 +970,9 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     return 0;
   }
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
+  /* SQLite's own verdict: a statement that cannot write is never logged, so
+  ** nothing in it needs to replay (WITH ... SELECT random() included) */
+  if (pS && sqlite3_stmt_readonly(pS)) return 0;
   /* Statements replay cannot reproduce are unsupported in v0.1 (row-level
   ** capture, #19, lifts this): connection state that changes what a later
   ** statement does, and non-deterministic values. Refused by default so the
@@ -845,6 +1006,29 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     ** every replica): not logged, so not allowed either. */
     refuseStatement(pCtx, "application writes may not reference _hpplite_ tables", zSql);
     return 0;
+  }
+  {
+    const char *z = zSql;
+    while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+    if (sqlite3_strnicmp(z, "CREATE", 6) == 0 || sqlite3_strnicmp(z, "DROP", 4) == 0
+        || sqlite3_strnicmp(z, "ALTER", 5) == 0) {
+      pCtx->nDdlGen++;                    /* views and triggers change what a write calls */
+    }
+  }
+  {
+    const char *zWhy = functionVerdict(pCtx, pS);
+    if (zWhy) {
+      int bAppFn = strstr(zWhy, "defined by the application") != NULL;
+      char why[240];
+      pCtx->nNondeterministic++;
+      /* determinism=warn lets non-deterministic values through (counted);
+      ** a function the replica does not have never replays at all */
+      if (!pCtx->bDeterminismWarn || bAppFn) {
+        snprintf(why, sizeof(why), "%s; unsupported in v0.1, compute the value in the application and bind it", zWhy);
+        refuseStatement(pCtx, why, zSql);
+        return 0;
+      }
+    }
   }
 
   /* Bound parameters are substituted so the statement can be replayed */
@@ -1045,6 +1229,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     sqlite3_set_authorizer(pCtx->db, NULL, NULL);
     finalizeOwnStatements(pCtx);
   }
+  freeFunctionChecks(pCtx);
   sqlite3_free(pCtx);
 }
 
