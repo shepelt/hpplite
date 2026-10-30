@@ -122,6 +122,8 @@ typedef struct HppliteNode {
     void *timerThread;              /* pthread_t (opaque) */
     void *flushMutex;               /* pthread_mutex_t */
     volatile int timerRunning;
+    void *timerWake;                /* pthread_cond_t: stop wakes the timer at once */
+    void *timerWakeMutex;           /* pthread_mutex_t for it */
     int64_t lastFlushTime;
 
     /* Ownership flags */

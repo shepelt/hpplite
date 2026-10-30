@@ -552,6 +552,14 @@ void hpplite_node_destroy(HppliteNode *node) {
         node->usersFd = -1;
     }
 
+    if (node->timerWake) {
+        pthread_cond_destroy((pthread_cond_t *)node->timerWake);
+        pthread_mutex_destroy((pthread_mutex_t *)node->timerWakeMutex);
+        sqlite3_free(node->timerWake);
+        sqlite3_free(node->timerWakeMutex);
+        node->timerWake = node->timerWakeMutex = NULL;
+    }
+
     /* Free crypto */
     if (node->crypto) {
         hpplite_crypto_free(node->crypto);
@@ -1205,11 +1213,22 @@ static void *node_timer_thread_func(void *arg) {
     int intervalMs = node->config.batchIntervalMs;
     if (intervalMs <= 0) return NULL;
 
-    /* Sleep in small increments for quick shutdown */
+    /* Wake every 100 ms at most; a stop wakes it at once (a close must not
+    ** wait out the sleep: with one connection per request - PHP - that was
+    ** most of what HPPLite added to a request) */
     int sleepMs = (intervalMs < 100) ? intervalMs : 100;
+    pthread_cond_t *wake = (pthread_cond_t *)node->timerWake;
+    pthread_mutex_t *wakeMutex = (pthread_mutex_t *)node->timerWakeMutex;
 
     while (node->timerRunning) {
-        usleep(sleepMs * 1000);
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += (long)sleepMs * 1000000L;
+        until.tv_sec += until.tv_nsec / 1000000000L;
+        until.tv_nsec %= 1000000000L;
+        pthread_mutex_lock(wakeMutex);
+        if (node->timerRunning) pthread_cond_timedwait(wake, wakeMutex, &until);
+        pthread_mutex_unlock(wakeMutex);
 
         if (!node->timerRunning) break;
 
@@ -1263,6 +1282,15 @@ void hpplite_node_start_timer(HppliteNode *node) {
     /* Start thread */
     pthread_t *thread = sqlite3_malloc(sizeof(pthread_t));
     if (!thread) return;
+    if (!node->timerWake) {
+        pthread_cond_t *c = sqlite3_malloc(sizeof(pthread_cond_t));
+        pthread_mutex_t *m = sqlite3_malloc(sizeof(pthread_mutex_t));
+        if (!c || !m) { sqlite3_free(c); sqlite3_free(m); sqlite3_free(thread); return; }
+        pthread_cond_init(c, NULL);
+        pthread_mutex_init(m, NULL);
+        node->timerWake = c;
+        node->timerWakeMutex = m;
+    }
 
     node->timerRunning = 1;
     pthread_create(thread, NULL, node_timer_thread_func, node);
@@ -1275,8 +1303,11 @@ void hpplite_node_start_timer(HppliteNode *node) {
 void hpplite_node_stop_timer(HppliteNode *node) {
     if (!node || !node->timerRunning) return;
 
-    /* Signal thread to stop */
+    /* Signal thread to stop, and wake it */
+    pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
+    pthread_cond_signal((pthread_cond_t *)node->timerWake);
+    pthread_mutex_unlock((pthread_mutex_t *)node->timerWakeMutex);
 
     /* Wait for thread to finish */
     pthread_t *thread = (pthread_t *)node->timerThread;

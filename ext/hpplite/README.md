@@ -189,18 +189,25 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
 // npm sqlite3 (Knex): new sqlite3.Database(":memory:").loadExtension(path, cb) first
 ```
 
-- **The first connection to a file in a process is the sequencer** (it
-  posts); later ones capture and leave posting to it. Open it at startup
-  and keep it open for the life of the process; close it last. With a
-  connection pool, open one connection yourself at startup and hold it.
-  A migration tool run as its own process while the server is stopped is
-  fine: it becomes the sequencer for its run.
-- **Close flushes**: it posts what is pending, waits for L1 and releases
-  the sequencer lease. Bounded: an unreachable RPC costs one timeout (15 s,
-  `HPPLITE_RPC_TIMEOUT`) and the rows stay in the file for the next open -
-  but the lease could not be released then, so the next process posts only
-  once it expires (the lease length, minutes). To be sure before exiting,
-  `SELECT hpplite_flush()` and check `pending` is 0.
+- **One connection to a file posts, whatever opens it**: threads with their
+  own connections, a pool, several processes (php-fpm, gunicorn workers, a
+  cron job beside the server). The first to open is the *sequencer*; the
+  others capture into the same log in the file and leave posting to it.
+  When the sequencer closes or its process dies, another connection takes
+  over within a second, as the same sequencer to L1 (no lease transaction).
+  `hpplite_status.sequencer` says which one posts.
+- **Close flushes** if this connection is the sequencer: it posts what is
+  pending and waits for L1. A follower closes at once - unless the
+  sequencer is gone, in which case it takes over first (the last connection
+  out posts). Bounded: an unreachable RPC costs one timeout (15 s,
+  `HPPLITE_RPC_TIMEOUT`) and the rows stay in the file for the next open.
+  To be sure before exiting, `SELECT hpplite_flush()` and check `pending`
+  is 0.
+- **Short-lived connections** (PHP opens one per request, CGI, cron): run
+  `hpplite-sequencer <file>` beside the app with the same `HPPLITE_PARAMS`.
+  It holds the file as its sequencer, so every request is a follower and
+  never waits for the chain (WordPress, 8 PHP workers, 16 concurrent
+  clients: ~4% over plain SQLite; `tests/real_apps/wordpress`).
 - **Everything that writes is replayed**, DDL included: `CREATE`, `ALTER`,
   `DROP`, the table rebuilds migration tools do, `PRAGMA user_version` and
   `application_id`. `changes()`, `last_insert_rowid()` and `RETURNING`
@@ -210,16 +217,21 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   to another machine). In the same process as the live writer it says
   `another sequencer instance holds the lease`: expected - it is a reader.
 
-**Every connection that writes must open with `hpplite=on`** - a plain
-connection's writes are not captured. The first `hpplite=on` connection to a
-file in a process is the sequencer (L1, lease, timer); later ones are
-*followers*: they capture into the same log in the file and post nothing,
-the sequencer's flush posts everyone's rows (transaction groups stay correct
-across connections). Close the sequencer last; rows a follower captures
-after it is gone wait in the file for the next sequencer. Several
-*processes* on one file work the same way, with the lease deciding who
-posts. Loading HPPLite twice into one connection (static library plus
-module) is refused.
+**Every connection that writes must open with `hpplite=on`** (or be named
+by `HPPLITE_FILES`) - a plain connection's writes are not captured. Within
+a process the sequencer is the first `hpplite=on` connection to the file;
+across processes it is whoever holds an flock on `<file>-hpplite`, a small
+file beside the database that also keeps the seed of the sequencer's id
+(the id is the file's and the host's: every process on the host is the same
+sequencer to L1; a copy of the file on another machine is not). Every
+connection also holds `<file>-hpplite-users` shared while open, so a closing
+sequencer knows whether someone will take over: it keeps the lease for them,
+or releases it when it is the last. Both files belong with the database (and
+need a local filesystem, as SQLite's WAL does). Followers capture into the
+shared log and post nothing; the sequencer's flush posts everyone's rows in
+commit order, transaction groups intact (`tests/unit/test_concurrency.c`:
+threads and processes writing at once, replica equal). Loading HPPLite twice
+into one connection (static library plus module) is refused.
 
 **Statically linked** with the SQLite built in this tree (what the tests use):
 
@@ -365,7 +377,9 @@ logged, not yet posted), `state_root`, `prev_block_hash`,
 `last_checkpoint_height`, `lease` (1 = this instance may post), `log_errors`,
 `replay_skipped`, `encryption`, `keyed`, `nondeterministic`, `contract`,
 `da_contract`, `last_batch_tx`, `foreign_batches`, `hooks_replaced`,
-`roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`.
+`roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`,
+`sequencer` (1 = this connection posts the file's batches; 0 = another
+connection, in this process or another, does).
 
 
 What exists in v0.1 is **rebuild and compare**: open an empty file with the

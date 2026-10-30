@@ -135,8 +135,14 @@ interval, no durability model beyond SQLite's own.
 
 Inside an explicit transaction a failed statement only undoes its own
 changes, so when a logged statement completes HPPLite checks whether it had
-any effect (rows changed or schema changed) and deletes the log row if not:
-failed statements and no-ops are never replayed. SQLite reports a
+any effect (rows changed or schema changed) and deletes the log row if not,
+before the transaction commits: failed statements are never replayed. (In
+autocommit a failed statement's rollback takes its row along. A no-op in
+autocommit keeps its row: it committed with the statement and may already be
+in a batch another connection is building, and removing it then would leave
+that batch holding a row the log no longer has. A statement that changed
+nothing on the writer changes nothing on a replica with the same state.)
+SQLite reports a
 statement's error only after the trace sees it finish, so effect is the
 signal; its one blind spot is a statement whose triggers changed rows
 before it aborted. Replay therefore skips any statement that fails

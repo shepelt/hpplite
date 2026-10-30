@@ -50,3 +50,35 @@ from HPP Sepolia alone equals WordPress's database: 22 tables, 909 rows,
 153 batches, same root, the checkpoint root compared. 506 transactions,
 0.0081 ETH: each of the ~75 PHP processes claims the lease when it opens the
 database and posts what it wrote when it closes.
+
+## Concurrent: several PHP workers at once (2026-10-30, anvil)
+
+What a production setup does: many PHP worker processes, each request its own
+database connection, all writing at once. `PHP_CLI_SERVER_WORKERS=8 php -S`
+(the built-in server forking 8 workers - php-fpm's process model) and
+`hpplite-sequencer` holding the database, so every request's connection is a
+follower that captures and closes without waiting for the chain:
+
+```bash
+HPPLITE_PARAMS="$HPPLITE_PARAMS&datadir=/tmp/wp/wordpress/wp-content/database&interval=1s" \
+  build_real/hpplite-sequencer /tmp/wp/wordpress/wp-content/database/.ht.sqlite &
+(cd /tmp/wp/wordpress && PHP_CLI_SERVER_WORKERS=8 $P -S localhost:8093) &
+python3 tests/real_apps/wordpress/load.py http://localhost:8093 admin <application password> 16 50
+```
+
+`load.py`: 16 clients at once, 50 operations each - new posts, edits,
+comments through the REST API, API and page reads.
+
+- Every write succeeded (245 posts, 109 edits, 152 comments); no refusals
+  but the installer's REGEXP one.
+- A replica rebuilt from the chain equals WordPress's database: 22 tables,
+  1714 rows, 27 batches. 39 transactions in all (one lease claim, the
+  batches) - the single-process runs above took ~3 per batch, every PHP
+  process claiming and releasing the lease.
+- Same load without HPPLite: 21.4 s and a write p50 of ~430 ms; with it,
+  22.2 s and ~440 ms (~4%).
+
+Found on the way, fixed: a second process on the file was not a follower
+(each sequenced on its own); no-op statements from other connections could
+vanish from under a batch being built; and closing a connection waited out
+HPPLite's 100 ms timer sleep - most of what it added to each PHP request.
