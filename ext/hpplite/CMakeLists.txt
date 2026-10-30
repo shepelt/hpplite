@@ -64,6 +64,10 @@ target_link_libraries(sqlite3 PUBLIC
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+# FTS5's ranking uses log(): libm, separate from libc outside Apple
+if(NOT APPLE)
+    target_link_libraries(sqlite3 PUBLIC m)
+endif()
 
 # HPPLite core library
 set(HPPLITE_SOURCES
