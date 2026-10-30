@@ -77,6 +77,10 @@ struct HppliteCtx {
   unsigned aActiveSeen[16];      /* ...clock reads on the thread when it started */
   int aActiveVm[16];             /* ...its VM step count when this run started (a later trace with
                                  ** the same count is a sub-program; another count, a new run) */
+  int seenSchema;                /* schema_version this connection last loaded (-1: not yet) */
+  sqlite3_stmt *pRerunStmt;      /* a statement prepared on a stale schema, logged in a transaction
+                                 ** HPPLite opened for it: SQLite reruns it without a STMT trace */
+  int rerunStage;                /* 1 logged, 2 its first run failed (SQLITE_SCHEMA) and the rerun runs */
   volatile int bAppTxnOpen;   /* The application connection is inside a transaction (app thread
                               ** writes, the timer thread reads: no bookkeeping commit then) */
   struct HppliteNoClock { sqlite3_int64 id, now; } *aNoClock; /* Log rows whose statement did not read

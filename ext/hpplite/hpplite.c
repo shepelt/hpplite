@@ -1166,6 +1166,74 @@ static void noteNoClock(HppliteCtx *pCtx, sqlite3_int64 id, sqlite3_int64 now) {
   sqlite3_mutex_leave(pCtx->pNoClockMutex);
 }
 
+/*
+** A statement prepared on a stale schema - another connection changed it -
+** fails its first run with SQLITE_SCHEMA and SQLite reruns it inside
+** sqlite3_step(), without a STMT trace (tag-20220401a): in autocommit the
+** failed run rolls back our log row, and the rerun would go unlogged. So
+** once our row is written (in the write transaction: a read before it would
+** hold a snapshot the write could not upgrade from), HPPLite reads the schema
+** version; if it moved since this connection last saw it, the statement is
+** stale, and HPPLite turns the transaction into one of its own (BEGIN, before
+** the statement's own transaction start). The failed run then undoes only
+** itself; our row stays; the rerun runs in the same transaction, which
+** HPPLite commits at its end.
+*/
+static void rerunBegin(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  int v;
+  if (pCtx->pRerunStmt || !sqlite3_get_autocommit(pCtx->db)) return;
+  v = schemaVersion(pCtx);
+  if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema
+      && internalExec(pCtx, pCtx->db, "BEGIN") == SQLITE_OK) {
+    pCtx->pRerunStmt = pS;
+    pCtx->rerunStage = 1;
+  }
+  pCtx->seenSchema = v;
+}
+static void rerunCommit(HppliteCtx *pCtx) {
+  pCtx->pRerunStmt = NULL;
+  pCtx->rerunStage = 0;
+  if (!sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
+    /* what the commit hook does for an application commit (ours it skips) */
+    pCtx->curTxn = 0;
+    pCtx->bRootDirty = 1;
+    if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
+  }
+  pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
+  gateLeaveAppIfIdle(pCtx);
+}
+/* Expired (to be prepared again)? A SQLite built without its deprecated
+** interfaces has no sqlite3_expired(): assume so (the rerun's end, or the
+** next statement's start, commits) */
+static int stmtExpired(sqlite3_stmt *pS) {
+#ifdef HPPLITE_EXTENSION
+  if (!sqlite3_api->expired) return 1;
+#endif
+  return sqlite3_expired(pS);
+}
+/* PROFILE of that statement: its first run failed and expired it - the rerun
+** follows (running again, as a STMT trace would have recorded it); or it is
+** over (it ran, or failed for another reason): commit */
+static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  if (pCtx->rerunStage == 1 && stmtExpired(pS)) {
+    pCtx->rerunStage = 2;
+    if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
+      int slot = pCtx->nActiveStmt++;
+      pCtx->aActiveStmt[slot] = pS;
+      pCtx->aActiveLog[slot] = pCtx->lastLogId;
+      pCtx->aActiveNow[slot] = 0;
+      pCtx->aActiveSeen[slot] = hpplite_clock_consulted();
+      pCtx->aActiveVm[slot] = sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0);
+      gateEnterApp(pCtx);
+      pCtx->nAppStmtActive++;
+    }
+    pCtx->pLastLogged = pS;               /* the effect check applies to the rerun */
+    return;
+  }
+  rerunCommit(pCtx);
+  pCtx->seenSchema = schemaVersion(pCtx);
+}
+
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
@@ -1178,6 +1246,9 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
   ** connection itself (sqlite3_next_stmt takes the connection mutex, which
   ** sqlite3_close holds while it joins the timer thread - a deadlock). */
+  if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt) {
+    rerunCommit(pCtx);                    /* the rerun never came (its first run failed otherwise) */
+  }
   if (mask == SQLITE_TRACE_STMT) {
     /* Sub-programs are traced too and have no PROFILE event of their own.
     ** Named triggers say so ("-- TRIGGER x"); foreign key actions (ON
@@ -1226,7 +1297,17 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     internalExec(pCtx, pCtx->db, "SELECT * FROM hpplite_status LIMIT 0");
   }
   if (mask == SQLITE_TRACE_PROFILE) {
+    int bWasLogged = pS == pCtx->pLastLogged;
+    if (pS == pCtx->pRerunStmt && pCtx->rerunStage == 1 && stmtExpired(pS)) {
+      /* the failed first run of a stale statement: no effect to check - the
+      ** rerun follows, and its end checks (and commits) */
+      rerunStatementDone(pCtx, pS);
+      return 0;
+    }
     hppliteStatementDone(pCtx, pS);
+    /* a schema change of this connection's own is not staleness */
+    if (bWasLogged && pS != pCtx->pRerunStmt) pCtx->seenSchema = schemaVersion(pCtx);
+    if (pS == pCtx->pRerunStmt) rerunStatementDone(pCtx, pS);
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
     ** closing read just before this callback. With no other read, the
@@ -1350,6 +1431,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
     }
     if (rc == SQLITE_DONE) {
+      rerunBegin(pCtx, pS);
       pCtx->pLastLogged = pS;
       pCtx->bLastLoggedKeep = isHeaderPragmaWrite(zSql);
       if (slot < 0) {
@@ -1485,6 +1567,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
   if (!pCtx) return SQLITE_NOMEM;
   memset(pCtx, 0, sizeof(HppliteCtx));
+  pCtx->seenSchema = -1;
 
   pCtx->db = db;
   pCtx->bkDb = db;
@@ -1526,6 +1609,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
     return rc;
   }
   loadMeta(pCtx);
+  pCtx->seenSchema = schemaVersion(pCtx);
   pCtx->bClockPin = hpplite_clock_on(db);
 
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
