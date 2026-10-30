@@ -120,7 +120,22 @@ detected.
   cost far more than their text. Reducing it is v0.3 (compression, DA,
   #33).
 - **Write overhead**: one log row per changed row instead of per statement.
-  Measured in phase 1 before anything is built on it.
+  Measured in phase 1 through the real engine (sysbench-style OLTP, 100k
+  rows, WAL, mean µs per transaction):
+
+  | | v1 text | rows |
+  |---|---|---|
+  | writes (4 statements) | 19.4 | 13.0–14.7 |
+  | commit | 140 | 138 |
+  | log bytes, same work | 10.2 MB | 7.6 MB |
+
+  Each cached write statement carries its tables' trigger programs: about
+  5.5 KB more per statement. On a connection with few statements that is
+  enough to fill SQLite's lookaside memory (default about 124 slots), and the
+  connection's small allocations fall through to malloc: a sort-heavy read
+  (`SELECT DISTINCT ... ORDER BY`) went from 29 to 41 µs. With 300 slots
+  (`SQLITE_DBCONFIG_LOOKASIDE`) reads are equal to v1. Whether HPPLite sizes
+  the lookaside of the connections it attaches to is decided in phase 2.
 - **Readable history**: v0.1 batches are SQL, an audit trail of what the
   application did; records are not. Rows only in v0.2; statement text kept
   alongside for audit (not replayed) is an option later.

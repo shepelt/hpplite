@@ -1334,8 +1334,10 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     if (pS == pCtx->pRerunStmt) rerunStatementDone(pCtx, pS);
     if (pCtx->bRows) {
       if (pS == pCtx->pRowsTextStmt) { pCtx->pRowsTextStmt = NULL; pCtx->bRowsCapOff = 0; }
-      /* a safe point for DDL: the statement is over (not a reset mid-run) */
-      if (!sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0) hpplite_rows_after_statement(pCtx);
+      /* a safe point for DDL: the statement is over (not a reset mid-run).
+      ** Only after a write: a read cannot move the schema, and another
+      ** connection's change is caught at the next write (text, then this) */
+      if (!sqlite3_stmt_readonly(pS) && !sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0) hpplite_rows_after_statement(pCtx);
     }
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
