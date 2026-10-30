@@ -145,6 +145,24 @@ sqlite> SELECT hpplite_flush();            -- or just wait for the interval / cl
 Programs call `sqlite3_load_extension()` once; every later connection in the
 process that opens with `?hpplite=on` is handled automatically.
 
+**Drivers.** HPPLite is turned on per connection, by the URI
+(`file:app.db?hpplite=on&...`) or - for code that opens a plain path - by
+the environment: `HPPLITE_FILES` names the files (`:`-separated globs,
+matched against the full path and the file name) and `HPPLITE_PARAMS`
+carries what the URI would (`l1=hpp-sepolia&interval=5s`). Load the module
+once per process before opening. Checked by `tests/orm/run_orm.sh`:
+
+| Driver / ORM | How | Status |
+|---|---|---|
+| Python `sqlite3`: SQLAlchemy, Alembic, Django | `sqlite3.connect(uri, uri=True)`; Django `NAME` = the URI | works |
+| Node `node:sqlite`: Drizzle (`sqlite-proxy`) | URI, or a plain path with `HPPLITE_FILES` | works |
+| npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
+| better-sqlite3 (Drizzle's and Knex's default) | - | **refused at open**: its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()` - writes would replay truncated |
+| Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
+
+One SQLite library per process: loading the module into a second one
+(better-sqlite3's copy and Node's own) is refused.
+
 **Every connection that writes must open with `hpplite=on`** - a plain
 connection's writes are not captured. The first `hpplite=on` connection to a
 file in a process is the sequencer (L1, lease, timer); later ones are

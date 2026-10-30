@@ -7,6 +7,8 @@
 
 #include "hpplite.h"
 #include "clock.h"
+#include <fnmatch.h>
+#include <limits.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1232,6 +1234,13 @@ static void hppliteRollbackHook(void *pArg) {
 ** ============================================================================
 */
 
+/* HPPLite's own connections to a database file (bookkeeping) must not be
+** taken for the application's when HPPLITE_FILES names the file */
+static _Thread_local int tlInternalOpen;
+void hpplite_internal_open_begin(void) { tlInternalOpen++; }
+void hpplite_internal_open_end(void) { tlInternalOpen--; }
+int hpplite_internal_open_active(void) { return tlInternalOpen > 0; }
+
 static int addColumnIfMissing(HppliteCtx *pCtx, sqlite3 *db, const char *zTable, const char *zCol) {
   sqlite3_stmt *q = NULL;
   int has = 0, rc = SQLITE_OK;
@@ -1249,9 +1258,46 @@ static int addColumnIfMissing(HppliteCtx *pCtx, sqlite3 *db, const char *zTable,
   return rc;
 }
 
+/*
+** Capture inlines bound values with sqlite3_expanded_sql(). A SQLite built
+** with SQLITE_TRACE_SIZE_LIMIT (better-sqlite3's bundled one: 32) cuts every
+** longer string or blob there, and the replica would replay the cut value -
+** silently different data. SQLite has no other way to read bound values
+** back, so such a build cannot be used: found once, at init.
+*/
+static const char *gInitError;           /* why the last hpplite_init failed, for the open's message */
+const char *hpplite_init_error(void) { return gInitError; }
+
+static int expandedSqlIsFaithful(sqlite3 *db) {
+  static const char zLong[] = "hpplite-probe-0123456789abcdefghijklmnopqrstuvwxyz-0123456789abcdefghijklmnopqrstuvwxyz";
+  sqlite3_stmt *st = NULL;
+  char *z;
+  int ok = 0;
+#ifdef HPPLITE_TEST_HOOKS
+  if (getenv("HPPLITE_TEST_TRUNCATING_EXPAND")) return 0;
+#endif
+  if (sqlite3_prepare_v2(db, "SELECT ?1", -1, &st, NULL) != SQLITE_OK) return 0;
+  sqlite3_bind_text(st, 1, zLong, -1, SQLITE_STATIC);
+  z = sqlite3_expanded_sql(st);
+  ok = z && strstr(z, zLong) != NULL;
+  sqlite3_free(z);
+  sqlite3_finalize(st);
+  return ok;
+}
+
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   HppliteCtx *pCtx;
   int rc;
+
+  gInitError = NULL;
+  if (!expandedSqlIsFaithful(db)) {
+    gInitError = "this SQLite truncates bound values in sqlite3_expanded_sql() (built with "
+                 "SQLITE_TRACE_SIZE_LIMIT, as better-sqlite3's bundled SQLite is): writes would replay "
+                 "with cut strings. Use a driver on a stock SQLite (Node: node:sqlite or the sqlite3 "
+                 "package; Python: sqlite3)";
+    fprintf(stderr, "hpplite: %s\n", gInitError);
+    return SQLITE_ERROR;
+  }
 
   pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
   if (!pCtx) return SQLITE_NOMEM;
@@ -2753,6 +2799,40 @@ static void hpplite_flush_func(
 ** Checks URI parameters and initializes HPPLite if enabled.
 ** Uses HppliteNode for unified implementation.
 */
+/* HPPLITE_FILES: ':'-separated glob patterns, matched against the full
+** path and the file name (#55) */
+static int envNamesFile(const char *zPath) {
+    const char *zList = getenv("HPPLITE_FILES");
+    const char *zBase = strrchr(zPath, '/');
+    char pat[1024];
+    zBase = zBase ? zBase + 1 : zPath;
+    while (zList && *zList) {
+        const char *e = strchr(zList, ':');
+        size_t n = e ? (size_t)(e - zList) : strlen(zList);
+        if (n > 0 && n < sizeof(pat)) {
+            memcpy(pat, zList, n);
+            pat[n] = 0;
+            if (fnmatch(pat, zPath, 0) == 0 || fnmatch(pat, zBase, 0) == 0) return 1;
+            if (!strpbrk(pat, "*?[") && strchr(pat, '/')) {
+                /* a plain path: compare where it points (SQLite reports the
+                ** resolved path: /tmp is /private/tmp on macOS); the file
+                ** may not exist yet, its directory does */
+                char dir[1024], res[PATH_MAX];
+                const char *slash = strrchr(pat, '/');
+                size_t dn = (size_t)(slash - pat);
+                if (dn == 0) { dir[0] = '/'; dir[1] = 0; } else { memcpy(dir, pat, dn); dir[dn] = 0; }
+                if (realpath(dir, res)) {
+                    char full[PATH_MAX + 256];
+                    snprintf(full, sizeof(full), "%s%s%s", res, strcmp(res, "/") ? "/" : "", slash + 1);
+                    if (strcmp(full, zPath) == 0) return 1;
+                }
+            }
+        }
+        zList = e ? e + 1 : NULL;
+    }
+    return 0;
+}
+
 static int hpplite_auto_init(
     sqlite3 *db,
     char **pzErrMsg,
@@ -2764,23 +2844,30 @@ static int hpplite_auto_init(
     /* Get the URI used to open this database */
     const char *filename = sqlite3_db_filename(db, "main");
     if (!filename) return SQLITE_OK;
+    if (hpplite_internal_open_active()) return SQLITE_OK;   /* our own bookkeeping connection */
 
-    /* Check if HPPLite is enabled via URI parameter */
+    /* Enabled by the URI (hpplite=on), or - for drivers that cannot open
+    ** URIs - by HPPLITE_FILES naming this file (#55); a URI that says
+    ** hpplite= itself decides */
     const char *hppliteParam = sqlite3_uri_parameter(filename, "hpplite");
-    if (!hppliteParam || strcmp(hppliteParam, "on") != 0) {
-        /* HPPLite not enabled for this connection */
-        return SQLITE_OK;
+    HppliteConfig *config = NULL;
+    if (hppliteParam) {
+        if (strcmp(hppliteParam, "on") != 0) return SQLITE_OK;
+        config = hpplite_config_create();
+        if (!config) return SQLITE_OK;
+        hpplite_config_load_env(config);                    /* env first */
+        hpplite_config_load_sqlite_uri(config, filename);   /* the URI overrides it */
+    } else if (filename[0] && envNamesFile(filename)) {
+        const char *zParams = getenv("HPPLITE_PARAMS");
+        char *zUri = sqlite3_mprintf("file:%s?hpplite=on%s%s", filename,
+                                     zParams && zParams[0] ? "&" : "", zParams ? zParams : "");
+        if (!zUri) return SQLITE_OK;
+        config = hpplite_config_load(zUri);                 /* env, then HPPLITE_PARAMS */
+        sqlite3_free(zUri);
+        if (!config) return SQLITE_OK;
+    } else {
+        return SQLITE_OK;                                   /* not an HPPLite database */
     }
-
-    /* Load configuration from SQLite URI parameters */
-    HppliteConfig *config = hpplite_config_create();
-    if (!config) return SQLITE_OK;
-
-    /* Load from env first */
-    hpplite_config_load_env(config);
-
-    /* Then override with SQLite URI parameters */
-    hpplite_config_load_sqlite_uri(config, filename);
 
     /* Convert to node config */
     HppliteNodeConfig nodeConfig;
@@ -2794,7 +2881,8 @@ static int hpplite_auto_init(
         /* hpplite=on was asked for and cannot be honoured: fail the open
         ** rather than hand back a connection that silently captures nothing */
         hpplite_config_free(config);
-        if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s (bad key, unreadable key file, "
+        if (pzErrMsg && hpplite_init_error()) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s: %s", filename, hpplite_init_error());
+        else if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s (bad key, unreadable key file, "
                                                   "or bookkeeping tables could not be created)", filename);
         return SQLITE_ERROR;
     }
@@ -2894,6 +2982,15 @@ int sqlite3_hpplite_init(
   char **pzErrMsg,
   const sqlite3_api_routines *pApi
 ) {
+  /* One process, two SQLite libraries (better-sqlite3's bundled copy and
+  ** Node's own, say), both loading this module: there is one module, so one
+  ** API table and one clock VFS - the second library's connections would
+  ** run on the first one's functions. Refuse the second library. */
+  if (sqlite3_api && sqlite3_api != pApi) {
+    if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite is already loaded into another SQLite library in this "
+                                              "process; one process can use HPPLite with one SQLite library");
+    return SQLITE_ERROR;
+  }
   SQLITE_EXTENSION_INIT2(pApi);
   /* A second copy of HPPLite (the static library plus this module, or the
   ** module loaded twice) would replace the first one's hpplite_status

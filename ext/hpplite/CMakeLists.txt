@@ -180,6 +180,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_big_txn hpplite)
         add_executable(test_clock tests/unit/test_clock.c)
         target_link_libraries(test_clock hpplite)
+        add_executable(test_env_enable tests/unit/test_env_enable.c)
+        target_link_libraries(test_env_enable hpplite)
 
         # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
@@ -266,6 +268,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_foreign_keys COMMAND test_foreign_keys)
         add_test(NAME test_big_txn COMMAND test_big_txn)
         add_test(NAME test_clock COMMAND test_clock)
+        add_test(NAME test_env_enable COMMAND test_env_enable)
         add_test(NAME test_crash COMMAND crash_hpplite)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c

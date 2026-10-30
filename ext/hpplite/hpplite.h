@@ -118,7 +118,14 @@ struct HppliteCtx {
 ** Creates _hpplite_meta / _hpplite_pending if missing and installs hooks.
 ** Returns SQLITE_OK on success.
 */
+/* Around HPPLite's own opens of a database file (see HPPLITE_FILES, #55) */
+void hpplite_internal_open_begin(void);
+void hpplite_internal_open_end(void);
+int hpplite_internal_open_active(void);
+
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
+/* Why the last hpplite_init() failed, when it knows (NULL otherwise) */
+const char *hpplite_init_error(void);
 
 /*
 ** Shutdown HPPLite tracking and free resources.

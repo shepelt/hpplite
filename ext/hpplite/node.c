@@ -193,7 +193,9 @@ static int node_init_tracking(HppliteNode *node) {
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
 
     if (zFile && zFile[0]) {
+        hpplite_internal_open_begin();
         rc = sqlite3_open_v2(zFile, &node->bkDb, SQLITE_OPEN_READWRITE, NULL);
+        hpplite_internal_open_end();
         if (rc != SQLITE_OK) {
             if (node->bkDb) sqlite3_close(node->bkDb);
             node->bkDb = NULL;
@@ -317,7 +319,9 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
     }
 
     /* Open database */
+    hpplite_internal_open_begin();          /* this node is the HPPLite instance, not an auto-enabled one */
     rc = sqlite3_open(config->dbPath, &node->db);
+    hpplite_internal_open_end();
     if (rc != SQLITE_OK) {
         hpplite_node_destroy(node);
         return NULL;
