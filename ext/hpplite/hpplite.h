@@ -141,6 +141,9 @@ void hpplite_internal_open_end(void);
 int hpplite_internal_open_active(void);
 
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
+/* Batches the writer keeps as posted, to post again after a reorg (#49) */
+#define HPPLITE_POSTED_KEEP 32
+uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen);
 /* Why the last hpplite_init() failed, when it knows (NULL otherwise) */
 const char *hpplite_init_error(void);
 

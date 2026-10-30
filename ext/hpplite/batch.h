@@ -51,6 +51,8 @@ struct HppliteBatch {
   int openTxn;                               /* Last group continues in the next batch (#57) */
   int contTxn;                               /* First group continues the previous batch's open one */
   int64_t openGroup;                         /* Writer only, not posted: log id of the open group */
+  const uint8_t *pPosted;                    /* Writer only: the bytes posted for it (kept for a reorg) */
+  size_t nPosted;
   int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */
 };
 

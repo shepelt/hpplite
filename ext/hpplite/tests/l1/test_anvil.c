@@ -28,7 +28,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
-static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *ANVIL_PID;
+static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *ANVIL_PID;
 
 static void chain_sleep(int seconds) {
     char cmd[256];
@@ -471,11 +471,60 @@ static void test_l1_outage(void) {
     PASS();
 }
 
+/* 9. A chain reorganisation drops two batches the writer finalized (#49):
+** evm_snapshot before them, evm_revert after. The writer must post them
+** again and continue; a replica rebuilt from the chain matches. KEY5. */
+static void cast_rpc(const char *method, const char *arg, char *out, size_t n) {
+    char cmd[256];
+    FILE *f;
+    snprintf(cmd, sizeof(cmd), "cast rpc %s %s --rpc-url %s 2>/dev/null", method, arg ? arg : "", RPC);
+    out[0] = 0;
+    if ((f = popen(cmd, "r")) != NULL) {
+        if (fgets(out, (int)n, f)) out[strcspn(out, "\r\n")] = 0;
+        pclose(f);
+    }
+}
+static void test_reorg(void) {
+    TEST("a reorg drops two finalized batches: the writer posts them again and continues; replica matches");
+    sqlite3 *w = open_db("g_writer.db", KEY5, NULL);
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE g(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 1"); }
+    sqlite3_exec(w, "INSERT INTO g VALUES(1, 'before')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 2"); }
+    char snap[80];
+    cast_rpc("evm_snapshot", NULL, snap, sizeof(snap));
+    if (!snap[0]) { sqlite3_close(w); FAIL("evm_snapshot"); }
+    sqlite3_exec(w, "INSERT INTO g VALUES(2, 'lost in the reorg')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 3"); }
+    sqlite3_exec(w, "INSERT INTO g VALUES(3, 'also lost')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 4"); }
+    char rev[80];
+    cast_rpc("evm_revert", snap, rev, sizeof(rev));
+    if (strcmp(rev, "true") != 0) { sqlite3_close(w); FAIL("evm_revert"); }
+    sqlite3_exec(w, "INSERT INTO g VALUES(4, 'after')", NULL, NULL, NULL);
+    for (int k = 0; k < 4 && scalar(w, "SELECT pending FROM hpplite_status") > 0; k++) scalar(w, "SELECT hpplite_flush()");
+    sqlite3_int64 left = scalar(w, "SELECT pending FROM hpplite_status");
+    unsigned char rootW[32], rootR[32];
+    hpplite_state_root(w, rootW);
+    sqlite3_close(w);
+    if (left != 0) FAIL("the writer did not get past the reorg");
+    sqlite3 *r = open_db("g_replica.db", KEY5, NULL);
+    if (!r) FAIL("replica");
+    sqlite3_int64 rows = scalar(r, "SELECT count(*) FROM g");
+    hpplite_state_root(r, rootR);
+    sqlite3_close(r);
+    if (rows != 4) { printf("(replica rows %lld) ", (long long)rows); FAIL("the lost batches are not on the chain"); }
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica root differs");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
     KEY3 = getenv("HPPLITE_ANVIL_KEY3"); KEY4 = getenv("HPPLITE_ANVIL_KEY4"); ANVIL_PID = getenv("HPPLITE_ANVIL_PID");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    KEY5 = getenv("HPPLITE_ANVIL_KEY5");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
@@ -486,6 +535,7 @@ int main(void) {
     test_edge_sql_end_to_end();
     test_big_transaction_end_to_end();
     test_l1_outage();
+    test_reorg();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     (void)!system("rm -rf " DIR);
     return tests_passed == tests_run ? 0 : 1;

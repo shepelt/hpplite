@@ -397,6 +397,9 @@ int hpplite_l1_submit_was_oversized(HppliteL1 *l1);
 ** is above it is not sent, a sent one never asks for more */
 void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas);
 
+/* A chain reorganisation: batches above height `keep` are gone */
+void hpplite_l1_mock_truncate(HppliteL1 *l1, uint64_t keep);
+
 /* Accept n more submissions, then fail them all (a crash in the middle of a series) */
 void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n);
 

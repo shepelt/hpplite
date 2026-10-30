@@ -600,6 +600,17 @@ void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
     if (l1) { l1->failSubmit = fail; l1->failAfterPlus1 = 0; }
 }
 
+void hpplite_l1_mock_truncate(HppliteL1 *l1, uint64_t keep) {
+    if (!l1) return;
+    while (l1->nBatches > keep) {
+        l1->nBatches--;
+        free(l1->batchData[l1->nBatches]);
+        l1->batchData[l1->nBatches] = NULL;
+        l1->batchLen[l1->nBatches] = 0;
+    }
+    mockSaveState(l1);
+}
+
 void hpplite_l1_mock_set_max_tx_bytes(HppliteL1 *l1, size_t n) {
     if (l1) l1->maxTxBytes = n;
 }

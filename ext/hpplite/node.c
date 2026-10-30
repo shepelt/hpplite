@@ -593,6 +593,41 @@ static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
 ** or the RPC reply was lost). Adopt it so we neither resubmit nor skip it.
 ** Returns 1 if adopted, 0 if L1 has nothing at that height, -1 on divergence.
 */
+/*
+** L1 has fewer batches than we finalized: a chain reorganisation dropped
+** the last ones (#49). Every later submission would fail as non-sequential.
+** Post the lost heights again from the bytes kept at finalize, unchanged
+** (same bytes, same block hashes: replicas that saw them before agree). A
+** height no longer kept cannot be restored: stop rather than post past a
+** gap. Returns 1 when L1 is caught up, 0 to try again later, -1 to stop.
+*/
+static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
+    uint64_t h;
+    for (h = lastBatch + 1; h < node->ctx->blockHeight; h++) {
+        size_t len = 0;
+        uint8_t *bytes = hpplite_posted_batch(node->ctx, h, &len);
+        char *txHash;
+        int ok;
+        if (!bytes) {
+            fprintf(stderr, "hpplite: L1 has %llu batches but this database finalized %llu (a chain "
+                    "reorganisation?), and batch %llu is no longer kept to post again; stopping rather "
+                    "than post past the gap\n", (unsigned long long)lastBatch,
+                    (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)h);
+            node->state = HPPLITE_STATE_ERROR;
+            return -1;
+        }
+        if (!node_ensure_lease(node)) { free(bytes); return 0; }
+        txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, h, bytes, len);
+        free(bytes);
+        ok = txHash && hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1;
+        sqlite3_free(txHash);
+        if (!ok) return 0;
+        fprintf(stderr, "hpplite: L1 lost batch %llu (a chain reorganisation?); posted it again\n",
+                (unsigned long long)h);
+    }
+    return 1;
+}
+
 static int node_adopt_existing(HppliteNode *node) {
     uint64_t lastBatch = 0, totalBatches = 0;
     unsigned char latestHash[32];
@@ -600,6 +635,10 @@ static int node_adopt_existing(HppliteNode *node) {
     int rc;
 
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
+    if (lastBatch + 1 < node->ctx->blockHeight) {
+        node_repost_lost(node, lastBatch);
+        return 0;                  /* the batch at our height is still to post */
+    }
     if (lastBatch < node->ctx->blockHeight) return 0;
 
     batch = node_fetch_batch(node, node->ctx->blockHeight);
@@ -778,6 +817,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         }
 
         char *json = hpplite_batch_to_json(batch);
+        uint8_t *postedCopy = NULL;
+        size_t postedLen = 0;
         if (json) {
             const uint8_t *payload = (const uint8_t *)json;
             size_t payloadLen = strlen(json);
@@ -809,6 +850,10 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 if (txHash) {
                     confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
                     if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash);
+                    if (confirmed && (postedCopy = malloc(payloadLen)) != NULL) {
+                        memcpy(postedCopy, payload, payloadLen);   /* kept with the batch (#49) */
+                        postedLen = payloadLen;
+                    }
                     if (confirmed && node->onBatchPosted) {
                         node->onBatchPosted(node->callbackArg, height, txHash);
                     }
@@ -818,6 +863,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
             free(sealed);
             sqlite3_free(json);
         }
+        batch->pPosted = postedCopy;
+        batch->nPosted = postedLen;
+        node->postedCopy = postedCopy;     /* freed after finalize */
         if (confirmed) test_crash_point("after_submit");
         if (!confirmed) {
             /* The transaction may have landed despite the error */
@@ -860,6 +908,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     }
 
     hpplite_batch_free(batch);
+    free(node->postedCopy);
+    node->postedCopy = NULL;
     return height;
 }
 

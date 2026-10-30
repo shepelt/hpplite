@@ -176,6 +176,12 @@ static const char *HPPLITE_SCHEMA =
   ");"
   "INSERT OR IGNORE INTO _hpplite_meta(id, next_height, prev_block_hash, state_root)"
   "  VALUES(1, 1, zeroblob(32), zeroblob(32));"
+  /* the bytes of the writer's recent batches, to post again if a chain
+  ** reorganisation drops them (#49) */
+  "CREATE TABLE IF NOT EXISTS _hpplite_posted("
+  "  height INTEGER PRIMARY KEY,"
+  "  data BLOB NOT NULL"
+  ");"
   /* the part of a transaction a replica holds back until its end is posted (#57) */
   "CREATE TABLE IF NOT EXISTS _hpplite_carry("
   "  seq INTEGER PRIMARY KEY,"
@@ -1953,6 +1959,23 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     if (rc != SQLITE_DONE) return rc;
   }
 
+  if (maxId > 0 && pBatch->pPosted && pBatch->nPosted) {
+    /* keep the last HPPLITE_POSTED_KEEP batches as posted */
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)",
+                            -1, &pStmt, NULL);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)pBatch->height);
+    sqlite3_bind_blob(pStmt, 2, pBatch->pPosted, (int)pBatch->nPosted, SQLITE_STATIC);
+    rc = sqlite3_step(pStmt);
+    sqlite3_finalize(pStmt);
+    if (rc != SQLITE_DONE) return rc;
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "DELETE FROM _hpplite_posted WHERE height <= ?1", -1, &pStmt, NULL);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)pBatch->height - HPPLITE_POSTED_KEEP);
+    rc = sqlite3_step(pStmt);
+    sqlite3_finalize(pStmt);
+    if (rc != SQLITE_DONE) return rc;
+  }
   if (maxId > 0 && pCtx->nNoClock > 0 && pCtx->pNoClockMutex) {
     int i, k = 0;
     sqlite3_mutex_enter(pCtx->pNoClockMutex);
@@ -1993,6 +2016,26 @@ static int advanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
   }
   return SQLITE_OK;
+}
+
+uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen) {
+  sqlite3_stmt *pStmt;
+  uint8_t *out = NULL;
+  int saved;
+  *pLen = 0;
+  if (!pCtx) return NULL;
+  saved = bkEnter(pCtx);
+  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT data FROM _hpplite_posted WHERE height = ?1", -1, &pStmt, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height);
+    if (sqlite3_step(pStmt) == SQLITE_ROW) {
+      int n = sqlite3_column_bytes(pStmt, 0);
+      out = malloc(n > 0 ? (size_t)n : 1);
+      if (out) { memcpy(out, sqlite3_column_blob(pStmt, 0), (size_t)n); *pLen = (size_t)n; }
+    }
+    sqlite3_finalize(pStmt);
+  }
+  bkLeave(pCtx, saved);
+  return out;
 }
 
 int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
