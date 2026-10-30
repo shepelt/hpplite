@@ -386,6 +386,8 @@ uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1);
 ** Make hpplite_l1_submit_batch() fail (for testing retry behaviour)
 */
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail);
+/* Accept n more submissions, then fail them all (a crash in the middle of a series) */
+void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n);
 
 /* A lease held by someone else: wallet (NULL = a stranger) with instanceId, for `seconds` */
 void hpplite_l1_mock_claim_foreign(HppliteL1 *l1, const unsigned char *wallet,

@@ -103,6 +103,15 @@ step("delete with Python-side CASCADE and SET_NULL", python_cascade)
 step("M2M set, annotate/aggregate reads", m2m_and_aggregate)
 step("update filtered by __year", date_lookup_update)
 
+def bulk_create_big():
+    # bulk_create of 5000 objects in one atomic block: several DA batches (#57)
+    p = Project.objects.get(slug="p-0-1")
+    with transaction.atomic():
+        Task.objects.bulk_create([Task(project=p, title=f"imported {i:05d} " + "y" * 60, points=i % 5)
+                                  for i in range(5000)], batch_size=500)
+    assert Task.objects.filter(title__startswith="imported").count() == 5000
+step("bulk_create 5000 in atomic() (larger than a DA batch)", bulk_create_big)
+
 probe("update filtered by __month (django_date_extract, a Python UDF)",
       lambda: Task.objects.filter(due__month=3).update(points=F("points") + 1))
 probe("update with Now()", lambda: Task.objects.filter(pk=1).update(title=Concat(F("title"), Now())))

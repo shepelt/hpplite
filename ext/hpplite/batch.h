@@ -47,6 +47,9 @@ struct HppliteBatch {
   int nTxns;                                 /* Number of transactions */
   HppliteTxn *aTxns;                         /* Array of transactions */
   int partial;                               /* More pending SQL follows in the next batch */
+  int openTxn;                               /* Last group continues in the next batch (#57) */
+  int contTxn;                               /* First group continues the previous batch's open one */
+  int64_t openGroup;                         /* Writer only, not posted: log id of the open group */
   int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */
 };
 

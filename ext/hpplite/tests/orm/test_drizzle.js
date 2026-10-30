@@ -100,6 +100,15 @@ PRAGMA foreign_keys=ON;
 CREATE UNIQUE INDEX tags_name_unique ON tags (name);
 UPDATE posts SET slug = lower(replace(title, ' ', '-'));`);
     });
+    await step("5000-row seed in one transaction (larger than a DA batch)", async () => {
+        raw.exec("BEGIN");
+        for (let k = 0; k < 50; k++) {
+            await db.insert(posts).values(Array.from({ length: 100 }, (_, i) => ({ authorId: 1, title: `seed ${k}.${i} ` + "w".repeat(60), body: { k, i } })));
+        }
+        raw.exec("COMMIT");
+        const r = await db.select({ n: count() }).from(posts).where(sql`${posts.title} like 'seed %'`);
+        assert(r[0].n === 5000, "seed rows");
+    });
     await probe("default sql`(unixepoch())` (the drizzle template default)",
         async () => raw.exec("CREATE TABLE sessions (id text PRIMARY KEY, created_at integer DEFAULT (unixepoch()) NOT NULL)"));
     await probe("default sql`(CURRENT_TIMESTAMP)`",

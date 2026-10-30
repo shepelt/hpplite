@@ -348,7 +348,8 @@ A key holder checks the whole history by rebuilding it:
 
 ```
 1. Fetch all batches from L1 and open them (the key)
-2. Replay SQL in order (each batch's transaction groups as transactions)
+2. Replay SQL in order (each batch's transaction groups as transactions; a
+   group a batch leaves open is held until the batch that ends it, #57)
 3. After each batch that carries a root, compute the content hash
 4. Compare against the posted root; report any mismatch
 ```

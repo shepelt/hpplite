@@ -58,6 +58,7 @@ struct HppliteL1 {
 
     /* Batch DA storage */
     int failSubmit;              /* Test hook: reject batch submissions */
+    int failAfterPlus1;          /* Test hook: 0 = off; else accept this many - 1 more, then reject */
     int loseConfirmation;        /* Test hook: store but report failure */
     int txPending;               /* Test hook: wait_for_tx never confirms */
     int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
@@ -594,7 +595,11 @@ void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
 }
 
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
-    if (l1) l1->failSubmit = fail;
+    if (l1) { l1->failSubmit = fail; l1->failAfterPlus1 = 0; }
+}
+
+void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n) {
+    if (l1) l1->failAfterPlus1 = n + 1;
 }
 
 void hpplite_l1_mock_set_lose_confirmation(HppliteL1 *l1, int lose) {
@@ -734,6 +739,7 @@ char *hpplite_l1_submit_batch(
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
     if (l1->failSubmit) return NULL;
+    if (l1->failAfterPlus1 == 1) return NULL;
     if (data_len > (l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024)) {
         return NULL;  /* "Batch too large" */
     }
@@ -761,6 +767,7 @@ char *hpplite_l1_submit_batch(
 
     memcpy(l1->batchData[idx], data, data_len);
     l1->batchLen[idx] = data_len;
+    if (l1->failAfterPlus1 > 1) l1->failAfterPlus1--;
 
     if (height > l1->nBatches) {
         l1->nBatches = height;

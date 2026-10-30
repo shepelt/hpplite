@@ -62,6 +62,9 @@ struct HppliteCtx {
   char **azReplicaFns;        /* Functions a replica has (fresh connection), sorted, lower case */
   int nReplicaFns;            /* ...count; -1 = unknown (pragma_function_list unavailable) */
   int nDdlGen;                /* DDL captured on this connection (invalidates the verdicts) */
+  sqlite3_int64 openTxnId;    /* Writer: log id of the group the last posted batch left open (#57) */
+  int nCarry;                 /* Replica: statements held back from an open group (_hpplite_carry) */
+  uint64_t nTxnsDropped;      /* Replica: transactions dropped because their other part never came */
   struct HppliteFnVerdict {   /* Function check of a write, by statement text and schema */
     char *zSql; int schema; char zWhy[160];
   } aFnVerdict[64];
@@ -86,7 +89,6 @@ struct HppliteCtx {
   int bRootDirty;
 
   size_t maxStmtBytes;        /* Longest statement the DA can carry (0 = unlimited) */
-  size_t txnBytes;            /* Posted size of the open transaction's logged statements so far */
   int bDeterminismWarn;       /* Non-deterministic SQL: 1 = warn and count, 0 = refuse (default) */
   uint64_t nAuthDenied;       /* Statements the authorizer refused at prepare (our tables, ATTACH, pragmas) */
   const char *zDenyWhy;       /* Why the statement being prepared was denied (for the error message) */

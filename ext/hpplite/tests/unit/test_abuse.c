@@ -8,7 +8,8 @@
 **   - a refused statement leaves no row behind and no pending log entry
 **   - a batch that is not ours never changes the local database
 **   - nothing we read from L1 can crash the process
-**   - a transaction is never split across batches
+**   - a replica never applies part of a transaction (one larger than a
+**     batch spans several: tests/unit/test_big_txn.c)
 **   - what capture lets through fits in one batch as posted
 */
 
@@ -765,7 +766,7 @@ static void test_transaction_boundary(void) {
 }
 
 static void test_oversized_transaction(void) {
-    TEST("a transaction that outgrows a batch is refused at the write, not wedged in the sequencer");
+    TEST("a transaction that outgrows a batch is posted across batches within the limit (#57)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     const size_t LIMIT = 2000;
@@ -774,19 +775,15 @@ static void test_oversized_transaction(void) {
     hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
     if (hpplite_node_flush_batch(n) != 1) FAIL("batch 1");
     hpplite_node_exec(n, "BEGIN", NULL);
-    int refusedAt = -1;
     for (int s = 0; s < 40; s++) {
         char sql[256];
         snprintf(sql, sizeof(sql), "INSERT INTO t VALUES('%060d')", s);
-        if (sqlite3_exec(n->db, sql, NULL, NULL, NULL) != SQLITE_OK) { refusedAt = s; break; }
+        if (sqlite3_exec(n->db, sql, NULL, NULL, NULL) != SQLITE_OK) FAILF("statement %d of a large transaction refused", s);
     }
-    if (refusedAt < 1) FAIL("the transaction was never refused (or refused at its first statement)");
-    /* whatever the application does next, the sequencer must be able to post */
-    hpplite_node_exec(n, "COMMIT", NULL);
-    hpplite_node_exec(n, "ROLLBACK", NULL);
+    if (hpplite_node_exec(n, "COMMIT", NULL) != SQLITE_OK) FAIL("commit");
     hpplite_node_exec(n, "INSERT INTO t VALUES('after')", NULL);
     int h = hpplite_node_flush_batch(n);
-    if (h < 2) FAIL("the sequencer is wedged: nothing could be posted");
+    if (h < 3) FAIL("the transaction did not span batches");
     if (hpplite_node_pending_count(n) != 0) FAIL("pending rows left: the sequencer cannot drain");
     for (int k = 2; k <= h; k++) {
         size_t len = 0;

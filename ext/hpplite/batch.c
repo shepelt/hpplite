@@ -176,8 +176,8 @@ size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int
 }
 
 size_t hpplite_batch_json_overhead(void) {
-  /* height, timestamp, state_root, partial, "transactions": [ ] and braces */
-  return 256;
+  /* height, timestamp, state_root, partial, open, cont, "transactions": [ ] and braces */
+  return 288;
 }
 
 /*
@@ -206,6 +206,9 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
   if (pBatch->partial) {
     sqlite3_str_appendf(pStr, "\"partial\":1,");
   }
+  /* a transaction larger than one batch (#57); only when set */
+  if (pBatch->openTxn) sqlite3_str_appendf(pStr, "\"open\":1,");
+  if (pBatch->contTxn) sqlite3_str_appendf(pStr, "\"cont\":1,");
 
   sqlite3_str_appendf(pStr, "\"transactions\":[");
   for (i = 0; i < pBatch->nTxns; i++) {
@@ -362,6 +365,10 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
       pBatch->timestamp = (uint64_t)json_parse_number(&p);
     } else if (strcmp(zKey, "partial") == 0) {
       pBatch->partial = json_parse_number(&p) != 0;
+    } else if (strcmp(zKey, "open") == 0) {
+      pBatch->openTxn = json_parse_number(&p) != 0;
+    } else if (strcmp(zKey, "cont") == 0) {
+      pBatch->contTxn = json_parse_number(&p) != 0;
     } else if (strcmp(zKey, "pre_state_root") == 0) {
       zVal = json_parse_string(&p);
       if (zVal) {

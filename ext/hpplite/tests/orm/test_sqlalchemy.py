@@ -169,6 +169,16 @@ step("database-level ON DELETE CASCADE", db_cascade)
 step("ORM-level cascade delete", orm_cascade)
 step("self-referential FK rows, again (the cascade took the first ones)", comments)
 step("Alembic: add column, index, batch table rebuild", alembic_batch)
+
+def bulk_seed():
+    # a seed script: 5000 rows (~600 KB of SQL) in one transaction, several batches (#57)
+    with Session(engine) as s, s.begin():
+        pid = s.scalar(select(Project.id).limit(1))
+        s.execute(insert(Task), [{"project_id": pid, "title": f"seed task {i:05d} " + "x" * 60, "points": i % 7}
+                                 for i in range(5000)])
+    with Session(engine) as s:
+        assert s.scalar(select(func.count()).where(Task.title.like("seed task%"))) == 5000
+step("bulk seed: 5000 rows in one transaction (larger than a DA batch)", bulk_seed)
 step("PRAGMA reads", with_pragmas)
 
 def p_server_default_now():

@@ -60,6 +60,12 @@ const { uri, step, probe, finish, assert, EXT } = require("./node_common.js");
         await knex.schema.alterTable("orders", (t) => { t.renameColumn("note", "memo"); });
         await knex.schema.alterTable("orders", (t) => { t.dropColumn("items"); });
     });
+    await step("batchInsert of 5000 rows in one transaction (larger than a DA batch)", async () => {
+        const rows = [];
+        for (let i = 0; i < 5000; i++) rows.push({ customer_id: 1, total: i, status: "imported " + "z".repeat(60) });
+        await knex.transaction(async (trx) => { await trx.batchInsert("orders", rows, 250); });
+        assert((await knex("orders").where("status", "like", "imported%").count({ n: "*" }))[0].n === 5000, "bulk rows");
+    });
     await probe("t.timestamps(true, true) (DEFAULT CURRENT_TIMESTAMP)", async () =>
         knex.schema.createTable("audit", (t) => { t.increments("id"); t.timestamps(true, true); }));
     await probe("update ... knex.fn.now()", async () => knex("orders").where({ id: 1 }).update({ status: knex.fn.now() }));

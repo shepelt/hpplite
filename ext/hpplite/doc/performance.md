@@ -16,14 +16,20 @@ check on completion.
 
 | Mode | plain SQLite | hpplite=on | overhead |
 |------|-------------:|-----------:|---------:|
-| autocommit (one fsync per statement) | 15 900 stmt/s | 13 800 stmt/s | 1.2x |
-| 1000 statements per transaction | 784 000 stmt/s | 442 000 stmt/s | 1.8x |
+| autocommit (one fsync per statement) | 19 000 stmt/s | 12 600 stmt/s | 1.5x |
+| 1000 statements per transaction | 785 000 stmt/s | 288 000 stmt/s | 2.7x |
 
 Autocommit is fsync-bound, so the extra row barely shows. Inside large
-transactions capture costs ~45% of raw insert throughput: each user row
-carries a second row (the SQL text, ~118 bytes here) plus the effect check.
-That is the price of "nothing lives only in memory"; 440k captured
+transactions each user row carries a second row (the SQL text, ~118 bytes
+here), the effect check, the size check and the per-write function check
+(#53: a cached verdict per statement shape, a prepare on a miss).
+That is the price of "nothing lives only in memory"; 290k captured
 statements per second is still far above what any single-writer app does.
+
+Re-measured 2026-10-30 after #53/#54/#57. The 1000-statement transaction
+(~140 KB as posted) is larger than one DA batch: until #57 capture refused
+it at statement ~960, the bench ignored the error and timed the rest in
+autocommit; it now stops on any failed statement.
 
 ## Flush, encryption, replay (20 000 statements, one batch, 2.3 MB JSON)
 

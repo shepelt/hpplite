@@ -28,7 +28,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
-static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2;
+static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3;
 
 static void chain_sleep(int seconds) {
     char cmd[256];
@@ -363,10 +363,57 @@ static void test_edge_sql_end_to_end(void) {
     PASS();
 }
 
+/* 7. A transaction several batches long on the real contract (#57). KEY3's
+** own rollup. Every posted batch is within the contract's limit; a replica
+** rebuilt from the chain has all of it and the writer's root. */
+static void test_big_transaction_end_to_end(void) {
+    TEST("a transaction larger than a batch spans batches on the real contract; replica root matches");
+    sqlite3 *w = open_db("b_writer.db", KEY3, NULL);
+    if (!w) FAIL("open writer");
+    HppliteNode *nw = hpplite_get_node(w);
+    if (!nw || !nw->l1) FAIL("writer has no L1");
+    if (sqlite3_exec(w, "CREATE TABLE seed(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL) != SQLITE_OK) FAIL("create");
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) FAIL("schema batch");
+    sqlite3_int64 h0 = scalar(w, "SELECT height FROM hpplite_status");
+    /* ~400 KB as posted: three batches or more at the 128 KB limit */
+    if (sqlite3_exec(w, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) FAIL("begin");
+    for (int i = 0; i < 3000; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql), "INSERT INTO seed VALUES(%d, '%0120d')", i, i);
+        if (sqlite3_exec(w, sql, NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("a statement of the large transaction was refused"); }
+    }
+    if (sqlite3_exec(w, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("commit"); }
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("not posted"); }
+    sqlite3_int64 h1 = scalar(w, "SELECT height FROM hpplite_status");
+    if (h1 - h0 < 3) { sqlite3_close(w); FAIL("the transaction did not span batches"); }
+    int nOpen = 0;
+    for (sqlite3_int64 h = h0; h < h1; h++) {
+        HppliteBatch *b = hpplite_node_fetch_batch(nw, (uint64_t)h);
+        if (!b) { sqlite3_close(w); FAIL("fetch"); }
+        nOpen += b->openTxn;
+        hpplite_batch_free(b);
+    }
+    if (nOpen < 2) { sqlite3_close(w); FAIL("batches not marked open"); }
+    unsigned char rootW[32], rootR[32];
+    hpplite_state_root(w, rootW);
+    sqlite3_close(w);
+    sqlite3 *r = open_db("b_replica.db", KEY3, NULL);
+    if (!r) FAIL("open replica");
+    sqlite3_int64 rows = scalar(r, "SELECT count(*) FROM seed");
+    sqlite3_int64 dropped = scalar(r, "SELECT txns_dropped FROM hpplite_status");
+    hpplite_state_root(r, rootR);
+    sqlite3_close(r);
+    if (rows != 3000) FAIL("replica does not have the whole transaction");
+    if (dropped != 0) FAIL("replica dropped a transaction");
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica state root differs from the writer's");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    KEY3 = getenv("HPPLITE_ANVIL_KEY3");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
@@ -375,6 +422,7 @@ int main(void) {
     test_sleep_and_wake();
     test_stranger_after_expiry();
     test_edge_sql_end_to_end();
+    test_big_transaction_end_to_end();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     (void)!system("rm -rf " DIR);
     return tests_passed == tests_run ? 0 : 1;
