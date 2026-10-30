@@ -1215,7 +1215,10 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
-    if (!pCtx->pLastLogged) __atomic_store_n(&pCtx->nUnsettled, 0, __ATOMIC_RELEASE);
+    if (!pCtx->pLastLogged) {
+      unsigned g = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_RELAXED);
+      if (g & 1) __atomic_store_n(&pCtx->nUnsettled, g + 1, __ATOMIC_RELEASE);
+    }
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
     ** closing read just before this callback. With no other read, the
@@ -1338,7 +1341,10 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       ** runs; if the statement changes nothing it is removed after. Until its
       ** end (PROFILE) the row is unsettled (see bkBegin) - marked before it
       ** can be seen. */
-      if (sqlite3_get_autocommit(pCtx->db)) __atomic_store_n(&pCtx->nUnsettled, 1, __ATOMIC_RELEASE);
+      if (sqlite3_get_autocommit(pCtx->db)) {
+        unsigned g = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_RELAXED);
+        if (!(g & 1)) __atomic_store_n(&pCtx->nUnsettled, g + 1, __ATOMIC_RELEASE);
+      }
       rc = sqlite3_step(pCtx->pLogStmt);
       if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
@@ -1731,10 +1737,15 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
       /* An autocommit statement's log row commits before the statement
       ** runs; if it changed nothing, the row is removed only afterwards. A
       ** snapshot taken in between would hold a row the log is about to lose
-      ** (a batch built from it fails adoption later). Take the snapshot, then
-      ** look: if a row is marked unsettled, it may be in it - try later. */
+      ** (a batch built from it fails adoption later). Looking after the
+      ** snapshot is not enough - the row may be settled by then, yet still in
+      ** it - so look before and after: unless nothing was unsettled across
+      ** the whole time (same even count), try later. */
+      unsigned g1 = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE), g2;
       internalExec(pCtx, pCtx->bkDb, "SELECT 1 FROM _hpplite_meta LIMIT 1");
-      if (__atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE)) {
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      g2 = __atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE);
+      if ((g1 & 1) || g1 != g2) {
         internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
         return SQLITE_BUSY;
       }
