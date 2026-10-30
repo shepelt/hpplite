@@ -1213,7 +1213,7 @@ static void test_replaced_hooks_detected(void) {
 
 /* 32. Capture matching: our prefix is an identifier prefix, not a substring; bare time functions (issues #42, #43) */
 static void test_capture_matching(void) {
-    TEST("app_hpplite_cfg and comments are captured; bare date()/strftime('fmt') are flagged");
+    TEST("app_hpplite_cfg and comments are captured; bare date()/strftime('fmt') are flagged off the clock VFS");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/match.db", l1);
@@ -1225,20 +1225,30 @@ static void test_capture_matching(void) {
     sqlite3_exec(n->db, "SELECT count(*) FROM _hpplite_pending", NULL, NULL, NULL);
     sqlite3_exec(n->db, "DELETE FROM _hpplite_meta WHERE 0", NULL, NULL, NULL);     /* a real reference: still not captured */
     if (hpplite_node_pending_count(n) != 3) FAIL("real references to our tables must not be captured");
-    uint64_t nd = n->ctx->nNondeterministic;
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t1', date())", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t2', datetime( ))", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t3', julianday())", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t4', strftime('%s'))", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('t5', unixepoch())", NULL);
-    if (n->ctx->nNondeterministic != nd + 5) { printf("(flagged %llu) ", (unsigned long long)(n->ctx->nNondeterministic - nd)); FAIL("each bare time function must be flagged"); }
-    nd = n->ctx->nNondeterministic;
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok1', date('2026-01-01'))", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok2', strftime('%s', '2026-01-01'))", NULL);
-    hpplite_node_exec(n, "INSERT INTO app_hpplite_cfg VALUES('ok3', 'update(') ", NULL);
-    if (n->ctx->nNondeterministic != nd) FAIL("time functions with an explicit time are deterministic");
     hpplite_node_destroy(n);
     hpplite_l1_disconnect(l1);
+    /* the bare time functions read the clock: on a connection that is not on
+    ** the clock VFS (#56) the detector must catch every spelling */
+    sqlite3 *u = NULL;
+    if (sqlite3_open_v2("file:" DIR "/unixvfs.db?hpplite=on&privkey=0x" PRIVKEY_HEX "&datadir=" DIR, &u,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, "unix") != SQLITE_OK) FAIL("open unix vfs");
+    HppliteNode *un = hpplite_get_node(u);
+    if (!un || un->ctx->bClockPin) { sqlite3_close(u); FAIL("unix-VFS connection must not pin the clock"); }
+    sqlite3_exec(u, "CREATE TABLE app_hpplite_cfg(k, v)", NULL, NULL, NULL);
+    uint64_t nd = un->ctx->nNondeterministic;
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('t1', date())", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('t2', datetime( ))", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('t3', julianday())", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('t4', strftime('%s'))", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('t5', unixepoch())", NULL, NULL, NULL);
+    if (un->ctx->nNondeterministic != nd + 5) { printf("(flagged %llu) ", (unsigned long long)(un->ctx->nNondeterministic - nd)); sqlite3_close(u); FAIL("each bare time function must be flagged"); }
+    nd = un->ctx->nNondeterministic;
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('ok1', date('2026-01-01'))", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('ok2', strftime('%s', '2026-01-01'))", NULL, NULL, NULL);
+    sqlite3_exec(u, "INSERT INTO app_hpplite_cfg VALUES('ok3', 'update(') ", NULL, NULL, NULL);
+    int flaggedOk = un->ctx->nNondeterministic != nd;
+    sqlite3_close(u);
+    if (flaggedOk) FAIL("time functions with an explicit time are deterministic");
     PASS();
 }
 
@@ -1282,10 +1292,7 @@ static void test_unsupported_sql_refused(void) {
     hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
     static const char *aBad[] = {
         "INSERT INTO t(v) VALUES(random())",
-        "INSERT INTO t(v) VALUES(datetime('now'))",
-        "INSERT INTO t(v) VALUES(CURRENT_TIMESTAMP)",
-        "CREATE TABLE log(id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP)",
-        "INSERT INTO t(v) VALUES(date())",
+        "INSERT INTO t(v) VALUES(datetime('now', 'localtime'))",
         "UPDATE t SET v = last_insert_rowid()",
         "ATTACH DATABASE ':memory:' AS aux",
         NULL };
@@ -1297,14 +1304,20 @@ static void test_unsupported_sql_refused(void) {
     }
     if (count_rows(n->db, "t") != 0) FAIL("nothing applied");
     if (hpplite_node_pending_count(n) != 1) FAIL("only the CREATE TABLE is logged");
-    if (n->ctx->nNondeterministic != 7) { printf("(counted %llu) ", (unsigned long long)n->ctx->nNondeterministic); FAIL("each refusal counted"); }
+    if (n->ctx->nNondeterministic != 4) { printf("(counted %llu) ", (unsigned long long)n->ctx->nNondeterministic); FAIL("each refusal counted"); }
+    /* the clock replays (#56): accepted, not counted */
+    if (sqlite3_exec(n->db, "CREATE TABLE log(id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP)", NULL, NULL, NULL) != SQLITE_OK
+        || sqlite3_exec(n->db, "INSERT INTO log(id) VALUES(1)", NULL, NULL, NULL) != SQLITE_OK
+        || sqlite3_exec(n->db, "UPDATE log SET at = datetime('now')", NULL, NULL, NULL) != SQLITE_OK) FAIL("clock SQL refused");
+    if (n->ctx->nNondeterministic != 4) FAIL("clock SQL counted as non-deterministic");
+    hpplite_node_exec(n, "DROP TABLE log", NULL);
     /* pragmas (foreign keys replay in the writer's mode, #52), deterministic
     ** time functions and bound values are fine */
     if (sqlite3_exec(n->db, "PRAGMA foreign_keys", NULL, NULL, NULL) != SQLITE_OK) FAIL("pragma read");
     if (sqlite3_exec(n->db, "INSERT INTO t(v) VALUES(date('2026-01-01'))", NULL, NULL, NULL) != SQLITE_OK) FAIL("date with an argument");
     sqlite3_stmt *s; sqlite3_prepare_v2(n->db, "INSERT INTO t(v) VALUES(?)", -1, &s, NULL);
     sqlite3_bind_int64(s, 1, 1700000000); if (sqlite3_step(s) != SQLITE_DONE) FAIL("bound timestamp"); sqlite3_finalize(s);
-    if (count_rows(n->db, "t") != 2 || hpplite_node_pending_count(n) != 3) FAIL("supported statements captured");
+    if (count_rows(n->db, "t") != 2 || hpplite_node_pending_count(n) != 7) { printf("(pending %d) ", hpplite_node_pending_count(n)); FAIL("supported statements captured"); }
     hpplite_node_destroy(n);
 
     hpplite_l1_disconnect(l1);

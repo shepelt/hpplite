@@ -181,22 +181,26 @@ def bulk_seed():
 step("bulk seed: 5000 rows in one transaction (larger than a DA batch)", bulk_seed)
 step("PRAGMA reads", with_pragmas)
 
-def p_server_default_now():
-    t = Table("audit", MetaData(), Column("id", Integer, primary_key=True),
+audit = Table("audit", MetaData(), Column("id", Integer, primary_key=True), Column("what", String),
               Column("at", DateTime, server_default=func.now()))
-    t.create(engine)
-def p_func_now():
+def server_default_now():
+    # the ORM template default: DEFAULT CURRENT_TIMESTAMP, filled in by SQLite (#56)
+    audit.create(engine)
     with engine.begin() as c:
-        c.execute(update(User).values(name=User.name).where(User.id == func.abs(1)))
-        c.execute(text("UPDATE users SET bio = bio || datetime('now') WHERE id = 1"))
+        c.execute(audit.insert(), [{"what": f"event {i}"} for i in range(20)])
+        assert c.execute(select(func.count()).select_from(audit).where(audit.c.at.is_not(None))).scalar() == 20
+def func_now():
+    with engine.begin() as c:
+        c.execute(update(User).where(User.id == 1).values(name=User.name + " " + func.datetime("now")))
+        c.execute(text("UPDATE users SET bio = bio || ' ' || strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = 2"))
 def p_order_random():
     with Session(engine) as s:
         s.scalars(select(Tag).order_by(func.random())).all()
 def p_wal():
     with engine.connect() as c:
         c.exec_driver_sql("PRAGMA journal_mode=WAL").fetchall()
-probe("server_default=func.now() (DEFAULT CURRENT_TIMESTAMP)", p_server_default_now)
-probe("UPDATE ... datetime('now')", p_func_now)
+step("server_default=func.now(): DEFAULT CURRENT_TIMESTAMP rows", server_default_now)
+step("UPDATE with func.datetime('now') / strftime('now')", func_now)
 probe("SELECT ... ORDER BY random() (read only)", p_order_random)
 probe("PRAGMA journal_mode=WAL", p_wal)
 

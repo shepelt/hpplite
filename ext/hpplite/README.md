@@ -254,6 +254,7 @@ database costs nothing.
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
 | `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
 | `batch.c` | Batch creation and serialization |
+| `clock.c` | Pass-through VFS that records and pins SQLite's "now" so clock SQL replays (#56) |
 | `crypto.c` | secp256k1 signing |
 | `config.c` | URI parsing, configuration |
 | `l1_eth.c` | Real Ethereum L1 client |
@@ -326,7 +327,7 @@ a hundred batches later:
 | Refused | Why | Do this instead |
 |---------|-----|-----------------|
 | `random()`, `randomblob()` in a write | different value on replay | generate in the application, bind it; reads (`ORDER BY random()`) are fine |
-| `CURRENT_TIMESTAMP`, `CURRENT_TIME`, `CURRENT_DATE`, `'now'`, bare `date()`/`time()`/`datetime()`/`julianday()`/`unixepoch()`, `strftime('fmt')` - also as a column `DEFAULT` (`CREATE TABLE` is refused) | the clock | bind the timestamp; `date('2026-01-01')` with an explicit time is fine |
+| `'localtime'` / `'utc'` modifiers in a write (`datetime('now', 'localtime')`) | the machine's time zone differs between replicas | store UTC, convert when reading (reads may use them) |
 | `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `sqlite_source_id()`, `sqlite_compileoption_*()`, `load_extension()` in a write | connection or build state | read the value (`SELECT last_insert_rowid()` is fine), then bind it |
 | a write that calls a function the application registered (`sqlite3_create_function`, Python `create_function`; Django's `django_date_extract` behind `filter(due__month=3).update(...)`), directly or through a view, trigger, generated column or expression index | a replica has SQLite's functions only, so the statement could not run there (#53) | compute the value in the application and bind it, or filter with a built-in (`due__year`, a range); reads may call it |
 | `ATTACH` | writes to another file are not captured | one database per file |
@@ -343,6 +344,17 @@ never refused: they are not logged (#54).
 `tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
 look-alikes it must let through.
 
+**The clock is supported.** `CURRENT_TIMESTAMP`, `datetime('now')`,
+`unixepoch()`, `strftime('%f', 'now')` and columns with `DEFAULT
+CURRENT_TIMESTAMP` - the timestamp defaults every ORM template uses - work in
+writes. SQLite takes "now" from the VFS; HPPLite registers a pass-through VFS
+as the default that records the time each write read and pins that same time
+when the write is replayed, so a replica computes identical values (#56).
+Reads see the real clock. The one condition: the connection must be on that
+VFS, which it is unless the application names another one (`vfs=` in the URI,
+or a VFS registered as default after HPPLite was loaded); there, clock SQL in
+writes is still refused.
+
 **Transactions of any size are supported.** One larger than a DA batch (a
 seed script, `bulk_create` of thousands of rows, a data migration) is posted
 across several batches: the batch it starts in is marked open, the ones it
@@ -358,8 +370,7 @@ statement does to other rows (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`,
 text. HPPLite records the state each statement ran under and replays it in
 that state, so an application that turns foreign keys on at connect (as
 Django and Rails do) needs no change for it, and switching the pragmas
-mid-session is fine (#52). The rest of this table still applies to ORM
-schemas: a `DEFAULT CURRENT_TIMESTAMP` column is refused.
+mid-session is fine (#52).
 
 Not detectable, so not refused - know these:
 

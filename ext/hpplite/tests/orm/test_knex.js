@@ -66,9 +66,11 @@ const { uri, step, probe, finish, assert, EXT } = require("./node_common.js");
         await knex.transaction(async (trx) => { await trx.batchInsert("orders", rows, 250); });
         assert((await knex("orders").where("status", "like", "imported%").count({ n: "*" }))[0].n === 5000, "bulk rows");
     });
-    await probe("t.timestamps(true, true) (DEFAULT CURRENT_TIMESTAMP)", async () =>
-        knex.schema.createTable("audit", (t) => { t.increments("id"); t.timestamps(true, true); }));
-    await probe("update ... knex.fn.now()", async () => knex("orders").where({ id: 1 }).update({ status: knex.fn.now() }));
+    await step("t.timestamps(true, true) rows (DEFAULT CURRENT_TIMESTAMP, #56)", async () => {
+        await knex.schema.createTable("audit", (t) => { t.increments("id"); t.string("what"); t.timestamps(true, true); });
+        for (let i = 0; i < 20; i++) await knex("audit").insert({ what: `event ${i}` });
+    });
+    await step("update ... knex.fn.now()", async () => knex("orders").where({ id: 1 }).update({ status: knex.fn.now() }));
     await probe("orderByRaw('random()') read", async () => knex("orders").orderByRaw("random()").limit(3));
     await knex.destroy();
     finish("knex");

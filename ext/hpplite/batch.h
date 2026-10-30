@@ -26,6 +26,7 @@ struct HppliteTxn {
   int64_t nRowsAffected;   /* Number of rows affected (-1 if unknown) */
   int64_t txn;             /* Transaction group within the batch (0, 1, ...) */
   int mode;                /* Connection state the statement ran under (HPPLITE_MODE_*) */
+  int64_t now;             /* The time it read, Julian day ms (0 = it did not read the clock; #56) */
 };
 
 /*

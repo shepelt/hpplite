@@ -114,7 +114,7 @@ step("bulk_create 5000 in atomic() (larger than a DA batch)", bulk_create_big)
 
 probe("update filtered by __month (django_date_extract, a Python UDF)",
       lambda: Task.objects.filter(due__month=3).update(points=F("points") + 1))
-probe("update with Now()", lambda: Task.objects.filter(pk=1).update(title=Concat(F("title"), Now())))
+step("update with Now() (#56)", lambda: Task.objects.filter(pk__lte=5).update(title=Concat(F("title"), Value(" "), Now())))
 probe("order_by('?') read (RAND, a Python UDF)", lambda: list(Tag.objects.order_by("?")))
 probe("order_by(Random()) read", lambda: list(Tag.objects.order_by(Random())))
 probe("last_login update via update_last_login (Python timezone.now())",

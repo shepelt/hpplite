@@ -109,10 +109,14 @@ UPDATE posts SET slug = lower(replace(title, ' ', '-'));`);
         const r = await db.select({ n: count() }).from(posts).where(sql`${posts.title} like 'seed %'`);
         assert(r[0].n === 5000, "seed rows");
     });
-    await probe("default sql`(unixepoch())` (the drizzle template default)",
-        async () => raw.exec("CREATE TABLE sessions (id text PRIMARY KEY, created_at integer DEFAULT (unixepoch()) NOT NULL)"));
-    await probe("default sql`(CURRENT_TIMESTAMP)`",
-        async () => raw.exec("CREATE TABLE events (id integer PRIMARY KEY, at text DEFAULT (CURRENT_TIMESTAMP))"));
+    await step("default sql`(unixepoch())` and (CURRENT_TIMESTAMP) rows (the drizzle template defaults, #56)", async () => {
+        raw.exec("CREATE TABLE sessions (id text PRIMARY KEY, created_at integer DEFAULT (unixepoch()) NOT NULL)");
+        raw.exec("CREATE TABLE events (id integer PRIMARY KEY, at text DEFAULT (CURRENT_TIMESTAMP), ms text DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')))");
+        for (let i = 0; i < 20; i++) {
+            raw.prepare("INSERT INTO sessions(id) VALUES(?)").run(`s${i}`);
+            raw.prepare("INSERT INTO events(id) VALUES(?)").run(i);
+        }
+    });
     await probe("orderBy(sql`random()`) read", async () => db.select().from(posts).orderBy(sql`random()`));
     await probe("SELECT last_insert_rowid() read", async () => raw.prepare("SELECT last_insert_rowid()").get());
     raw.close();

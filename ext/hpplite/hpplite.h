@@ -69,6 +69,12 @@ struct HppliteCtx {
     char *zSql; int schema; char zWhy[160];
   } aFnVerdict[64];
   sqlite3_stmt *aActiveStmt[16]; /* Application statements between their STMT and PROFILE trace */
+  sqlite3_int64 aActiveLog[16];  /* ...the log row each one wrote (0 = none) */
+  sqlite3_int64 aActiveNow[16];  /* ...the time pinned for it (0 = none; #56) */
+  unsigned aActiveSeen[16];      /* ...clock reads on the thread when it started */
+  int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
+  sqlite3_stmt *pPinOwner;    /* The statement that pinned the clock (outermost write) */
+  sqlite3_stmt *pNowStmt;     /* Cached UPDATE _hpplite_pending SET now */
   int nActiveStmt;
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
   sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */

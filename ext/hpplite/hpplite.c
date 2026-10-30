@@ -6,6 +6,7 @@
 */
 
 #include "hpplite.h"
+#include "clock.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -176,13 +177,15 @@ static const char *HPPLITE_SCHEMA =
   "CREATE TABLE IF NOT EXISTS _hpplite_carry("
   "  seq INTEGER PRIMARY KEY,"
   "  sql TEXT NOT NULL,"
-  "  mode INTEGER NOT NULL DEFAULT 0"
+  "  mode INTEGER NOT NULL DEFAULT 0,"
+  "  now INTEGER NOT NULL DEFAULT 0"
   ");"
   "CREATE TABLE IF NOT EXISTS _hpplite_pending("
   "  id INTEGER PRIMARY KEY,"
   "  txn INTEGER NOT NULL,"
   "  sql TEXT NOT NULL,"
-  "  mode INTEGER NOT NULL DEFAULT 0"   /* HPPLITE_MODE_*: the connection state it ran under (#52) */
+  "  mode INTEGER NOT NULL DEFAULT 0,"  /* HPPLITE_MODE_*: the connection state it ran under (#52) */
+  "  now INTEGER NOT NULL DEFAULT 0"    /* the time it read, Julian day ms; 0 = none (#56) */
   ");";
 
 /*
@@ -932,12 +935,58 @@ static int currentMode(HppliteCtx *pCtx) {
   return mode;
 }
 
+/* A logged statement read the clock: its row records the time it read
+** (no-op if the effect check removed the row) */
+static void recordNow(HppliteCtx *pCtx, sqlite3_int64 logId, sqlite3_int64 t) {
+  pCtx->bInternal = 1;
+  if (!pCtx->pNowStmt
+      && sqlite3_prepare_v3(pCtx->db, "UPDATE _hpplite_pending SET now = ?2 WHERE id = ?1", -1,
+                            SQLITE_PREPARE_PERSISTENT, &pCtx->pNowStmt, NULL) != SQLITE_OK) {
+    pCtx->pNowStmt = NULL;
+  }
+  if (pCtx->pNowStmt) {
+    sqlite3_bind_int64(pCtx->pNowStmt, 1, logId);
+    sqlite3_bind_int64(pCtx->pNowStmt, 2, t);
+    if (sqlite3_step(pCtx->pNowStmt) != SQLITE_DONE) pCtx->nLogErrors++;
+    sqlite3_reset(pCtx->pNowStmt);
+  } else {
+    pCtx->nLogErrors++;
+  }
+  pCtx->bInternal = 0;
+}
+
+/* 'localtime' / 'utc' as a time function's modifier; zIn lower-cased.
+** Literals already looked at are blanked, as isTimeFunctionArg expects. */
+static int usesTimeZone(const char *zIn) {
+  size_t n = strlen(zIn), i;
+  char *z = sqlite3_malloc64(n + 1);
+  int hit = 0;
+  if (!z) return 0;
+  memcpy(z, zIn, n + 1);
+  for (i = 0; i < n && !hit; i++) {
+    if (z[i] == '\'') {
+      size_t j = i + 1;
+      while (j < n && !(z[j] == '\'' && z[j + 1] != '\'')) j += (z[j] == '\'') ? 2 : 1;
+      if (((j - i - 1 == 9 && strncmp(z + i + 1, "localtime", 9) == 0)
+           || (j - i - 1 == 3 && strncmp(z + i + 1, "utc", 3) == 0)) && isTimeFunctionArg(z, i)) {
+        hit = 1;
+      }
+      for (size_t m = i; m <= j && m < n; m++) z[m] = '#';
+      i = j;
+    }
+  }
+  sqlite3_free(z);
+  return hit;
+}
+
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
   const char *zSql = (const char*)pX;
   char *zExpanded;
-  int rc;
+  int rc, slot = -1, readClock = 0;
+  sqlite3_int64 doneLog = 0, doneNow = 0;
+  unsigned doneSeen = 0;
 
   if (!pCtx || pCtx->bInternal) return 0;
   /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
@@ -954,18 +1003,40 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { running = 1; break; }
     if (running) return 0;
     if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
-      pCtx->aActiveStmt[pCtx->nActiveStmt++] = pS;
+      slot = pCtx->nActiveStmt++;
+      pCtx->aActiveStmt[slot] = pS;
+      pCtx->aActiveLog[slot] = 0;
+      pCtx->aActiveNow[slot] = 0;
+      pCtx->aActiveSeen[slot] = 0;
     }
     pCtx->nAppStmtActive++;
   } else if (mask == SQLITE_TRACE_PROFILE) {
     int i;
     for (i = 0; i < pCtx->nActiveStmt; i++) {
       if (pCtx->aActiveStmt[i] == pS) {
-        pCtx->aActiveStmt[i] = pCtx->aActiveStmt[--pCtx->nActiveStmt];
+        int last = --pCtx->nActiveStmt;
+        doneLog = pCtx->aActiveLog[i];
+        doneNow = pCtx->aActiveNow[i];
+        doneSeen = pCtx->aActiveSeen[i];
+        pCtx->aActiveStmt[i] = pCtx->aActiveStmt[last];
+        pCtx->aActiveLog[i] = pCtx->aActiveLog[last];
+        pCtx->aActiveNow[i] = pCtx->aActiveNow[last];
+        pCtx->aActiveSeen[i] = pCtx->aActiveSeen[last];
         break;
       }
     }
     if (pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
+    if (doneNow) {
+      /* the statement read the clock while it ran: record the time it got.
+      ** One read is SQLite's own: with PROFILE tracing on it times every
+      ** statement, and the closing read lands just before this callback.
+      ** Reads by statements nested in this one only over-record (harmless). */
+      readClock = hpplite_clock_consulted() - doneSeen > 1;
+    }
+    if (pS == pCtx->pPinOwner) {
+      hpplite_clock_pin(0);
+      pCtx->pPinOwner = NULL;
+    }
   }
   if (!pCtx->bEnabled) return 0;
   if (pCtx->bStatusGone && mask == SQLITE_TRACE_STMT) {
@@ -976,6 +1047,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
+    if (readClock && doneLog) recordNow(pCtx, doneLog, doneNow);
     return 0;
   }
   if (mask != SQLITE_TRACE_STMT || !zSql) return 0;
@@ -991,7 +1063,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     char *lower = lowercaseDup(zSql);
     const char *zWhy = NULL;
     if (lower) {
-      if (isTrackedSql(zSql) && isNondeterministicSql(lower))
+      /* the clock replays when the connection is on the clock VFS (#56);
+      ** a machine's time zone never does */
+      if (isTrackedSql(zSql) && usesTimeZone(lower))
+        zWhy = "'localtime'/'utc' depend on the machine's time zone, which differs between replicas";
+      else if (isTrackedSql(zSql) && !pCtx->bClockPin && isNondeterministicSql(lower))
         zWhy = "non-deterministic SQL (random(), 'now', CURRENT_TIMESTAMP, date() ...) cannot be replayed";
     }
     sqlite3_free(lower);
@@ -1060,6 +1136,23 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     ** only a single statement has to fit */
   }
 
+  if (pCtx->bClockPin && slot < 0) {
+    int i;
+    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { slot = i; break; }
+  }
+  if (pCtx->bClockPin && slot >= 0) {
+    /* Pin "now" for the statement (#56): the outermost write pins the real
+    ** time, a write that starts while it runs shares it; at the end, a
+    ** statement that read the clock records the time it read */
+    sqlite3_int64 t = hpplite_clock_pinned();
+    if (!t) {
+      t = hpplite_clock_read();
+      hpplite_clock_pin(t);
+      pCtx->pPinOwner = pS;
+    }
+    pCtx->aActiveNow[slot] = t;
+  }
+
   pCtx->bInternal = 1;
   if (!pCtx->pLogStmt) {
     rc = sqlite3_prepare_v3(pCtx->db,
@@ -1078,6 +1171,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     if (rc == SQLITE_DONE) {
       pCtx->pLastLogged = pS;
       pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      if (slot < 0) {
+        int i;
+        for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { slot = i; break; }
+      }
+      if (slot >= 0) pCtx->aActiveLog[slot] = pCtx->lastLogId;
       if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->lastLogId;
       pCtx->changesAtLog = totalChanges(pCtx->db);
       pCtx->schemaAtLog = schemaVersion(pCtx);
@@ -1088,6 +1186,8 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     rc = SQLITE_ERROR;
   }
   pCtx->bInternal = 0;
+  /* the statement's own clock reads start after our bookkeeping above */
+  if (slot >= 0) pCtx->aActiveSeen[slot] = hpplite_clock_consulted();
   if (rc != SQLITE_DONE) {
     char why[160];
     snprintf(why, sizeof(why), "could not log statement (%s)", sqlite3_errmsg(pCtx->db));
@@ -1129,6 +1229,23 @@ static void hppliteRollbackHook(void *pArg) {
 ** ============================================================================
 */
 
+static int addColumnIfMissing(HppliteCtx *pCtx, sqlite3 *db, const char *zTable, const char *zCol) {
+  sqlite3_stmt *q = NULL;
+  int has = 0, rc = SQLITE_OK;
+  char *z = sqlite3_mprintf("SELECT 1 FROM pragma_table_info(%Q) WHERE name = %Q", zTable, zCol);
+  if (!z) return SQLITE_NOMEM;
+  if (sqlite3_prepare_v2(db, z, -1, &q, NULL) == SQLITE_OK) has = (sqlite3_step(q) == SQLITE_ROW);
+  sqlite3_finalize(q);
+  sqlite3_free(z);
+  if (!has) {
+    z = sqlite3_mprintf("ALTER TABLE %s ADD COLUMN %s INTEGER NOT NULL DEFAULT 0", zTable, zCol);
+    if (!z) return SQLITE_NOMEM;
+    rc = internalExec(pCtx, db, z);
+    sqlite3_free(z);
+  }
+  return rc;
+}
+
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   HppliteCtx *pCtx;
   int rc;
@@ -1154,22 +1271,17 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
     sqlite3_finalize(q);
     if (!has) rc = internalExec(pCtx, db, "ALTER TABLE _hpplite_pending ADD COLUMN mode INTEGER NOT NULL DEFAULT 0");
   }
-  if (rc == SQLITE_OK) {
-    /* files from before #57: no batch was ever left open */
-    sqlite3_stmt *q = NULL;
-    int has = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'open_txn'",
-                           -1, &q, NULL) == SQLITE_OK) {
-      has = (sqlite3_step(q) == SQLITE_ROW);
-    }
-    sqlite3_finalize(q);
-    if (!has) rc = internalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN open_txn INTEGER NOT NULL DEFAULT 0");
-  }
+  /* files from before #57 (no batch was ever left open) and #56 (no
+  ** statement recorded a time) */
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "open_txn");
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_pending", "now");
+  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "now");
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);
     return rc;
   }
   loadMeta(pCtx);
+  pCtx->bClockPin = hpplite_clock_on(db);
 
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
@@ -1212,7 +1324,8 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
   if (pCtx->pRecTrigStmt) sqlite3_finalize(pCtx->pRecTrigStmt);
   if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
-  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = NULL;
+  if (pCtx->pNowStmt) sqlite3_finalize(pCtx->pNowStmt);
+  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pNowStmt = NULL;
   pCtx->pLastLogged = NULL;
 }
 
@@ -1222,7 +1335,7 @@ static int applicationStatementsOpen(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt = NULL;
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
-        || pStmt == pCtx->pRecTrigStmt) continue;
+        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pNowStmt) continue;
     return 1;
   }
   return 0;
@@ -1318,6 +1431,10 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
       sha256_update(&h, (const uint8_t*)"M", 1);
       hashU64(&h, (uint64_t)pBatch->aTxns[i].mode);
     }
+    if (pBatch->aTxns[i].now) {
+      sha256_update(&h, (const uint8_t*)"N", 1);
+      hashU64(&h, (uint64_t)pBatch->aTxns[i].now);
+    }
   }
   sha256_final(&h, pOut);
 }
@@ -1401,7 +1518,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   size_t estSize = hpplite_batch_json_overhead();
   int overLimit = 0;
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode FROM _hpplite_pending ORDER BY id",
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now FROM _hpplite_pending ORDER BY id",
     -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
@@ -1433,6 +1550,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       if (txn != lastTxn) { txnRel++; lastTxn = txn; }
       hpplite_batch_add_stmt(pBatch, zSql, -1, txnRel);
       pBatch->aTxns[pBatch->nTxns - 1].mode = sqlite3_column_int(pStmt, 3);
+      pBatch->aTxns[pBatch->nTxns - 1].now = sqlite3_column_int64(pStmt, 4);
       aId[pBatch->nTxns - 1] = sqlite3_column_int64(pStmt, 0);
       aGroup[pBatch->nTxns - 1] = txn;
       nRead = pBatch->nTxns;
@@ -1663,20 +1781,21 @@ static int connectionMode(sqlite3 *db) {
 ** transaction is lost, never half of it - as if the writer had crashed
 ** before posting it.
 */
-typedef struct ReplayStmt { const char *zSql; int mode; sqlite3_int64 group; } ReplayStmt;
+typedef struct ReplayStmt { const char *zSql; int mode; sqlite3_int64 group; sqlite3_int64 now; } ReplayStmt;
 
-static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode) {
+static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode, sqlite3_int64 **paNow) {
   sqlite3_stmt *q = NULL;
   int n = 0, cap = 0, rc;
   char **az = NULL;
   int *am = NULL;
-  *pazSql = NULL; *paMode = NULL;
+  sqlite3_int64 *an = NULL;
+  *pazSql = NULL; *paMode = NULL; *paNow = NULL;
   if (pCtx->nCarry <= 0) return 0;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT sql, mode FROM _hpplite_carry ORDER BY seq", -1, &q, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT sql, mode, now FROM _hpplite_carry ORDER BY seq", -1, &q, NULL);
   if (rc != SQLITE_OK) return -1;
   while (sqlite3_step(q) == SQLITE_ROW) {
     if (n == cap) {
-      char **az2; int *am2;
+      char **az2; int *am2; sqlite3_int64 *an2;
       cap = cap ? cap * 2 : 64;
       az2 = sqlite3_realloc64(az, sizeof(char*) * cap);
       if (!az2) { n = -1; break; }
@@ -1684,13 +1803,17 @@ static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode) {
       am2 = sqlite3_realloc64(am, sizeof(int) * cap);
       if (!am2) { n = -1; break; }
       am = am2;
+      an2 = sqlite3_realloc64(an, sizeof(sqlite3_int64) * cap);
+      if (!an2) { n = -1; break; }
+      an = an2;
     }
     az[n] = sqlite3_mprintf("%s", (const char*)sqlite3_column_text(q, 0));
     am[n] = sqlite3_column_int(q, 1);
+    an[n] = sqlite3_column_int64(q, 2);
     n++;
   }
   sqlite3_finalize(q);
-  *pazSql = az; *paMode = am;
+  *pazSql = az; *paMode = am; *paNow = an;
   return n;
 }
 
@@ -1699,11 +1822,12 @@ static int storeCarry(HppliteCtx *pCtx, const ReplayStmt *a, int n) {
   int rc, i;
   rc = sqlite3_exec(pCtx->bkDb, "DELETE FROM _hpplite_carry", NULL, NULL, NULL);
   if (rc != SQLITE_OK || n == 0) return rc;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT INTO _hpplite_carry(seq, sql, mode) VALUES(?1, ?2, ?3)", -1, &q, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT INTO _hpplite_carry(seq, sql, mode, now) VALUES(?1, ?2, ?3, ?4)", -1, &q, NULL);
   for (i = 0; rc == SQLITE_OK && i < n; i++) {
     sqlite3_bind_int(q, 1, i);
     sqlite3_bind_text(q, 2, a[i].zSql, -1, SQLITE_STATIC);
     sqlite3_bind_int(q, 3, a[i].mode);
+    sqlite3_bind_int64(q, 4, a[i].now);
     rc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
     sqlite3_reset(q);
   }
@@ -1718,7 +1842,10 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ReplayStmt *aRun = NULL;
   char **azCarry = NULL;
   int *aCarryMode = NULL;
+  sqlite3_int64 *aCarryNow = NULL;
   int nCarry, nRun = 0, nHold, firstEnd, holdFrom, carryChanged;
+  sqlite3_int64 savedPin;
+  unsigned savedSeen;
 
   if (!pCtx || !pBatch) return SQLITE_MISUSE;
   if (pBatch->height < pCtx->blockHeight) return SQLITE_DONE;   /* already applied */
@@ -1741,14 +1868,14 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ** joins this batch's first group when it continues it */
   {
     int saved = bkEnter(pCtx);
-    nCarry = loadCarry(pCtx, &azCarry, &aCarryMode);
+    nCarry = loadCarry(pCtx, &azCarry, &aCarryMode, &aCarryNow);
     bkLeave(pCtx, saved);
   }
   if (nCarry < 0) return SQLITE_NOMEM;
   aRun = sqlite3_malloc64(sizeof(ReplayStmt) * (size_t)(nCarry + pBatch->nTxns + 1));
   if (!aRun) {
     for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
-    sqlite3_free(azCarry); sqlite3_free(aCarryMode);
+    sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
     return SQLITE_NOMEM;
   }
   firstEnd = 0;
@@ -1762,7 +1889,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   }
   if (nCarry > 0 && pBatch->contTxn) {
     for (i = 0; i < nCarry; i++) {
-      aRun[nRun].zSql = azCarry[i]; aRun[nRun].mode = aCarryMode[i];
+      aRun[nRun].zSql = azCarry[i]; aRun[nRun].mode = aCarryMode[i]; aRun[nRun].now = aCarryNow[i];
       aRun[nRun].group = pBatch->nTxns > 0 ? pBatch->aTxns[0].txn : 0;
       nRun++;
     }
@@ -1770,6 +1897,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   for (i = 0; i < pBatch->nTxns; i++) {
     if (i < firstEnd && pBatch->contTxn && nCarry == 0) continue;   /* a continuation without its head */
     aRun[nRun].zSql = pBatch->aTxns[i].zSql; aRun[nRun].mode = pBatch->aTxns[i].mode;
+    aRun[nRun].now = pBatch->aTxns[i].now;
     aRun[nRun].group = pBatch->aTxns[i].txn;
     nRun++;
   }
@@ -1791,6 +1919,22 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   nHold = nRun - holdFrom;
   if (nHold > 0) carryChanged = 1;
 
+  /* The clock: each statement reads the time it read on the writer; one
+  ** that did not read it there gets a fixed time (the batch's), so an
+  ** unexpected read is at least the same on every replica (#56) */
+  for (i = 0; i < holdFrom; i++) {
+    if (aRun[i].now && !hpplite_clock_on(rdb)) {
+      fprintf(stderr, "hpplite: batch %llu has statements that read the clock, and the replay connection "
+              "is not on the clock VFS; cannot reproduce them\n", (unsigned long long)pBatch->height);
+      for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
+      sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
+      sqlite3_free(aRun);
+      return SQLITE_MISMATCH;
+    }
+  }
+  savedPin = hpplite_clock_pinned();
+  savedSeen = hpplite_clock_consulted();
+
   savedEnabled = pCtx->bEnabled;
   if (rdb == pCtx->db) { pCtx->bEnabled = 0; pCtx->bInternal = 1; }
   int savedMode = connectionMode(rdb), curMode = savedMode;
@@ -1807,6 +1951,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       lastTxn = aRun[i].group;
     }
     if (rc == SQLITE_OK) rc = replayMode(rdb, aRun[i].mode, &curMode);
+    hpplite_clock_pin(aRun[i].now ? aRun[i].now
+                                  : (sqlite3_int64)pBatch->timestamp * 1000 + 210866760000000LL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
       /* The statement failed here as it did at the sequencer (a failed
@@ -1825,6 +1971,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
     else sqlite3_exec(rdb, "ROLLBACK", NULL, NULL, NULL);
   }
+  hpplite_clock_restore(savedPin, savedSeen);
   /* back to the connection's own state (the application's, on :memory:) */
   if (replayMode(rdb, savedMode, &curMode) != SQLITE_OK) {
     fprintf(stderr, "hpplite: could not restore the connection's foreign_keys/recursive_triggers after replay\n");
@@ -1847,7 +1994,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     }
   }
   for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
-  sqlite3_free(azCarry); sqlite3_free(aCarryMode);
+  sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow);
   sqlite3_free(aRun);
   if (rc != SQLITE_OK) return rc;
 
@@ -1875,14 +2022,15 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
 
   int saved = bkEnter(pCtx);
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, sql, mode, CASE WHEN txn = 0 THEN id ELSE txn END FROM _hpplite_pending ORDER BY id LIMIT ?1",
+    "SELECT id, sql, mode, CASE WHEN txn = 0 THEN id ELSE txn END, now FROM _hpplite_pending ORDER BY id LIMIT ?1",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) { bkLeave(pCtx, saved); return rc; }
   sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
   while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
     if (!zSql || !pBatch->aTxns[i].zSql || strcmp(zSql, pBatch->aTxns[i].zSql) != 0
-        || sqlite3_column_int(pStmt, 2) != pBatch->aTxns[i].mode) {
+        || sqlite3_column_int(pStmt, 2) != pBatch->aTxns[i].mode
+        || sqlite3_column_int64(pStmt, 4) != pBatch->aTxns[i].now) {
       ok = 0;
       break;
     }
@@ -2666,6 +2814,7 @@ static int hpplite_auto_init(
 */
 __attribute__((constructor))
 static void hpplite_auto_register(void) {
+    hpplite_clock_register();        /* before any connection is opened (#56) */
     sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
 }
 #endif
@@ -2755,6 +2904,9 @@ int sqlite3_hpplite_init(
     }
   }
   hpplite_pin_in_memory();
+  /* connections opened from here on take their time from the clock VFS
+  ** (#56); the module stays loaded, so the VFS outlives every connection */
+  hpplite_clock_register();
   sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
   return hpplite_auto_init(db, pzErrMsg, pApi);
 }

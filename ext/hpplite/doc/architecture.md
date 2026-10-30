@@ -240,13 +240,21 @@ with no history is the wrong key, never an intruder, and is an error.
 ### Determinism
 
 Replay re-executes captured SQL text. That is only sound when a statement's
-effect is a function of the database and the statement: `random()`,
-`randomblob()`, the clock (`datetime('now')`, `CURRENT_TIMESTAMP`, including
-as a column default), `last_insert_rowid()` and friends break it, as do
-`ATTACH` and the pragmas that change later statements' effects. v0.1
-**refuses** these at the write (`SQLITE_INTERRUPT`; `determinism=warn` to
-only count them): the application learns at the statement, not from a root
-mismatch later. The convention is to compute such values in the application
+effect is a function of the database and the statement - plus whatever
+state is recorded with it and reapplied on replay:
+
+- connection state that changes what a statement does to other rows
+  (`foreign_keys`, `recursive_triggers`) is recorded per statement (#52);
+- the clock (`datetime('now')`, `CURRENT_TIMESTAMP`, column defaults) is
+  recorded per statement that read it and pinned on replay through a
+  pass-through VFS (`clock.c`, #56).
+
+What cannot be recorded - `random()`, `randomblob()`, `last_insert_rowid()`
+and friends, the machine's time zone (`'localtime'`), functions the
+application registered (a replica does not have them, #53), `ATTACH` - v0.1
+**refuses** in writes (`SQLITE_INTERRUPT`; `determinism=warn` to only count
+the non-deterministic ones): the application learns at the statement, not
+from a root mismatch later. Reads are never refused (#54). The convention is to compute such values in the application
 and bind them; `sqlite3_expanded_sql()` writes the bound literal into the
 captured text. The structural fix is v0.2's row-level capture (#19): log
 the row changes the preupdate hook reports instead of the text, and replay

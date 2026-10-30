@@ -272,9 +272,10 @@ static void test_nondeterminism_detected(void) {
     exec(db, "INSERT INTO t VALUES(2, datetime('now'))");
     exec(db, "INSERT INTO t VALUES(3, CURRENT_TIMESTAMP)");
     exec(db, "INSERT INTO t VALUES(RANDOMBLOB(4), 'b')");
-    if (ctx->nNondeterministic != 4) { printf("(count=%llu) ", (unsigned long long)ctx->nNondeterministic); FAIL("expected 4 flagged statements"); }
+    /* the clock replays on the clock VFS (#56): only the random values count */
+    if (ctx->nNondeterministic != 2) { printf("(count=%llu) ", (unsigned long long)ctx->nNondeterministic); FAIL("expected 2 flagged statements"); }
     exec(db, "UPDATE t SET x = 9 WHERE ts = 'fixed'");
-    if (ctx->nNondeterministic != 4) FAIL("deterministic UPDATE flagged");
+    if (ctx->nNondeterministic != 2) FAIL("deterministic UPDATE flagged");
     close_ctx(db, ctx);
     PASS();
 }
