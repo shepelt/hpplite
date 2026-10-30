@@ -184,6 +184,11 @@ ext/hpplite/tools/linux_test.sh          # Ubuntu 24.04, Release, ctest
 ext/hpplite/tools/linux_test.sh asan     # AddressSanitizer + UBSan
 ext/hpplite/tools/linux_test.sh stress   # + the 100 MB stress test
 
+# ORM smoke tests on anvil: SQLAlchemy + Alembic, Django (migrate, ORM), Drizzle, Knex;
+# a replica rebuilt from the chain must match each writer. First run pip/npm installs
+# into $TMPDIR/hpplite-orm (network), so not in ctest or CI
+tests/orm/run_orm.sh build_real/hpplite.dylib [sqlalchemy|django|drizzle|knex ...]
+
 # Integration tests (real L1, requires funded wallet); also runs the examples
 export HPPLITE_PRIVATE_KEY=0x...
 ./tests/integration/run_integration.sh
