@@ -1212,6 +1212,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     hppliteStatementDone(pCtx, pS);
+    if (!pCtx->pLastLogged) __atomic_store_n(&pCtx->nUnsettled, 0, __ATOMIC_RELEASE);
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
     ** closing read just before this callback. With no other read, the
@@ -1376,6 +1377,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
 static int hppliteCommitHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   if (pCtx->bInternal) return 0;
+  /* an autocommit statement whose effect is not checked yet: its log row may
+  ** still be removed after this commit (see bkBegin) */
+  if (pCtx->pLastLogged && sqlite3_get_autocommit(pCtx->db)) {
+    __atomic_store_n(&pCtx->nUnsettled, 1, __ATOMIC_RELEASE);
+  }
   pCtx->curTxn = 0;
   pCtx->bRootDirty = 1;
   if (pCtx->xOnCommit) {
@@ -1708,6 +1714,18 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
     if (rc != SQLITE_OK && pCtx->bBkGate) {
       pCtx->bBkGate = 0;
       __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+    }
+    if (rc == SQLITE_OK && !bWrite && pCtx->bkDb != pCtx->db) {
+      /* An autocommit statement commits with its log row; if it changed
+      ** nothing, the row is removed only afterwards. A snapshot taken in
+      ** between would hold a row the log is about to lose (a batch built
+      ** from it fails adoption later). Take the snapshot, then look: if the
+      ** commit is marked unsettled, it may be in it - try again later. */
+      internalExec(pCtx, pCtx->bkDb, "SELECT 1 FROM _hpplite_meta LIMIT 1");
+      if (__atomic_load_n(&pCtx->nUnsettled, __ATOMIC_ACQUIRE)) {
+        internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
+        return SQLITE_BUSY;
+      }
     }
     return rc;
   }

@@ -654,6 +654,9 @@ static int node_adopt_existing(HppliteNode *node) {
         node->batchesSinceCheckpoint++;
         return 1;
     }
+    /* It matched but could not be finalized now (an application statement or
+    ** transaction is open: the gate) - a deferral, not a fork: next flush */
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) return 0;
     fprintf(stderr, "hpplite: L1 batch %llu does not match local pending SQL\n",
             (unsigned long long)node->ctx->blockHeight);
     return -1;
@@ -1007,6 +1010,10 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         if (hpplite_pending_count(node->ctx) > 0) {
             /* Local writes exist: the L1 batch must be ours */
             rc = hpplite_adopt_batch(node->ctx, batch);
+            if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+                hpplite_batch_free(batch);   /* matched; finalized by a later flush */
+                return synced;
+            }
             if (rc != SQLITE_OK) {
                 fprintf(stderr, "hpplite: local pending SQL diverges from L1 batch %llu\n",
                         (unsigned long long)batch->height);

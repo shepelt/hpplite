@@ -86,6 +86,7 @@ struct HppliteCtx {
   volatile int txnGate;       /* 0 free, 1 the application (a statement or transaction open), 2 a
                               ** bookkeeping write: its commit never lands inside the application's */
   int bBkGate;                /* this bookkeeping transaction took the gate */
+  volatile int nUnsettled;    /* an autocommit statement committed, its effect check still to run */
   sqlite3_stmt *pSeqStmt;     /* Cached fingerprint of sqlite_sequence (NULL: none yet) */
   int seqTriedGen;            /* nDdlGen + 1 when sqlite_sequence was last found missing */
   sqlite3_int64 seqAtLog[2];  /* ...its fingerprint when the last statement was logged */

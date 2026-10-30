@@ -661,6 +661,55 @@ static void test_read_then_write_under_timer(void) {
     PASS();
 }
 
+/* An autocommit statement that changes nothing commits with its log row,
+** and the row is removed just after: a batch built in between carried a row
+** the log no longer had, and adopting it (confirmation lost) failed. Found
+** booting Ghost (#58): "L1 batch 2 does not match local pending SQL". */
+typedef struct { HppliteNode *n; volatile int stop; int flushes; } Flusher2;
+static void *flusher2(void *arg) {
+    Flusher2 *f = arg;
+    while (!f->stop) { hpplite_node_flush_batch(f->n); f->flushes++; }
+    return NULL;
+}
+static void test_no_op_rows_vs_adoption(void) {
+    TEST("batches built while no-op statements commit and unlog: adoption never mismatches");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
+    HppliteNode *n = open_node(DIR "/noop.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, x)", NULL);
+    hpplite_l1_mock_set_lose_confirmation(l1, 1);          /* every batch is finished by adoption */
+    Flusher2 f = { n, 0, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, flusher2, &f);
+    for (int i = 0; i < 3000 && n->state != HPPLITE_STATE_ERROR; i++) {
+        char sql[64];
+        sqlite3_exec(n->db, "UPDATE t SET x = x WHERE id < 0", NULL, NULL, NULL);   /* logs, then unlogs */
+        snprintf(sql, sizeof(sql), "INSERT INTO t(x) VALUES(%d)", i);
+        sqlite3_exec(n->db, sql, NULL, NULL, NULL);
+    }
+    f.stop = 1;
+    pthread_join(th, NULL);
+    hpplite_l1_mock_set_lose_confirmation(l1, 0);
+    int state = n->state;
+    hpplite_node_flush_batch(n);
+    int left = hpplite_node_pending_count(n);
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    HppliteNode *r = open_node(DIR "/noop_replica.db", l1);
+    if (r) hpplite_node_get_state_root(r, rb);
+    int rows = r ? count_rows(r->db, "t") : -1;
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    printf("(%d flushes) ", f.flushes);
+    if (state == HPPLITE_STATE_ERROR) FAIL("an adoption mismatched: a batch carried a row the log removed");
+    if (left != 0) FAIL("pending left");
+    if (rows != 3000 || memcmp(ra, rb, 32) != 0) FAIL("replica differs");
+    PASS();
+}
+
 /* A transaction that reads, then writes (Knex's deferred BEGIN, Django's
 ** atomic(): the usual shape) must not be broken by a bookkeeping commit in
 ** between: in WAL mode the read snapshot could no longer become a write */
@@ -1129,6 +1178,7 @@ int main(void) {
     test_bookkeeping_waits_for_app_transaction();
     test_zero_row_insert_into_autoincrement();
     test_read_then_write_under_timer();
+    test_no_op_rows_vs_adoption();
     test_wrong_height_batch();
     test_plaintext_on_encrypting_rollup();
     test_plaintext_at_height_1();
