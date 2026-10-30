@@ -408,6 +408,35 @@ static void test_app_defined_functions(void) {
     PASS();
 }
 
+/* "interrupted" / "not authorized" is all a driver reports for a refusal:
+** the reason must be one query away for the application (or its agent) */
+static void text_of(sqlite3 *db, const char *sql, char *out, size_t n) {
+    sqlite3_stmt *st;
+    out[0] = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+        snprintf(out, n, "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+}
+static void test_last_refusal(void) {
+    TEST("the reason of the last refusal is in hpplite_status.last_refusal");
+    reset_dir();
+    HppliteNode *n = open_node(DIR "/why.db", NULL);
+    if (!n) FAIL("open");
+    char why[512];
+    text_of(n->db, "SELECT last_refusal FROM hpplite_status", why, sizeof(why));
+    if (why[0]) FAIL("a refusal before any statement");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    if (sqlite3_exec(n->db, "INSERT INTO t VALUES(random())", NULL, NULL, NULL) == SQLITE_OK) FAIL("random() accepted");
+    text_of(n->db, "SELECT last_refusal FROM hpplite_status", why, sizeof(why));
+    if (!strstr(why, "random()") || !strstr(why, "INSERT INTO t VALUES(random())")) FAILF("reason/statement missing: '%s'", why);
+    if (sqlite3_exec(n->db, "DELETE FROM _hpplite_pending", NULL, NULL, NULL) == SQLITE_OK) FAIL("log write accepted");
+    text_of(n->db, "SELECT last_refusal FROM hpplite_status", why, sizeof(why));
+    if (!strstr(why, "_hpplite_")) FAILF("authorizer reason missing: '%s'", why);
+    hpplite_node_destroy(n);
+    PASS();
+}
+
 /* ------------------------------------------------------------------------
 ** 2. Adversarial bytes on L1
 ** ---------------------------------------------------------------------- */
@@ -822,6 +851,7 @@ int main(void) {
     printf("=== HPPLite abuse tests ===\n");
     test_guard_spellings();
     test_app_defined_functions();
+    test_last_refusal();
     test_wrong_height_batch();
     test_plaintext_on_encrypting_rollup();
     test_plaintext_at_height_1();

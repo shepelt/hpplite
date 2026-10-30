@@ -334,6 +334,18 @@ a hundred batches later:
 | writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
 | a single statement larger than one DA batch as posted (default 128 KB after JSON escaping and the envelope) | it could never be posted | split the statement (a multi-row `INSERT` into several); bulk-load before `hpplite=on` |
 
+**What a refusal looks like.** The driver reports only SQLite's code:
+`interrupted` (`SQLITE_INTERRUPT`) or `not authorized` (`SQLITE_AUTH`) - in
+Python an `OperationalError`, in Node an `Error` with that text - and the
+transaction it was in is rolled back. If a write fails that way, the reason
+and the statement are on stderr (`hpplite: ... statement refused`) and one
+query away:
+
+```sql
+SELECT last_refusal FROM hpplite_status;
+-- non-deterministic function random() in a write; replay cannot reproduce it; ... : INSERT INTO t VALUES(random())
+```
+
 `determinism=warn` (URI) or `HPPLITE_DETERMINISM=warn` restores warn-and-count
 for people who know what they are doing (the `_hpplite_*`, size and
 application-function rules stay). Detection is the parser's

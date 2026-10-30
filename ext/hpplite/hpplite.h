@@ -98,6 +98,7 @@ struct HppliteCtx {
   int bDeterminismWarn;       /* Non-deterministic SQL: 1 = warn and count, 0 = refuse (default) */
   uint64_t nAuthDenied;       /* Statements the authorizer refused at prepare (our tables, ATTACH, pragmas) */
   const char *zDenyWhy;       /* Why the statement being prepared was denied (for the error message) */
+  char zLastRefusal[400];     /* Reason and statement of the last refusal (hpplite_status.last_refusal) */
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */

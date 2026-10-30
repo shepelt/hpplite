@@ -837,6 +837,8 @@ static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2,
   rc = hppliteAuthorizerInner(pCtx, op, z1, z2);
   if (rc == SQLITE_DENY) {
     fprintf(stderr, "hpplite: %s; statement refused (SQLITE_AUTH)\n", pCtx->zDenyWhy ? pCtx->zDenyWhy : "not authorized");
+    snprintf(pCtx->zLastRefusal, sizeof(pCtx->zLastRefusal), "%s%s%s (the driver reports \"not authorized\")",
+             pCtx->zDenyWhy ? pCtx->zDenyWhy : "not authorized", z1 ? ": " : "", z1 ? z1 : "");
   }
   return rc;
 }
@@ -896,6 +898,7 @@ static int mentionsHppliteTable(const char *z) {
 static void refuseStatement(HppliteCtx *pCtx, const char *zWhy, const char *zSql) {
   pCtx->nLogErrors++;
   fprintf(stderr, "hpplite: %s; statement refused (SQLITE_INTERRUPT): %.80s\n", zWhy, zSql);
+  snprintf(pCtx->zLastRefusal, sizeof(pCtx->zLastRefusal), "%s (the driver reports \"interrupted\"): %.160s", zWhy, zSql);
   sqlite3_interrupt(pCtx->db);
 }
 
@@ -2214,7 +2217,7 @@ static void hpplite_on_close(sqlite3 *db);
 ** One row: height, pending, state_root, prev_block_hash,
 ** last_checkpoint_height, lease, log_errors, replay_skipped, encryption,
 ** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches,
-** hooks_replaced, roots_compared, root_mismatches, txns_dropped.
+** hooks_replaced, roots_compared, root_mismatches, txns_dropped, last_refusal.
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -2250,6 +2253,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_ROOTS_COMPARED   16
 #define STATUS_COL_ROOT_MISMATCHES  17
 #define STATUS_COL_TXNS_DROPPED     18
+#define STATUS_COL_LAST_REFUSAL     19
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -2262,7 +2266,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER)");
+        " txns_dropped INTEGER, last_refusal TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -2416,6 +2420,10 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_TXNS_DROPPED:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nTxnsDropped);
+            break;
+        case STATUS_COL_LAST_REFUSAL:
+            if (node->ctx->zLastRefusal[0]) sqlite3_result_text(ctx, node->ctx->zLastRefusal, -1, SQLITE_TRANSIENT);
+            else sqlite3_result_null(ctx);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);
