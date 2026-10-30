@@ -1,0 +1,134 @@
+# Capture engine v2: row-based capture
+
+**Status: design, v0.2 (#19). Record what a write did, not what it said.**
+
+## Why
+
+v0.1 captures the text of every write and replays it. That is compact and
+readable, and it is correct only when replaying the text reproduces the
+effect - which needs the replica to have the same functions, the same
+clock, the same connection state, and the same order. Each of these has
+had to be handled one by one:
+
+| Problem with replaying text | v0.1 answer |
+|---|---|
+| `random()`, `randomblob()` in a write | refused (#53) |
+| `CURRENT_TIMESTAMP`, `datetime('now')`, column DEFAULTs | clock pinned per statement, time recorded (#56) |
+| application-defined functions (WordPress's REGEXP) | refused (#53, #19) |
+| failed and no-op statements | effect check after each statement, rows removed (in a transaction) or kept (autocommit) |
+| foreign-key and recursive-trigger settings | connection mode recorded per statement (#52) |
+| a zero-row INSERT creating a `sqlite_sequence` entry | fingerprint check per statement |
+
+Every row of that table is gone if the log holds the *effect*: which rows
+changed, to which values. MySQL went the same way (statement-based, then
+row-based and mixed replication).
+
+## Mechanism: per-connection TEMP triggers
+
+Each HPPLite connection creates, in its own TEMP schema, `AFTER INSERT`,
+`AFTER UPDATE` and `AFTER DELETE` triggers on every table of the database.
+The triggers append one record per changed row to the log table in the
+database file.
+
+- **Inside the application's transaction.** A record commits or rolls back
+  with the change it describes (crash safety as in v0.1), and records from
+  every connection and process are in commit order. A statement that fails,
+  or changes nothing, writes nothing.
+- **Any SQLite build.** The preupdate hook and the session extension would
+  avoid triggers, but they are compile-time options: present in Homebrew's
+  and macOS's SQLite and in Node's, absent in the static PHP that runs
+  WordPress and in some Python builds. A loadable extension cannot count on
+  them. They also cannot write inside the transaction, so a crash between
+  commit and persisting the changes would lose them.
+- **Invisible to the application's schema.** TEMP triggers are not in
+  `sqlite_schema`; migration tools that compare schemas see nothing.
+- **Effects of everything.** The application's own triggers, foreign-key
+  cascades, `REPLACE` conflict deletes, and what FTS5 and R*Tree write to
+  their internal tables all arrive as row changes (checked on SQLite 3.51:
+  cascades and app triggers captured in order; FTS5 internal tables accept
+  triggers; virtual tables and `sqlite_sequence` do not).
+
+### Records
+
+| Op | Contents |
+|---|---|
+| Insert | table, key, every stored column's value |
+| Update | table, old key, new key if it changed, the changed columns only |
+| Delete | table, key |
+
+The key is the rowid, or the primary key of a WITHOUT ROWID table.
+Generated columns are left out (the replica computes them). Values are
+encoded by an HPPLite function the triggers call - type tag and exact
+payload - so integers above 2^53, REALs and blobs round-trip bit for bit.
+
+### Schema and the rest
+
+Schema changes (CREATE, ALTER, DROP), `PRAGMA user_version` and
+`application_id` stay statement text, in the same ordered log. After any
+schema change a connection rebuilds its triggers before its next write, so
+a migration that rebuilds a table (create new, copy rows, drop old, rename)
+is captured row by row. `sqlite_sequence` cannot carry a trigger: replaying
+inserts with their original rowids moves it as on the writer, and the one
+case that does not - an entry created without a row - is recorded as a
+small fix-up record, as today.
+
+## Replay
+
+Records are applied with triggers disabled
+(`SQLITE_DBCONFIG_ENABLE_TRIGGER`) and foreign keys off - their effects are
+already in the log; firing them again would double them. Insert is `INSERT
+OR REPLACE` with the original key (which also reproduces conflict
+replacement); update and delete go by key. Statement text (schema) is
+replayed as in v0.1.
+
+## Format and compatibility
+
+Batches get a format version. A replica keeps replaying v1 (statement)
+batches, so existing histories continue; a v0.1 database upgrades in place,
+its next batch being v2.
+
+## Tampering
+
+TEMP triggers belong to the connection that made them: no other
+connection or process can see or change them. The application could, on
+its own connection - `DROP TRIGGER`, by mistake more likely than not. The
+authorizer HPPLite already installs refuses dropping or replacing its
+triggers, and lets writes to the log through only from inside them (the
+authorizer is told which trigger is running). Before a write, a connection
+checks the TEMP schema version and rebuilds its triggers if it changed.
+
+Anything that goes around capture - a connection without HPPLite, the file
+edited directly, an application set on defeating the authorizer - cannot be
+prevented from inside the process, but it is not silent: checkpoint roots
+are computed from the database file, a replica's from replaying the chain,
+and an uncaptured change makes them differ (`root_mismatches` for any
+verifier). The trust model is v0.1's: the writer is trusted, divergence is
+detected.
+
+## Limits and risks
+
+- **VACUUM** renumbers the rowids of tables without an `INTEGER PRIMARY
+  KEY`, and no trigger sees it. Recorded as a statement; that the
+  renumbering replays identically must be shown (Home Assistant runs it).
+- **Size.** Inserts cost about what their SQL did; updates carry changed
+  columns only; bulk statements (`UPDATE` of every row, `INSERT ... SELECT`)
+  cost far more than their text. Reducing it is v0.3 (compression, DA,
+  #33).
+- **Write overhead**: one log row per changed row instead of per statement.
+  Measured in phase 1 before anything is built on it.
+- **Readable history**: v0.1 batches are SQL, an audit trail of what the
+  application did; records are not. Rows only in v0.2; statement text kept
+  alongside for audit (not replayed) is an option later.
+- Not captured, as before: connections without HPPLite (#37), TEMP tables.
+
+## Phases
+
+1. Prototype and benchmark: trigger manager, record encoding, replay of
+   inserts, updates, deletes; against v1 on the same workloads - equality,
+   size, overhead.
+2. Engine: schema changes in the log, trigger rebuild, WITHOUT ROWID,
+   `sqlite_sequence`, FTS5/R*Tree internal tables, VACUUM, the authorizer.
+3. Batch format v2; v1 history still replayed.
+4. Validation: all current suites, agent apps, Ghost, WordPress concurrent;
+   then SQLite's TCL suite with HPPLite on every connection, Rails 8,
+   Home Assistant.
