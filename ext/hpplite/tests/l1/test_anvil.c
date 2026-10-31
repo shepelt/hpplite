@@ -94,6 +94,14 @@ static void test_open_write_post_checkpoint(void) {
     unsigned char inst[32]; memcpy(inst, n->instanceId, 32);
     sqlite3_close(db);
     HppliteL1 *peek = hpplite_l1_connect(RPC, c);
+    {
+        /* the contract's configuration as the backend reads it (#44): the
+        ** interval this node wrote back, and the lease length */
+        HppliteSystemConfig *sc = hpplite_l1_get_system_config(peek);
+        uint64_t ci = sc ? sc->checkpointInterval : 0, ld = sc ? sc->leaseDuration : 0;
+        hpplite_l1_system_config_free(sc);
+        if (ci != 1 || ld == 0) { hpplite_l1_disconnect(peek); FAILF("getSystemConfig as read: checkpointInterval %llu (want 1), leaseDuration %llu (want > 0)", (unsigned long long)ci, (unsigned long long)ld); }
+    }
     if (lease_is(peek, inst) != 0) { dump_state(peek, inst, "after close"); hpplite_l1_disconnect(peek); FAIL("close must release the lease"); }
     hpplite_l1_disconnect(peek);
     PASS();

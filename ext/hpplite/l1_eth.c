@@ -282,7 +282,8 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     if (!l1) return NULL;
 
     /* Call getSystemConfig() on contract */
-    /* Returns: (string daScheme, address daContract, uint256 version, uint256 chainId) */
+    /* Returns: (string daScheme, address daContract, uint256 version, uint256 chainId,
+    **           uint256 checkpointInterval, uint256 leaseDuration) */
     uint8_t calldata[4];
     memcpy(calldata, SEL_GET_SYSTEM_CONFIG, 4);
 
@@ -328,6 +329,13 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     config->version = abi_decode_uint64(result + 64);
     l1->version = config->version;
     config->chainId = abi_decode_uint64(result + 96);
+    /* words 4 and 5: the checkpoint interval (the configuration of record,
+    ** #44) and the lease length; older contracts return four words */
+    if (getenv("HPPLITE_TRACE_RPC")) fprintf(stderr, "hpplite: getSystemConfig returned %zu bytes\n", result_len);
+    if (result_len >= 192) {
+        config->checkpointInterval = abi_decode_uint64(result + 128);
+        config->leaseDuration = abi_decode_uint64(result + 160);
+    }
     config->batchSizeLimit = 128 * 1024;  /* Default, DA contract has actual limit */
 
     /* Cache DA contract address for batch operations */
