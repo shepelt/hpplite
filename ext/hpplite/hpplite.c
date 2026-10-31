@@ -2211,6 +2211,12 @@ static void bkForeignCheck(HppliteCtx *pCtx, int doneBefore) {
   pCtx->commitsDoneAtLook = doneBefore;
 }
 
+#ifdef HPPLITE_TEST_HOOKS
+int hpplite_test_fail_commits;   /* a test makes the next n finalize/adopt COMMITs fail as SQLITE_FULL (a full disk) */
+#define TEST_FAIL_COMMIT(rc) do { if ((rc) == SQLITE_OK && hpplite_test_fail_commits > 0) { hpplite_test_fail_commits--; (rc) = SQLITE_FULL; } } while (0)
+#else
+#define TEST_FAIL_COMMIT(rc) ((void)0)
+#endif
 static int bkEnd(HppliteCtx *pCtx, int rc) {
   int bLook = rc == SQLITE_OK && pCtx->bkDb != pCtx->db;
   if (bLook) bkForeignCheck(pCtx, pCtx->commitsDoneBefore);
@@ -2699,7 +2705,13 @@ int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3
     rc = advanceMeta(pCtx, pBatch, maxId, 1);
     bkLeave(pCtx, saved);
   }
-  return bkEnd(pCtx, rc);
+  TEST_FAIL_COMMIT(rc);
+  rc = bkEnd(pCtx, rc);
+  /* a commit that failed (a full disk) rolled the file back: the height and
+  ** the rest of the meta row that advanceMeta() set must follow, or the next
+  ** flush posts the same rows again at the next height (#97) */
+  if (rc != SQLITE_OK) loadMeta(pCtx);
+  return rc;
 }
 
 struct HppliteBatch *hpplite_flush_block(HppliteCtx *pCtx) {
@@ -3101,6 +3113,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       bkLeave(pCtx, saved);
       rc = bkEnd(pCtx, rc);
       if (rc == SQLITE_OK) pCtx->nCarry = nHold;
+      else loadMeta(pCtx);              /* memory follows the file (#97) */
     }
   }
   for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);

@@ -29,6 +29,7 @@ static int tests_run = 0, tests_passed = 0;
 static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
 #define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 #define PRIVKEY_HEX "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 static const unsigned char PRIVKEY[32] = {
@@ -1334,6 +1335,45 @@ static void test_claim_reverted_on_chain(void) {
     PASS();
 }
 
+/* A finalize whose bookkeeping COMMIT fails (a full disk): the file still
+** says the old height and the rows are still pending, so memory must too -
+** or the next flush posts the same rows again at the next height (#97) */
+static void test_finalize_commit_fails(void) {
+    TEST("a finalize whose COMMIT fails leaves the height where the file has it; the batch is adopted, not posted again");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/full.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    hpplite_test_fail_commits = 1;                       /* the finalize of batch 1 */
+    uint64_t h = hpplite_node_flush_batch(n);
+    hpplite_test_fail_commits = 0;
+    uint64_t last = 0, total = 0;
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    if (h != 0 || last != 1) FAILF("flush %llu, chain %llu: batch 1 should be posted and not finalized", (unsigned long long)h, (unsigned long long)last);
+    if (hpplite_node_get_height(n) != 1) FAILF("height in memory %llu after the failed finalize, the file says 1", (unsigned long long)hpplite_node_get_height(n));
+    if (hpplite_node_pending_count(n) != 2) FAIL("the rows should still be pending");
+    h = hpplite_node_flush_batch(n);                     /* adopts batch 1 from L1 and finalizes it */
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    if (last != 1) FAILF("the chain holds %llu batches: the same rows were posted again", (unsigned long long)last);
+    if (hpplite_node_get_height(n) != 2 || hpplite_node_pending_count(n) != 0) FAIL("batch 1 should be adopted and finalized now");
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(n) != 2) FAIL("batch 2");
+    unsigned char rootW[32], rootR[32];
+    hpplite_state_root(n->db, rootW);
+    hpplite_node_destroy(n);
+    HppliteNode *r = open_node(DIR "/full_r.db", l1);
+    if (!r) { hpplite_l1_disconnect(l1); FAIL("replica open"); }
+    int rows = count_rows(r->db, "t");
+    hpplite_state_root(r->db, rootR);
+    hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    if (rows != 2) FAILF("replica has %d rows, the writer 2 (a row posted twice)", rows);
+    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica root differs");
+    PASS();
+}
+
 static void test_unsupported_sql_refused(void) {
     TEST("non-deterministic SQL and ATTACH are refused (strict); warn mode counts");
     SKIP_IF_ROWS("non-deterministic SQL is accepted; ATTACH (test_rows_e2e)");
@@ -1423,6 +1463,7 @@ int main(void) {
     test_idle_reader_flush_replays();
     test_unsupported_sql_refused();
     test_claim_reverted_on_chain();
+    test_finalize_commit_fails();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

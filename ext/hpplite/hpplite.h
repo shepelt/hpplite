@@ -395,6 +395,9 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx);
 ** hpplite_status.last_error until hpplite_error_clear() at the next success (#32) */
 void hpplite_error(HppliteCtx *pCtx, const char *zFmt, ...);
 void hpplite_error_clear(HppliteCtx *pCtx);
+#ifdef HPPLITE_TEST_HOOKS
+extern int hpplite_test_fail_commits;   /* mock builds: the next n bookkeeping COMMITs fail as SQLITE_FULL */
+#endif
 
 /*
 ** Register HPPLite as a loadable extension.
