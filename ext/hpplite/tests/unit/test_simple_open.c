@@ -263,8 +263,9 @@ int main(void) {
         sqlite3_exec(db, "CREATE TABLE auto(x);", NULL, NULL, NULL);
         sqlite3_exec(db, "INSERT INTO auto VALUES(1);", NULL, NULL, NULL);
 
-        /* Wait for background thread to auto-flush (interval + buffer) */
-        usleep(350000);  /* 350ms - enough for 200ms interval + thread wake */
+        /* Wait for the background thread to auto-flush: the interval is 200 ms,
+        ** a loaded CI runner can take seconds to schedule the thread */
+        for (int i = 0; i < 100 && hpplite_get_block_height(ctx) <= h1; i++) usleep(50000);
 
         /* Check that block height increased - NO manual flush call needed! */
         uint64_t h2 = hpplite_get_block_height(ctx);
