@@ -612,6 +612,38 @@ static void test_drop_table_cascade(void) {
     PASS();
 }
 
+/* 15. A batch on L1 whose finalize the gate deferred (a statement of the
+** application mid-step) is adopted at the next flush, not posted again as
+** another batch at the same height, counted as an L1 failure (#90) */
+static void test_deferred_finalize_not_reposted(void) {
+    TEST("a posted batch the gate defers is not re-posted at the next flush, nor counted as a failure");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/defer.db", l1);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1), (2)", NULL);
+    sqlite3_stmt *held = NULL;
+    if (sqlite3_prepare_v2(w->db, "SELECT x FROM t", -1, &held, NULL) != SQLITE_OK) FAIL("prepare");
+    if (sqlite3_step(held) != SQLITE_ROW) FAIL("step");            /* mid-step: the gate is the application's */
+    uint64_t h1 = hpplite_node_flush_batch(w);                     /* posted, finalize deferred */
+    uint64_t h2 = hpplite_node_flush_batch(w);                     /* still deferred: nothing to post */
+    uint64_t last = 0, total = 0;
+    unsigned char hash[32];
+    hpplite_l1_get_da_state(l1, &last, &total, hash);
+    int streak = w->failStreak;
+    sqlite3_finalize(held);
+    hpplite_node_flush_batch(w);                                   /* adopted (an adoption confirms no new height) */
+    sqlite3_int64 height = scalar(w->db, "SELECT height FROM hpplite_status");
+    const char *why = replica_matches(w, l1, "defer_r.db");
+    hpplite_l1_disconnect(l1);
+    if (h1 != 0 || h2 != 0) FAILF("flushes under the gate confirmed %llu, %llu; want 0, 0", (unsigned long long)h1, (unsigned long long)h2);
+    if (total != 1) FAILF("%llu batches on L1 after two flushes under the gate, want 1", (unsigned long long)total);
+    if (streak != 0) FAILF("failStreak %d after a deferral, want 0", streak);
+    if (height != 2) FAILF("height %lld after the statement ended and a flush, want 2 (one batch confirmed)", (long long)height);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -629,6 +661,7 @@ int main(void) {
     test_text_history_then_rows();
     test_drop_column();
     test_drop_table_cascade();
+    test_deferred_finalize_not_reposted();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

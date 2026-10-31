@@ -920,8 +920,10 @@ static int node_adopt_existing(HppliteNode *node) {
         return 1;
     }
     /* It matched but could not be finalized now (an application statement or
-    ** transaction is open: the gate) - a deferral, not a fork: next flush */
-    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) return 0;
+    ** transaction is open: the gate) - a deferral, not a fork: next flush.
+    ** Told apart from "nothing at our height": the batch is on L1, and
+    ** posting another at this height would only be refused (#90) */
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) return 2;
     fprintf(stderr, "hpplite: L1 batch %llu does not match local pending SQL\n",
             (unsigned long long)node->ctx->blockHeight);
     return -1;
@@ -1143,8 +1145,12 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         if (confirmed) test_crash_point("after_submit");
         if (!confirmed) {
             /* The transaction may have landed despite the error */
-            confirmed = (node_adopt_existing(node) == 1);
-            if (!confirmed) {
+            int adopted = node_adopt_existing(node);
+            confirmed = adopted == 1;
+            if (adopted == 2) {
+                node->retryAt = 0;         /* on L1, finalized at the next flush: not a failure (#90) */
+                *pMore = 0;
+            } else if (!confirmed) {
                 int64_t wait = (int64_t)node->config.batchIntervalMs;
                 if (wait <= 0) wait = 5000;
                 if (node->failStreak < 6) node->failStreak++;
@@ -1216,6 +1222,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
             node->state = HPPLITE_STATE_ERROR;
             return 0;
         }
+        if (rc == 2) return 0;           /* ours is on L1, waiting for the gate: nothing to post (#90) */
     }
     hpplite_rows_seq_flush(node->ctx);   /* busy now: the next flush */
 
