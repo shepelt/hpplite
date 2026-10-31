@@ -86,6 +86,21 @@ statements, ~4.3 KB per web write - 46% `INSERT INTO wp_posts` (each post and
 the revision WordPress keeps on every edit, all 23 columns spelled out by the
 plugin), 18% post updates, 11% comments, 5% the plugin's schema bookkeeping.
 
+## Row capture (`capture=rows`, #19; 2026-10-31, anvil)
+
+The concurrent run again on a fresh site with `capture=rows` in
+`HPPLITE_PARAMS` (8 workers, the sequencer, 16 clients x 50):
+
+- No refusals at all: the installer's `DELETE ... REGEXP` - the one statement
+  statement capture refuses in WordPress - is recorded as the rows it
+  deleted, and every write succeeded (245 posts, 109 edits, 152 comments).
+- 21.8 s and a write p50 of ~450 ms (statement capture: 22.2 s, ~440 ms).
+- A replica rebuilt from the chain equals WordPress's database: 22 tables,
+  1718 rows, same state root.
+- 626 KB of batches for the session, against 2.18 MB of SQL with statement
+  capture: the plugin spells out every column name of every `wp_posts`
+  INSERT; a record carries the values.
+
 Found on the way, fixed: a second process on the file was not a follower
 (each sequenced on its own); no-op statements from other connections could
 vanish from under a batch being built; and closing a connection waited out
