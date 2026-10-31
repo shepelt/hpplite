@@ -132,8 +132,11 @@ static int exec(HppliteNode *n, const char *sql) {
     return rc;
 }
 
-/* One seed: the workload, the faults, the oracle. Returns NULL or why. */
-static const char *run_seed(unsigned seed) {
+/* One seed: the workload, the faults, the oracle. Returns NULL or why.
+** With two connections, a second node on the same file (a follower: it
+** captures, the first posts) takes half the writes, and outlives the
+** sequencer at the end: it promotes itself and posts what is left. */
+static const char *run_seed(unsigned seed, int two) {
     static char why[600];
     int nFaults[F_COUNT] = {0};
     int altered = 0, step, nextId = 1, nRows = 0;
@@ -145,33 +148,39 @@ static const char *run_seed(unsigned seed) {
     exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)");
     exec(w, "CREATE INDEX tk ON t(k)");
     exec(w, "CREATE TABLE s(name TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID");
+    HppliteNode *f = NULL;
+    if (two) {
+        f = open_node(DIR "/w.db", l1, 1);
+        if (!f || !f->follower) { if (f) hpplite_node_destroy(f); hpplite_node_destroy(w); hpplite_l1_disconnect(l1); return "second connection should be a follower"; }
+    }
 
     for (step = 0; step < 50; step++) {
         int op = (int)(rnd() % 10);
+        HppliteNode *c = (f && chance(50)) ? f : w;                   /* who writes this step */
         char sql[256];
         if (op < 4) {
             snprintf(sql, sizeof sql, "INSERT INTO t(v, k) VALUES('row %d of seed %u', %d)", nextId, seed, (int)(rnd() % 7));
-            if (exec(w, sql) == SQLITE_OK) { nextId++; nRows++; }
+            if (exec(c, sql) == SQLITE_OK) { nextId++; nRows++; }
         } else if (op < 6) {
             snprintf(sql, sizeof sql, "UPDATE t SET v = v || '!', k = k + 1 WHERE id = %d", 1 + (int)(rnd() % (nextId > 1 ? nextId - 1 : 1)));
-            exec(w, sql);
+            exec(c, sql);
         } else if (op == 6) {
             snprintf(sql, sizeof sql, "DELETE FROM t WHERE id = %d", 1 + (int)(rnd() % (nextId > 1 ? nextId - 1 : 1)));
-            exec(w, sql);
+            exec(c, sql);
         } else if (op == 7) {
-            exec(w, "BEGIN");
+            exec(c, "BEGIN");
             snprintf(sql, sizeof sql, "INSERT INTO s(name, n) VALUES('k%d', %d) ON CONFLICT(name) DO UPDATE SET n = n + 1", (int)(rnd() % 5), step);
-            exec(w, sql);
+            exec(c, sql);
             snprintf(sql, sizeof sql, "INSERT INTO t(v, k) VALUES('in txn %d', %d)", step, (int)(rnd() % 7));
-            if (exec(w, sql) == SQLITE_OK) nextId++;
-            exec(w, "UPDATE t SET k = k WHERE 0");                 /* a no-op in a transaction */
-            if (chance(20)) exec(w, "ROLLBACK"); else exec(w, "COMMIT");
-            if (nextId > 1) nextId = (int)scalar(w->db, "SELECT coalesce(max(id), 0) + 1 FROM t");
+            if (exec(c, sql) == SQLITE_OK) nextId++;
+            exec(c, "UPDATE t SET k = k WHERE 0");                 /* a no-op in a transaction */
+            if (chance(20)) exec(c, "ROLLBACK"); else exec(c, "COMMIT");
+            if (nextId > 1) nextId = (int)scalar(c->db, "SELECT coalesce(max(id), 0) + 1 FROM t");
         } else if (op == 8 && !altered) {
-            exec(w, "ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'e'");   /* text-logged, rebuilds the triggers */
+            exec(c, "ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'e'");   /* text-logged, rebuilds the triggers */
             altered = 1;
         } else {
-            exec(w, "DELETE FROM s WHERE n < 0");                        /* a no-op in autocommit */
+            exec(c, "DELETE FROM s WHERE n < 0");                        /* a no-op in autocommit */
         }
 
         if (chance(45)) {
@@ -185,8 +194,20 @@ static const char *run_seed(unsigned seed) {
         }
     }
 
-    /* the end of the session: everything must reach the chain */
+    /* the end of the session: everything must reach the chain. With two
+    ** connections the sequencer leaves first, under one last fault, and the
+    ** follower takes over */
     disarm(l1);
+    if (f) {
+        int last = chance(50) ? (int)(1 + rnd() % (F_COUNT - 1)) : F_NONE;
+        nFaults[last]++;
+        if (g_verbose) printf("    sequencer closes under '%s'; the follower takes over\n", fault_name[last]);
+        arm(l1, w, last);
+        hpplite_node_destroy(w);
+        disarm(l1);
+        w = f; f = NULL;
+    }
+    hpplite_node_flush_batch(w);                   /* the timer's next tick: repairs a reorg with nothing pending too */
     for (int i = 0; i < 40 && hpplite_node_pending_count(w) > 0; i++) {
         if (i == 10 || i == 25) { hpplite_l1_mock_advance_time(l1, 400); w->leaseRecheckAt = 0; }
         hpplite_node_flush_batch(w);
@@ -198,10 +219,16 @@ static const char *run_seed(unsigned seed) {
     }
     uint64_t last = 0, total = 0;
     hpplite_l1_get_da_state(l1, &last, &total, NULL);
-    uint64_t heightW = hpplite_node_get_height(w);
+    uint64_t heightW = (uint64_t)scalar(w->db, "SELECT next_height FROM _hpplite_meta");   /* the file's */
+    uint64_t statusW = (uint64_t)scalar(w->db, "SELECT height FROM hpplite_status");       /* what the connection says */
     if (last + 1 != heightW) {
-        snprintf(why, sizeof why, "seed %u: the chain holds %llu batches, the writer finalized %llu", seed,
+        snprintf(why, sizeof why, "seed %u: the chain holds %llu batches, the file says %llu finalized", seed,
                  (unsigned long long)last, (unsigned long long)heightW - 1);
+        hpplite_node_destroy(w); hpplite_l1_disconnect(l1); return why;
+    }
+    if (statusW != heightW) {
+        snprintf(why, sizeof why, "seed %u: hpplite_status.height says %llu, the file %llu (a %s)", seed,
+                 (unsigned long long)statusW, (unsigned long long)heightW, two ? "connection that was a follower" : "sequencer");
         hpplite_node_destroy(w); hpplite_l1_disconnect(l1); return why;
     }
     char *a = dump(w->db);
@@ -250,14 +277,18 @@ int main(void) {
            getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
     if (one) {
         g_verbose = 1;
-        const char *why = run_seed((unsigned)atoi(one));
-        printf("%s\n", why ? why : "ok");
+        const char *why = run_seed((unsigned)atoi(one), 0);
+        printf("one connection: %s\n", why ? why : "ok");
+        const char *why2 = run_seed((unsigned)atoi(one), 1);
+        printf("two connections: %s\n", why2 ? why2 : "ok");
         (void)!system("rm -rf " DIR);
-        return why ? 1 : 0;
+        return why || why2 ? 1 : 0;
     }
     for (unsigned s = 1; s <= nSeeds; s++) {
-        const char *why = run_seed(s);
-        if (why) { printf("  FAIL: %s\n", why); failed++; }
+        const char *why = run_seed(s, 0);
+        if (why) { printf("  FAIL (one connection): %s\n", why); failed++; }
+        why = run_seed(s, 1);
+        if (why) { printf("  FAIL (two connections): %s\n", why); failed++; }
     }
     (void)!system("rm -rf " DIR);
     printf("\n%u/%u seeds passed\n", nSeeds - failed, nSeeds);
