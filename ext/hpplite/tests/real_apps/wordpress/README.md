@@ -9,7 +9,7 @@ PHP 8.4), and `HPPLITE_FILES` names the database (`wp-content/database/.ht.sqlit
 ```bash
 tests/real_apps/wordpress/setup.sh /tmp/wp
 export HPPLITE_PARAMS="rpc=...&factory=...&chainid=...&privkey=0x..."
-P="tests/real_apps/wordpress/php.sh /path/to/php8.4 build_real/hpplite.dylib /tmp/wp"
+P="$PWD/tests/real_apps/wordpress/php.sh /path/to/php8.4 $PWD/build_real/hpplite.dylib /tmp/wp"   # absolute: run from other directories below
 $P /tmp/wp/wp-cli.phar --path=/tmp/wp/wordpress core install --url=http://localhost:8090 ...
 (cd /tmp/wp/wordpress && $P -S localhost:8090)          # web traffic, REST API
 ```

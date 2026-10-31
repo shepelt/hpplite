@@ -12,18 +12,19 @@ Solid Queue worker runs for every order: it decrements the product's stock
 and marks the order fulfilled, in one transaction, and writes the cache.
 
 ```bash
+HPP=$PWD                                               # this tree: paths below are absolute
 tests/real_apps/rails/setup.sh /tmp/rails && cd /tmp/rails/shop
-export HPPLITE_EXT=build_real/hpplite.dylib RAILS_ENV=production SECRET_KEY_BASE=... \
+export HPPLITE_EXT=$HPP/build_real/hpplite.dylib RAILS_ENV=production SECRET_KEY_BASE=... \
        HPPLITE_FILES="*/storage/production*.sqlite3" \
-       HPPLITE_PARAMS="rpc=...&factory=...&chainid=...&privkey=0x...&datadir=$PWD/storage&interval=1s&dbname={file}"
+       HPPLITE_PARAMS="rpc=...&factory=...&chainid=...&privkey=0x...&interval=1s&dbname={file}"
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES        # macOS, forking servers: below
 bin/rails db:prepare
 WEB_CONCURRENCY=2 RAILS_MAX_THREADS=5 bin/rails server -p 3010 &
 bin/jobs &
-python3 tests/real_apps/rails/drive.py http://localhost:3010 16 50
+python3 $HPP/tests/real_apps/rails/drive.py http://localhost:3010 16 50
 # stop both with SIGTERM (each connection posts what it captured as it closes), then per database:
 HPPLITE_ANVIL_KEY0=0x... HPPLITE_ORM_EXTRA="&dbname=production_queue.sqlite3" \
-  HPPLITE_ORM_DIR=/tmp/rails/shop/storage ... python tests/orm/orm_common.py production_queue.sqlite3
+  HPPLITE_ORM_DIR=/tmp/rails/shop/storage ... python $HPP/tests/orm/orm_common.py production_queue.sqlite3
 ```
 
 ## Results (2026-10-31, anvil, `capture=rows`; Rails 8.1.4, Ruby 4.0.9, sqlite3 gem 2.10.2 / SQLite 3.54.1)
