@@ -342,6 +342,7 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     all = sqlite3_malloc(256 * 20);
     if (!all) return 0;
     n = hpplite_l1_factory_list_my_rollups(config->rpcUrl, factoryHex, config->privkey, all, 256);
+    char *zOthers = NULL;                 /* the wallet's databases, for the message below (#79) */
     for (i = 0; i < n; i++) {
         char hex[43];
         HppliteL1 *l1;
@@ -353,18 +354,20 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
             HppliteBatch *b = data ? node_decode_batch(node, 1, data, len) : NULL;
             int match = b && b->zDbName && strcmp(b->zDbName, zName) == 0;
+            if (b && b->zDbName && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", b->zDbName);
             hpplite_batch_free(b);
             free(data);
             hpplite_l1_disconnect(l1);
             if (match) {
                 memcpy(rollup, all[i], 20);
                 sqlite3_free(all);
+                sqlite3_free(zOthers);
                 return 1;
             }
         }
     }
     sqlite3_free(all);
-    if (n < 0) return 0;                  /* could not list: do not create a second one */
+    if (n < 0) { sqlite3_free(zOthers); return 0; }   /* could not list: do not create a second one */
     /* The factory makes a wallet's first rollup its primary - the one an
     ** unnamed database uses. A named database's must never be it: the
     ** primary comes first (getOrCreateRollup is idempotent, also when two
@@ -381,7 +384,10 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         }
         if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) return 0;
     }
-    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet; creating one\n", zName);
+    /* a misspelt name would be a new database: say which exist (#79) */
+    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s); creating one\n",
+            zName, zOthers ? zOthers : "none named");
+    sqlite3_free(zOthers);
     return hpplite_l1_factory_create_rollup(config->rpcUrl, factoryHex, config->privkey,
                                             config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100,
                                             rollup);
@@ -407,6 +413,16 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         int named = node->ctx && node->ctx->zDbName;
         int result = named ? node_named_rollup(node, config, factoryHex, rollup)
                            : hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
+        if (result == 1 && !named && node->ctx->blockHeight <= 1) {
+            /* an empty file, unnamed, on a wallet with named databases: it
+            ** gets the primary rollup - a forgotten dbname= would rebuild
+            ** nothing, silently (#79) */
+            uint8_t (*all)[20] = sqlite3_malloc(256 * 20);
+            int n = all ? hpplite_l1_factory_list_my_rollups(config->rpcUrl, factoryHex, config->privkey, all, 256) : 0;
+            sqlite3_free(all);
+            if (n > 1) fprintf(stderr, "hpplite: this wallet has %d rollups (named databases, dbname=); this open is unnamed"
+                               " and uses the wallet's primary rollup\n", n);
+        }
 
         if (result == 0 && !named) {
             /* No rollup exists - create one */
