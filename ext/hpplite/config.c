@@ -449,6 +449,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     const char *val;
 
     /* Set database path */
+    free(cfg->dbPath);
     cfg->dbPath = strdup(filename);
 
     /* Role */

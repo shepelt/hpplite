@@ -210,6 +210,31 @@ static void test_capture_values(void) {
     PASS();
 }
 
+/* HPPLITE_PARAMS applies to a URI open too, under the URI's own parameters (#86) */
+static void test_params_under_uri(void) {
+    TEST("HPPLITE_PARAMS applies to a hpplite=on URI; the URI's own parameters win");
+    reset_dir();
+    setenv("HPPLITE_PARAMS", "dbname=fromparams&interval=0", 1);
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("file:" DIR "/p1.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    HppliteNode *n = rc == SQLITE_OK ? hpplite_get_node(db) : NULL;
+    char name1[32] = "";
+    if (n && n->ctx->zDbName) snprintf(name1, sizeof(name1), "%s", n->ctx->zDbName);
+    sqlite3_close(db);
+    db = NULL;
+    rc = sqlite3_open_v2("file:" DIR "/p2.db?hpplite=on&privkey=" KEY "&datadir=" DIR "&dbname=fromuri", &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    n = rc == SQLITE_OK ? hpplite_get_node(db) : NULL;
+    char name2[32] = "";
+    if (n && n->ctx->zDbName) snprintf(name2, sizeof(name2), "%s", n->ctx->zDbName);
+    sqlite3_close(db);
+    unsetenv("HPPLITE_PARAMS");
+    if (strcmp(name1, "fromparams") != 0) FAILF("dbname from HPPLITE_PARAMS: '%s', want fromparams", name1);
+    if (strcmp(name2, "fromuri") != 0) FAILF("dbname with the URI's own: '%s', want fromuri", name2);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite enabled from the environment (#55) ===\n");
     test_plain_path_enabled();
@@ -219,6 +244,7 @@ int main(void) {
     test_truncating_sqlite_rows();
     test_read_only_open();
     test_capture_values();
+    test_params_under_uri();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

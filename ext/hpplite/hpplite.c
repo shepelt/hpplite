@@ -3778,6 +3778,15 @@ static int hpplite_auto_init(
         config = hpplite_config_create();
         if (!config) return SQLITE_OK;
         hpplite_config_load_env(config);                    /* env first */
+        {
+            /* then HPPLITE_PARAMS, what a URI would carry, for a URI open
+            ** too (#86): one setting for every file, the URI's own on top */
+            const char *zParams = getenv("HPPLITE_PARAMS");
+            if (zParams && zParams[0]) {
+                char *zUri = sqlite3_mprintf("file:%s?hpplite=on&%s", filename, zParams);
+                if (zUri) { hpplite_config_load_uri(config, zUri); sqlite3_free(zUri); }
+            }
+        }
         hpplite_config_load_sqlite_uri(config, filename);   /* the URI overrides it */
     } else if (filename[0] && envNamesFile(filename)) {
         const char *zParams = getenv("HPPLITE_PARAMS");

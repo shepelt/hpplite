@@ -152,7 +152,8 @@ process that opens with `?hpplite=on` is handled automatically.
 (`file:app.db?hpplite=on&...`) or - for code that opens a plain path - by
 the environment: `HPPLITE_FILES` names the files (`:`-separated globs,
 matched against the full path and the file name) and `HPPLITE_PARAMS`
-carries what the URI would (`l1=hpp-sepolia&interval=5s`). Load the module
+carries what the URI would (`l1=hpp-sepolia&interval=5s`). `HPPLITE_PARAMS`
+applies to URI opens too, under the URI's own parameters. Load the module
 once per process before opening. Checked by `tests/orm/run_orm.sh`:
 
 | Driver / ORM | How | Status |
