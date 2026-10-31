@@ -19,11 +19,14 @@ there on in those.
 
 ## Results (2026-10-31; 66 files, the parts row capture touches)
 
-34 of 66 files have no test that fails only with HPPLite: `insert`,
-`update`, `delete` (and 2-4), `upsert1`-`5`, `returning1`, `conflict`,
-`conflict2`, `conflict3`, `trigger2`-`6`, `trigger8`, `trigger9`,
-`triggerB`, `triggerD`, `fkey3`-`6`, `savepoint2`, `savepoint4`,
-`without_rowid2`, `4`-`6`, `vacuum4`, `lastinsert`, `altercol`, `insert3`.
+31 of 66 files run with the same result as stock SQLite: `conflict`,
+`conflict2`, `conflict3`, `delete2`-`4`, `fkey3`, `fkey4`, `fkey6`,
+`lastinsert`, `returning1`, `savepoint2`, `trigger2`-`6`, `trigger8`,
+`trigger9`, `triggerB`, `update2`, `upsert1`-`5`, `vacuum4`,
+`without_rowid2`, `without_rowid4`-`6`. 29 differ, and 6 stop part way
+(`alter`, `alter2`, `altercol`, `insert3`: their own cleanup drops every
+table, HPPLite's too, which it refuses; `delete`, `alterdropcol`: a
+database deleted by its main file alone, below).
 
 What fails in the rest, by cause:
 
