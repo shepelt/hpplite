@@ -106,6 +106,8 @@ struct HppliteCtx {
   int bRowsCapOff;            /* the running statement is logged as text: its triggers record nothing */
   sqlite3_stmt *pRowsTextStmt; /* ...that statement */
   sqlite3_stmt *pRowsSchemaStmt; /* Cached PRAGMA main.schema_version */
+  sqlite3_stmt *pRowsLockStmt; /* Cached no-op write: the write lock before that read */
+  char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
   char *zRowsTextOnly;        /* Names a write must not mention to be captured as rows: virtual
                               ** tables and what reaches them through triggers ('\0'-separated,
                               ** ends with an empty name) */
@@ -304,6 +306,10 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch);
 ** Number of committed pending SQL statements.
 */
 int hpplite_pending_count(HppliteCtx *pCtx);
+
+/* Row capture: log what moved in sqlite_sequence that no record carries
+** (before building a batch; the flusher's) */
+int hpplite_rows_seq_flush(HppliteCtx *pCtx);
 
 /*
 ** Next block height to produce.

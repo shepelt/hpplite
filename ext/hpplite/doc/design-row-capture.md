@@ -148,7 +148,19 @@ detected.
    size, overhead.
 2. Engine: schema changes in the log, trigger rebuild, WITHOUT ROWID,
    `sqlite_sequence`, VACUUM, the authorizer guarding the triggers.
-3. Batch format v2; v1 history still replayed.
+   Done: rebuild, WITHOUT ROWID, virtual tables (by the table a write
+   targets, closed over triggers and foreign key actions),
+   `sqlite_sequence` (sequence records the flusher logs from the
+   bookkeeping connection: a zero-row INSERT creates an entry no row
+   record carries). Open: VACUUM, the trigger guard.
+3. Batch format v2; v1 history still replayed. Done: a record is a batch
+   entry whose text is base64 of (op, table, record), marked by mode bit 4,
+   so pieces (#59) and open transactions (#57) work unchanged and v0.1
+   refuses such a batch. Replay applies records with triggers off, under the
+   writer's foreign keys, deferred to the end of the group. `capture=rows`
+   turns it on; every node-level suite also runs with it
+   (`HPPLITE_CAPTURE=rows`, the `_rows` tests), and `test_rows_e2e` covers
+   what only records make possible.
 4. Validation: all current suites, agent apps, Ghost, WordPress concurrent;
    then SQLite's TCL suite with HPPLite on every connection, Rails 8,
    Home Assistant.

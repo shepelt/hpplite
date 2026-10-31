@@ -8,12 +8,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+
+/* Row capture (#19, HPPLITE_CAPTURE=rows): cases about statement capture skip */
+static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return v && strcasecmp(v, "rows") == 0; }
+#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 #define DIR "/tmp/hpplite_test_keys"
@@ -169,6 +174,7 @@ static void test_no_key_never_posts(void) {
 
 static void test_encrypt_off_is_explicit(void) {
     TEST("encrypt=off with a key posts plaintext; with a key and default, sealed");
+    SKIP_IF_ROWS("the plaintext batch carries records (test_rows_e2e)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     sqlite3 *db = hpplite_open("file:" DIR "/p.db?hpplite=on&encrypt=off&datadir=" DIR "&privkey=" KEY_A);

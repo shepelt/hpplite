@@ -14,9 +14,11 @@
 
 #include "node.h"
 #include "da_uri.h"
+#include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
 static int node_check_rollup(HppliteNode *node);
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <stdio.h>
@@ -111,6 +113,10 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
+    node->config.captureRows = config->captureRows;
+    /* the environment turns it on for any node, however its configuration
+    ** was made (every suite can run in either mode) */
+    if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "rows") == 0) node->config.captureRows = 1;
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
     ** file's own, node_take_file_lock) */
@@ -252,6 +258,13 @@ static int node_init_tracking(HppliteNode *node) {
     rc = hpplite_init(node->db, &node->ctx);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
+    if (node->config.captureRows) {
+        rc = hpplite_rows_enable(node->ctx);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "hpplite: capture=rows: cannot set up row capture (%s)\n", sqlite3_errmsg(node->db));
+            return rc;
+        }
+    }
 
     if (zFile && zFile[0]) {
         hpplite_internal_open_begin();
@@ -1111,6 +1124,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
             return 0;
         }
     }
+    hpplite_rows_seq_flush(node->ctx);   /* busy now: the next flush */
 
     /* One batch per call normally; several when the size limit splits them */
     do {

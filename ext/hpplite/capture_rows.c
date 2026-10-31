@@ -21,6 +21,7 @@
 #include "hpplite_sqlite.h"
 #include "hpplite.h"
 #include "capture_rows.h"
+#include "batch.h"
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -147,6 +148,16 @@ static void fnGrp(sqlite3_context *c, int n, sqlite3_value **v) {
   (void)n; (void)v;
   sqlite3_result_int64(c, p->curTxn);
 }
+/* hpplite_mode(): a record, under the writer's foreign keys - replay runs
+** it with the same setting, so a cascade already recorded finds nothing
+** left to do there, and one the writer did not do is not done either */
+static void fnMode(sqlite3_context *c, int n, sqlite3_value **v) {
+  HppliteCtx *p = sqlite3_user_data(c);
+  int fk = 0;
+  (void)n; (void)v;
+  sqlite3_db_config(p->db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &fk);
+  sqlite3_result_int(c, HPPLITE_MODE_ROW | (fk ? HPPLITE_MODE_FOREIGN_KEYS : 0));
+}
 static void fnNote(sqlite3_context *c, int n, sqlite3_value **v) {
   HppliteCtx *p = sqlite3_user_data(c);
   (void)n;
@@ -252,15 +263,15 @@ static int buildTriggers(HppliteCtx *pCtx, const Tab *t, int k) {
   zSql = sqlite3_mprintf(
     "CREATE TEMP TRIGGER \"hpplite_cap_i%d\" AFTER INSERT ON main.\"%w\" WHEN hpplite_cap() BEGIN"
     " INSERT INTO _hpplite_pending(txn, sql, mode, now, tbl, op, rec)"
-    "  VALUES(hpplite_grp(), '', 0, 0, %Q, %d, hpplite_rec(%s%s));"
+    "  VALUES(hpplite_grp(), '', hpplite_mode(), 0, %Q, %d, hpplite_rec(%s%s));"
     " SELECT hpplite_note(last_insert_rowid()); END;"
     "CREATE TEMP TRIGGER \"hpplite_cap_u%d\" AFTER UPDATE ON main.\"%w\" WHEN hpplite_cap() BEGIN"
     " INSERT INTO _hpplite_pending(txn, sql, mode, now, tbl, op, rec)"
-    "  VALUES(hpplite_grp(), '', 0, 0, %Q, %d, hpplite_upd(%d, %s, %s%s));"
+    "  VALUES(hpplite_grp(), '', hpplite_mode(), 0, %Q, %d, hpplite_upd(%d, %s, %s%s));"
     " SELECT hpplite_note(last_insert_rowid()); END;"
     "CREATE TEMP TRIGGER \"hpplite_cap_d%d\" AFTER DELETE ON main.\"%w\" WHEN hpplite_cap() BEGIN"
     " INSERT INTO _hpplite_pending(txn, sql, mode, now, tbl, op, rec)"
-    "  VALUES(hpplite_grp(), '', 0, 0, %Q, %d, hpplite_rec(%s));"
+    "  VALUES(hpplite_grp(), '', hpplite_mode(), 0, %Q, %d, hpplite_rec(%s));"
     " SELECT hpplite_note(last_insert_rowid()); END;",
     k, t->zName, t->zName, HPPLITE_ROW_INSERT, t->nKey ? "" : "new.rowid", t->nKey ? (zIns ? zIns + 2 : "") : (zIns ? zIns : ""),
     k, t->zName, t->zName, HPPLITE_ROW_UPDATE, nKey, zOldKey, zNewKey, zUpd ? zUpd : "",
@@ -271,15 +282,18 @@ static int buildTriggers(HppliteCtx *pCtx, const Tab *t, int k) {
 }
 
 static int schemaVersionOf(HppliteCtx *pCtx) {
-  int v = -1;
+  int v = -1, savedInternal = pCtx->bInternal;
+  pCtx->bInternal = 1;                   /* ours: not traced as the application's */
   if (!pCtx->pRowsSchemaStmt
       && sqlite3_prepare_v3(pCtx->db, "PRAGMA main.schema_version", -1, SQLITE_PREPARE_PERSISTENT,
                             &pCtx->pRowsSchemaStmt, NULL) != SQLITE_OK) {
     pCtx->pRowsSchemaStmt = NULL;
+    pCtx->bInternal = savedInternal;
     return -1;
   }
   if (sqlite3_step(pCtx->pRowsSchemaStmt) == SQLITE_ROW) v = sqlite3_column_int(pCtx->pRowsSchemaStmt, 0);
   sqlite3_reset(pCtx->pRowsSchemaStmt);
+  pCtx->bInternal = savedInternal;
   return v;
 }
 
@@ -327,7 +341,9 @@ static int loadTextOnly(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
   char *zList = NULL;
   int nList = 0, rc, grew;
-  rc = sqlite3_prepare_v2(pCtx->db,
+  /* sqlite_sequence carries no triggers either: a write to it is text */
+  rc = textOnlyAdd(&zList, &nList, "sqlite_sequence");
+  if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->db,
     "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'virtual'", -1, &q, NULL);
   while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
     rc = textOnlyAdd(&zList, &nList, (const char *)sqlite3_column_text(q, 0));
@@ -335,8 +351,14 @@ static int loadTextOnly(HppliteCtx *pCtx) {
   sqlite3_finalize(q);
   q = NULL;
   if (rc == SQLITE_OK && zList) {
+    sqlite3_stmt *fk = NULL;
     rc = sqlite3_prepare_v2(pCtx->db,
       "SELECT tbl_name, sql FROM main.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL", -1, &q, NULL);
+    /* a foreign key action writes the child when the parent changes */
+    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->db,
+      "SELECT f.\"table\", m.name FROM main.sqlite_schema m, pragma_foreign_key_list(m.name) f"
+      " WHERE m.type = 'table' AND (f.on_delete NOT IN ('NO ACTION', 'RESTRICT') OR f.on_update NOT IN ('NO ACTION', 'RESTRICT'))",
+      -1, &fk, NULL);
     do {
       grew = 0;
       while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
@@ -346,9 +368,18 @@ static int loadTextOnly(HppliteCtx *pCtx) {
         rc = textOnlyAdd(&zList, &nList, zName);
         grew = 1;
       }
+      while (rc == SQLITE_OK && sqlite3_step(fk) == SQLITE_ROW) {
+        const char *zParent = (const char *)sqlite3_column_text(fk, 0);
+        const char *zChild = (const char *)sqlite3_column_text(fk, 1);
+        if (!zParent || !zChild || textOnlyHas(zList, zParent) || !textOnlyHas(zList, zChild)) continue;
+        rc = textOnlyAdd(&zList, &nList, zParent);
+        grew = 1;
+      }
       if (q) sqlite3_reset(q);
+      if (fk) sqlite3_reset(fk);
     } while (rc == SQLITE_OK && grew);
     sqlite3_finalize(q);
+    sqlite3_finalize(fk);
   }
   if (rc != SQLITE_OK) { sqlite3_free(zList); return rc; }
   sqlite3_free(pCtx->zRowsTextOnly);
@@ -417,6 +448,70 @@ static int addColumn(sqlite3 *db, const char *zCol, const char *zDecl) {
   return rc;
 }
 
+/* ------------------------------------------------------- sqlite_sequence */
+
+static char *seqRead(sqlite3 *db) {
+  sqlite3_stmt *q = NULL;
+  sqlite3_str *s = sqlite3_str_new(NULL);
+  if (sqlite3_prepare_v2(db, "SELECT name, seq FROM main.sqlite_sequence ORDER BY name", -1, &q, NULL) == SQLITE_OK) {
+    while (sqlite3_step(q) == SQLITE_ROW) {
+      sqlite3_str_appendall(s, (const char *)sqlite3_column_text(q, 0));
+      sqlite3_str_appendchar(s, 1, 0);
+      sqlite3_str_appendf(s, "%lld", sqlite3_column_int64(q, 1));
+      sqlite3_str_appendchar(s, 1, 0);
+    }
+  }
+  sqlite3_finalize(q);
+  sqlite3_str_appendchar(s, 1, 0);
+  return sqlite3_str_finish(s);
+}
+
+/* the value of zName in a snapshot, or NULL */
+static const char *seqFind(const char *zSnap, const char *zName) {
+  const char *z = zSnap;
+  while (z && *z) {
+    const char *v = z + strlen(z) + 1;
+    if (strcmp(z, zName) == 0) return v;
+    z = v + strlen(v) + 1;
+  }
+  return NULL;
+}
+
+char *hpplite_rows_seq_changed(HppliteCtx *pCtx, sqlite3 *db, int *pn) {
+  char *zNow = seqRead(db), *zOut;
+  const char *z;
+  sqlite3_str *s = sqlite3_str_new(NULL);
+  *pn = 0;
+  for (z = zNow; z && *z; ) {
+    const char *v = z + strlen(z) + 1, *was = seqFind(pCtx->zRowsSeq, z);
+    if (!was || strcmp(was, v) != 0) {
+      sqlite3_str_appendall(s, z); sqlite3_str_appendchar(s, 1, 0);
+      sqlite3_str_appendall(s, v); sqlite3_str_appendchar(s, 1, 0);
+      (*pn)++;
+    }
+    z = v + strlen(v) + 1;
+  }
+  sqlite3_str_appendchar(s, 1, 0);
+  sqlite3_free(zNow);
+  zOut = sqlite3_str_finish(s);
+  return zOut;
+}
+
+void hpplite_rows_seq_take(HppliteCtx *pCtx, sqlite3 *db) {
+  sqlite3_free(pCtx->zRowsSeq);
+  pCtx->zRowsSeq = seqRead(db);
+}
+
+unsigned char *hpplite_rows_seq_rec(sqlite3_int64 seq, int *pnRec) {
+  Rec r = {0};
+  recVarint(&r, 1);
+  recByte(&r, 1);
+  recVarint(&r, ((sqlite3_uint64)seq << 1) ^ (sqlite3_uint64)(seq >> 63));
+  if (r.oom) { sqlite3_free(r.a); return NULL; }
+  *pnRec = r.n;
+  return r.a;
+}
+
 int hpplite_rows_enable(HppliteCtx *pCtx) {
   int rc, savedInternal = pCtx->bInternal;
   sqlite3 *db = pCtx->db;
@@ -431,7 +526,9 @@ int hpplite_rows_enable(HppliteCtx *pCtx) {
   sqlite3_create_function(db, "hpplite_cap", 0, SQLITE_UTF8, pCtx, fnCap, NULL, NULL);
   sqlite3_create_function(db, "hpplite_grp", 0, SQLITE_UTF8, pCtx, fnGrp, NULL, NULL);
   sqlite3_create_function(db, "hpplite_note", 1, SQLITE_UTF8, pCtx, fnNote, NULL, NULL);
+  sqlite3_create_function(db, "hpplite_mode", 0, SQLITE_UTF8, pCtx, fnMode, NULL, NULL);
   pCtx->bRows = 1;
+  hpplite_rows_seq_take(pCtx, db);
   return rebuild(pCtx);
 }
 
@@ -439,8 +536,118 @@ int hpplite_rows_covered(HppliteCtx *pCtx) {
   return pCtx->rowsBuiltFor >= 0 && schemaVersionOf(pCtx) == pCtx->rowsBuiltFor;
 }
 
+/* The same, as a write starts. Read first, the schema version would open a
+** snapshot the write then has to upgrade from - SQLITE_BUSY at once (no busy
+** handler) when another connection committed in between. So the write lock
+** comes first, with a write that changes nothing (in the statement's own
+** transaction: it is running); held, it also keeps the schema as read until
+** the statement ends. */
+int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
+  int savedInternal = pCtx->bInternal;
+  if (pCtx->rowsBuiltFor < 0) return 0;
+  if (sqlite3_txn_state(pCtx->db, "main") != SQLITE_TXN_WRITE) {
+    int rc;
+    pCtx->bInternal = 1;
+    if (!pCtx->pRowsLockStmt
+        && sqlite3_prepare_v3(pCtx->db, "UPDATE main._hpplite_meta SET id = id WHERE 0", -1,
+                              SQLITE_PREPARE_PERSISTENT, &pCtx->pRowsLockStmt, NULL) != SQLITE_OK) {
+      pCtx->pRowsLockStmt = NULL;
+    }
+    rc = pCtx->pRowsLockStmt ? sqlite3_step(pCtx->pRowsLockStmt) : SQLITE_ERROR;
+    if (pCtx->pRowsLockStmt) sqlite3_reset(pCtx->pRowsLockStmt);
+    pCtx->bInternal = savedInternal;
+    if (rc != SQLITE_DONE) return 0;      /* no lock (busy past the timeout): text, as v1 - its own insert waits */
+  }
+  return schemaVersionOf(pCtx) == pCtx->rowsBuiltFor;
+}
+
+/* ------------------------------------------------- what a statement writes */
+
+static const char *skipSpace(const char *z) {
+  for (;;) {
+    while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r' || *z == '\f') z++;
+    if (z[0] == '-' && z[1] == '-') { while (*z && *z != '\n') z++; continue; }
+    if (z[0] == '/' && z[1] == '*') { const char *e = strstr(z + 2, "*/"); z = e ? e + 2 : z + strlen(z); continue; }
+    return z;
+  }
+}
+static int isIdChar(unsigned char c) { return isalnum(c) || c == '_' || c == '$' || c >= 0x80; }
+static int isWord(const char *z, const char *zWord) {
+  int n = (int)strlen(zWord);
+  return sqlite3_strnicmp(z, zWord, n) == 0 && !isIdChar((unsigned char)z[n]);
+}
+/* past one token: a quoted string or name, a word, or one character */
+static const char *skipToken(const char *z) {
+  char close = 0;
+  if (*z == '\'' || *z == '"' || *z == '`') close = *z;
+  else if (*z == '[') close = ']';
+  if (close) {
+    for (z++; *z; z++) {
+      if (*z == close) { if (close != ']' && z[1] == close) { z++; continue; } return z + 1; }
+    }
+    return z;
+  }
+  if (isIdChar((unsigned char)*z)) { while (isIdChar((unsigned char)*z)) z++; return z; }
+  return *z ? z + 1 : z;
+}
+/* a name (quoted or not) into zOut, unquoted; the position after it */
+static const char *readName(const char *z, char *zOut, int nOut) {
+  const char *e = skipToken(z);
+  int n = 0;
+  if (*z == '"' || *z == '`' || *z == '[') {
+    char close = *z == '[' ? ']' : *z;
+    for (z++; z < e - 1 && n < nOut - 1; z++) { if (*z == close && close != ']' && z[1] == close) z++; zOut[n++] = *z; }
+  } else if (isIdChar((unsigned char)*z)) {
+    for (; z < e && n < nOut - 1; z++) zOut[n++] = *z;
+  }
+  zOut[n] = 0;
+  return e;
+}
+
+/* The table (or view) an INSERT, REPLACE, UPDATE or DELETE writes, WITH in
+** front or not; 0 when the text does not say plainly */
+static int writeTarget(const char *z, char *zOut, int nOut) {
+  z = skipSpace(z);
+  if (isWord(z, "WITH")) {
+    int depth = 0;
+    for (z = skipSpace(z + 4); *z; z = skipSpace(skipToken(z))) {
+      if (*z == '(') depth++;
+      else if (*z == ')') depth--;
+      else if (depth == 0 && (isWord(z, "INSERT") || isWord(z, "REPLACE") || isWord(z, "UPDATE") || isWord(z, "DELETE"))) break;
+    }
+  }
+  if (isWord(z, "INSERT")) {
+    z = skipSpace(z + 6);
+    if (isWord(z, "OR")) z = skipSpace(skipToken(skipSpace(z + 2)));
+    if (!isWord(z, "INTO")) return 0;
+    z = skipSpace(z + 4);
+  } else if (isWord(z, "REPLACE")) {
+    z = skipSpace(z + 7);
+    if (!isWord(z, "INTO")) return 0;
+    z = skipSpace(z + 4);
+  } else if (isWord(z, "UPDATE")) {
+    z = skipSpace(z + 6);
+    if (isWord(z, "OR")) z = skipSpace(skipToken(skipSpace(z + 2)));
+  } else if (isWord(z, "DELETE")) {
+    z = skipSpace(z + 6);
+    if (!isWord(z, "FROM")) return 0;
+    z = skipSpace(z + 4);
+  } else {
+    return 0;
+  }
+  z = skipSpace(readName(z, zOut, nOut));
+  if (*z == '.') readName(skipSpace(z + 1), zOut, nOut);    /* schema.name: the name */
+  return zOut[0] != 0;
+}
+
+/* A write reaches a virtual table when the table it writes is one, or has
+** triggers or foreign key actions that reach one. Text that does not say
+** plainly what it writes is judged by every name it mentions. */
 int hpplite_rows_text_only(HppliteCtx *pCtx, const char *zSql) {
-  return pCtx->zRowsTextOnly && textOnlyMentioned(pCtx->zRowsTextOnly, zSql);
+  char zTarget[256];
+  if (!pCtx->zRowsTextOnly) return 0;
+  if (writeTarget(zSql, zTarget, (int)sizeof(zTarget))) return textOnlyHas(pCtx->zRowsTextOnly, zTarget);
+  return textOnlyMentioned(pCtx->zRowsTextOnly, zSql);
 }
 
 void hpplite_rows_after_statement(HppliteCtx *pCtx) {
@@ -521,6 +728,33 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
   char *zSql = NULL;
   int rc, i, n;
   *pzErr = NULL;
+  if (op == HPPLITE_ROW_SEQ) {
+    /* set exactly: the writer's value at this point of the stream */
+    if (decVarint(&d) != 1) { *pzErr = sqlite3_mprintf("sequence record for %s: malformed", zTab); return SQLITE_CORRUPT; }
+    rc = sqlite3_prepare_v2(db, "UPDATE main.sqlite_sequence SET seq = ?1 WHERE name = ?2", -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+      decBind(&d, st, 1);
+      sqlite3_bind_text(st, 2, zTab, -1, SQLITE_STATIC);
+      rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      sqlite3_finalize(st);
+      st = NULL;
+    }
+    if (rc == SQLITE_OK && sqlite3_changes(db) == 0) {
+      d.i = 0; decVarint(&d);
+      rc = sqlite3_prepare_v2(db, "INSERT INTO main.sqlite_sequence(name, seq) VALUES(?2, ?1)", -1, &st, NULL);
+      if (rc == SQLITE_OK) {
+        decBind(&d, st, 1);
+        sqlite3_bind_text(st, 2, zTab, -1, SQLITE_STATIC);
+        rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+        sqlite3_finalize(st);
+      }
+    }
+    if (rc != SQLITE_OK || d.bad) {
+      *pzErr = sqlite3_mprintf("sequence record for %s: %s", zTab, d.bad ? "malformed" : sqlite3_errmsg(db));
+      return d.bad ? SQLITE_CORRUPT : rc;
+    }
+    return SQLITE_OK;
+  }
   rc = tabLoad(db, zTab, &t);
   if (rc != SQLITE_OK || t.nCol == 0) {
     *pzErr = sqlite3_mprintf("record for table %s, which the replica does not have", zTab);
@@ -611,5 +845,100 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
   sqlite3_finalize(st);
   sqlite3_free(zSql);
   tabFree(&t);
+  return rc;
+}
+
+/* ----------------------------------------------------------- batch entries */
+
+/* A record as a batch entry: base64 of (op, table, record), so it is text
+** like a statement and is cut into pieces (#59) and held open (#57) the
+** same way */
+static const char aB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+char *hpplite_rows_entry(int op, const char *zTab, const unsigned char *aRec, int nRec) {
+  Rec r = {0};
+  int nTab = zTab ? (int)strlen(zTab) : 0, i, j = 0;
+  char *z;
+  recVarint(&r, (sqlite3_uint64)op);
+  recBytes(&r, zTab ? zTab : "", nTab);
+  recGrow(&r, nRec);
+  if (!r.oom && nRec > 0) { memcpy(r.a + r.n, aRec, (size_t)nRec); r.n += nRec; }
+  if (r.oom) { sqlite3_free(r.a); return NULL; }
+  z = sqlite3_malloc64((sqlite3_uint64)(r.n + 2) / 3 * 4 + 1);
+  if (z) {
+    for (i = 0; i + 2 < r.n; i += 3) {
+      unsigned v = (unsigned)r.a[i] << 16 | (unsigned)r.a[i + 1] << 8 | r.a[i + 2];
+      z[j++] = aB64[v >> 18]; z[j++] = aB64[(v >> 12) & 63]; z[j++] = aB64[(v >> 6) & 63]; z[j++] = aB64[v & 63];
+    }
+    if (i < r.n) {
+      unsigned v = (unsigned)r.a[i] << 16 | (i + 1 < r.n ? (unsigned)r.a[i + 1] << 8 : 0);
+      z[j++] = aB64[v >> 18]; z[j++] = aB64[(v >> 12) & 63];
+      z[j++] = i + 1 < r.n ? aB64[(v >> 6) & 63] : '=';
+      z[j++] = '=';
+    }
+    z[j] = 0;
+  }
+  sqlite3_free(r.a);
+  return z;
+}
+
+static int b64val(int c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+/* An entry's bytes: op, table, and where its record starts */
+static int entryDecode(const char *zEntry, unsigned char **paOut, int *pnOut, int *pOp, char **pzTab, int *piRec) {
+  size_t n = strlen(zEntry), i;
+  unsigned char *a = sqlite3_malloc64(n / 4 * 3 + 3);
+  int na = 0;
+  unsigned v = 0, bits = 0;
+  Dec d;
+  sqlite3_uint64 op, nTab;
+  if (!a) return SQLITE_NOMEM;
+  for (i = 0; i < n && zEntry[i] != '='; i++) {
+    int x = b64val((unsigned char)zEntry[i]);
+    if (x < 0) { sqlite3_free(a); return SQLITE_CORRUPT; }
+    v = v << 6 | (unsigned)x;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; a[na++] = (unsigned char)(v >> bits); }
+  }
+  d.a = a; d.n = na; d.i = 0; d.bad = 0;
+  op = decVarint(&d);
+  nTab = decVarint(&d);
+  if (d.bad || nTab > (sqlite3_uint64)(d.n - d.i)) { sqlite3_free(a); return SQLITE_CORRUPT; }
+  *pzTab = sqlite3_mprintf("%.*s", (int)nTab, (const char *)a + d.i);
+  if (!*pzTab) { sqlite3_free(a); return SQLITE_NOMEM; }
+  *pOp = (int)op;
+  *piRec = d.i + (int)nTab;
+  *paOut = a;
+  *pnOut = na;
+  return SQLITE_OK;
+}
+
+int hpplite_rows_entry_info(const char *zEntry, int *pOp, char **pzTab) {
+  unsigned char *a = NULL;
+  int n, iRec, rc = entryDecode(zEntry, &a, &n, pOp, pzTab, &iRec);
+  sqlite3_free(a);
+  return rc;
+}
+
+int hpplite_rows_apply_entry(sqlite3 *db, const char *zEntry, char **pzErr) {
+  unsigned char *a = NULL;
+  char *zTab = NULL;
+  int n = 0, op = 0, iRec = 0, rc;
+  *pzErr = NULL;
+  rc = entryDecode(zEntry, &a, &n, &op, &zTab, &iRec);
+  if (rc != SQLITE_OK) {
+    *pzErr = sqlite3_mprintf("row entry: %s", rc == SQLITE_CORRUPT ? "not a record" : "out of memory");
+    return rc;
+  }
+  rc = hpplite_rows_apply(db, zTab, op, a + iRec, n - iRec, pzErr);
+  sqlite3_free(zTab);
+  sqlite3_free(a);
   return rc;
 }

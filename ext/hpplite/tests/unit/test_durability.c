@@ -16,12 +16,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+
+/* Row capture (#19, HPPLITE_CAPTURE=rows): cases about statement capture skip */
+static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return v && strcasecmp(v, "rows") == 0; }
+#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 #define PRIVKEY_HEX "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
@@ -200,6 +205,7 @@ static void test_replay_not_relogged(void) {
 /* 5. Bound parameters are expanded into the logged SQL */
 static void test_bound_params_expanded(void) {
     TEST("bound parameters are expanded in the batch");
+    SKIP_IF_ROWS("the batch carries records, not statement text");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/bind.db", l1);
@@ -767,6 +773,7 @@ static void test_encryption_default(void) {
 /* 20. encrypt=off posts plaintext; plaintext batches replay into an encrypting node */
 static void test_encryption_off_and_legacy(void) {
     TEST("encrypt=off posts plaintext JSON; plaintext history replays into an encrypting node");
+    SKIP_IF_ROWS("the plaintext batch carries records (test_rows_e2e)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     /* same wallet as open_node(), through the URI, with encryption switched off */
@@ -857,6 +864,7 @@ static void test_flush_thread_never_loses_captures(void) {
 /* 22. Capture fidelity corner cases found by review */
 static void test_capture_corner_cases(void) {
     TEST("_hpplite_ in a string literal, lowercase 'without rowid', long statements");
+    SKIP_IF_ROWS("nothing is detected: records are what the write did");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNodeConfig config;
@@ -1191,6 +1199,7 @@ static int foreign_commit_hook(void *p) { (void)p; return 0; }
 static int foreign_trace(unsigned m, void *p, void *s, void *x) { (void)m; (void)p; (void)s; (void)x; return 0; }
 static void test_replaced_hooks_detected(void) {
     TEST("another component replaces the hooks: writes lost meanwhile are reported, capture resumes");
+    SKIP_IF_ROWS("the triggers keep capturing (test_rows_e2e)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/hooks.db", l1);
@@ -1219,6 +1228,7 @@ static void test_replaced_hooks_detected(void) {
 /* 32. Capture matching: our prefix is an identifier prefix, not a substring; bare time functions (issues #42, #43) */
 static void test_capture_matching(void) {
     TEST("app_hpplite_cfg and comments are captured; bare date()/strftime('fmt') are flagged off the clock VFS");
+    SKIP_IF_ROWS("the clock is not read on replay");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/match.db", l1);
@@ -1290,6 +1300,7 @@ static void test_idle_reader_flush_replays(void) {
 /* 34. Unsupported SQL is refused by default; determinism=warn lets it through with a count */
 static void test_unsupported_sql_refused(void) {
     TEST("non-deterministic SQL and ATTACH are refused (strict); warn mode counts");
+    SKIP_IF_ROWS("non-deterministic SQL is accepted; ATTACH (test_rows_e2e)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/strict.db", l1);

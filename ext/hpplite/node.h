@@ -58,6 +58,7 @@ typedef struct HppliteNodeConfig {
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
     int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
     int determinismWarn;            /* Warn about non-deterministic SQL instead of refusing it */
+    int captureRows;                /* Capture rows, not statements (#19) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;

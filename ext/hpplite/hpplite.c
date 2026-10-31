@@ -1358,7 +1358,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** is a write that may reach a virtual table (FTS5, R*Tree): what those
   ** store cannot carry triggers. */
   if (pCtx->bRows && isRowsDml(zSql)) {
-    if (hpplite_rows_covered(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
+    if (hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
     pCtx->pRowsTextStmt = pS;
     pCtx->bRowsCapOff = 1;
   }
@@ -1698,8 +1698,9 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pZeroStmt) sqlite3_finalize(pCtx->pZeroStmt);
   if (pCtx->pSeqStmt) sqlite3_finalize(pCtx->pSeqStmt);
   if (pCtx->pRowsSchemaStmt) sqlite3_finalize(pCtx->pRowsSchemaStmt);
+  if (pCtx->pRowsLockStmt) sqlite3_finalize(pCtx->pRowsLockStmt);
   pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
-  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = NULL;
+  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = pCtx->pRowsLockStmt = NULL;
   pCtx->pLastLogged = NULL;
 }
 
@@ -1710,7 +1711,7 @@ static int applicationStatementsOpen(HppliteCtx *pCtx) {
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
         || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt
-        || pStmt == pCtx->pRowsSchemaStmt) continue;
+        || pStmt == pCtx->pRowsSchemaStmt || pStmt == pCtx->pRowsLockStmt) continue;
     return 1;
   }
   return 0;
@@ -1729,6 +1730,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   freeFunctionChecks(pCtx);
   sqlite3_free(pCtx->aNoClock);
   sqlite3_free(pCtx->zRowsTextOnly);
+  sqlite3_free(pCtx->zRowsSeq);
   if (pCtx->pNoClockMutex) sqlite3_mutex_free(pCtx->pNoClockMutex);
   sqlite3_free(pCtx);
 }
@@ -1848,13 +1850,15 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   if (bWrite && pCtx->bkDb != pCtx->db && pCtx->bAppTxnOpen) {
     return SQLITE_BUSY;
   }
-  pCtx->bBkGate = 0;
   if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing) {
     int expected = 0;
     if (!__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-      return SQLITE_BUSY;                 /* the application is between read and write */
+      return SQLITE_BUSY;                 /* the application is between read and write (or the
+                                          ** gate is held: its holder's flag is not ours to clear) */
     }
     pCtx->bBkGate = 1;
+  } else {
+    pCtx->bBkGate = 0;
   }
   {
     int rc = internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1913,6 +1917,50 @@ static void cutToGroupStart(HppliteBatch *pBatch) {
   }
 }
 
+/*
+** sqlite_sequence entries no record carries (#19): a write that changed no
+** row can create one (an INSERT ... SELECT of nothing into a new
+** AUTOINCREMENT table). Before each batch the flusher logs what moved in
+** sqlite_sequence since it last looked, as sequence records - from the
+** bookkeeping connection, so the application's changes() stays its own, and
+** for every connection writing the file. Set exactly, at that point of the
+** log: what any committed transaction did, by then.
+*/
+int hpplite_rows_seq_flush(HppliteCtx *pCtx) {
+  char *zMoved;
+  int n = 0, rc, saved;
+  sqlite3_stmt *q = NULL;
+  const char *z;
+  if (!pCtx || !pCtx->bRows || pCtx->bkDb == pCtx->db) return SQLITE_OK;
+  if (bkBegin(pCtx, 1) != SQLITE_OK) return SQLITE_BUSY;
+  saved = bkEnter(pCtx);
+  zMoved = hpplite_rows_seq_changed(pCtx, pCtx->bkDb, &n);
+  rc = zMoved ? SQLITE_OK : SQLITE_NOMEM;
+  if (rc == SQLITE_OK && n > 0) {
+    rc = sqlite3_prepare_v2(pCtx->bkDb,
+      "INSERT INTO _hpplite_pending(txn, sql, mode, now, tbl, op, rec) VALUES(0, '', ?1, 0, ?2, ?3, ?4)", -1, &q, NULL);
+    for (z = zMoved; rc == SQLITE_OK && *z; ) {
+      const char *v = z + strlen(z) + 1;
+      int nRec = 0;
+      unsigned char *aRec = hpplite_rows_seq_rec(atoll(v), &nRec);
+      if (!aRec) { rc = SQLITE_NOMEM; break; }
+      sqlite3_bind_int(q, 1, HPPLITE_MODE_ROW);
+      sqlite3_bind_text(q, 2, z, -1, SQLITE_STATIC);
+      sqlite3_bind_int(q, 3, HPPLITE_ROW_SEQ);
+      sqlite3_bind_blob(q, 4, aRec, nRec, sqlite3_free);
+      rc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      sqlite3_reset(q);
+      z = v + strlen(v) + 1;
+    }
+    sqlite3_finalize(q);
+  }
+  sqlite3_free(zMoved);
+  bkLeave(pCtx, saved);
+  rc = bkEnd(pCtx, rc);
+  if (rc == SQLITE_OK && n > 0) hpplite_rows_seq_take(pCtx, pCtx->bkDb);
+  return rc;
+}
+
 struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxBytes,
                                                  int withRoot, sqlite3_int64 *pMaxId) {
   HppliteBatch *pBatch = NULL;
@@ -1931,15 +1979,28 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   ** a large backlog must not be re-read for every chunk. */
   size_t estSize = hpplite_batch_json_overhead();
   int overLimit = 0;
+  /* a log some connection has row capture on for has records in it (#19) */
   rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now, op, tbl, rec FROM _hpplite_pending ORDER BY id",
+    -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now FROM _hpplite_pending ORDER BY id",
     -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
+    char *zEntry = NULL;
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
       sqlite3_int64 id = sqlite3_column_int64(pStmt, 0);
       sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
       const char *zSql = (const char*)sqlite3_column_text(pStmt, 2);
       const char *zText = zSql ? zSql : "";
+      sqlite3_free(zEntry);
+      zEntry = NULL;
+      if (sqlite3_column_count(pStmt) > 5 && sqlite3_column_int(pStmt, 5) > 0) {
+        zEntry = hpplite_rows_entry(sqlite3_column_int(pStmt, 5), (const char*)sqlite3_column_text(pStmt, 6),
+                                    (const unsigned char*)sqlite3_column_blob(pStmt, 7), sqlite3_column_bytes(pStmt, 7));
+        if (!zEntry) break;
+        zText = zEntry;
+      }
       size_t off = 0, pieceLen = 0;
       int piece = 0;
       if (!pBatch) {
@@ -2006,6 +2067,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
         break;                      /* the rest of it starts the next batch */
       }
     }
+    sqlite3_free(zEntry);
     sqlite3_finalize(pStmt);
   }
   if (pBatch && split) pBatch->partial = 1;
@@ -2425,7 +2487,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   /* A mode this version does not know cannot be reproduced: stop rather
   ** than replay into a different state */
   for (i = 0; i < pBatch->nTxns; i++) {
-    if (pBatch->aTxns[i].mode & ~(HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_RECURSIVE_TRIGGERS)) {
+    if (pBatch->aTxns[i].mode & ~(HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_RECURSIVE_TRIGGERS | HPPLITE_MODE_ROW)) {
       fprintf(stderr, "hpplite: batch %llu statement %d ran under connection state this version cannot apply (mode %d)\n",
               (unsigned long long)pBatch->height, i, pBatch->aTxns[i].mode);
       return SQLITE_MISMATCH;
@@ -2543,19 +2605,50 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   int savedMode = connectionMode(rdb), curMode = savedMode;
   for (i = 0; i < holdFrom && rc == SQLITE_OK; i++) {
     const char *zSql = aRun[i].zSql;
+    /* A row record (#19) runs under the writer's foreign keys (a cascade it
+    ** did is in the records before the change that caused it, so here it
+    ** finds nothing left) and leaves recursive_triggers as it is: triggers
+    ** are off for it, their effects are records of their own */
+    int isRow = (aRun[i].mode & HPPLITE_MODE_ROW) != 0;
+    int mode = isRow ? (aRun[i].mode & HPPLITE_MODE_FOREIGN_KEYS) | (curMode & HPPLITE_MODE_RECURSIVE_TRIGGERS)
+                     : aRun[i].mode;
     if (!zSql) continue;
     if (useTxn && aRun[i].group != lastTxn) {
+      int j, hasRow = 0;
       if (open) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
       open = 0;
       /* foreign keys for the whole group, before it begins */
-      if (rc == SQLITE_OK) rc = replayMode(rdb, aRun[i].mode, &curMode);
+      if (rc == SQLITE_OK) rc = replayMode(rdb, mode, &curMode);
       if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "BEGIN", NULL, NULL, NULL);
       open = (rc == SQLITE_OK);
       lastTxn = aRun[i].group;
+      /* records apply a cascade's effects before its cause (the child row
+      ** moves to a key its parent has only after the next record): their
+      ** foreign keys are checked at the group's end, where the writer's
+      ** state held */
+      for (j = i; j < holdFrom && aRun[j].group == lastTxn; j++) if (aRun[j].mode & HPPLITE_MODE_ROW) hasRow = 1;
+      if (open && hasRow) rc = sqlite3_exec(rdb, "PRAGMA defer_foreign_keys = ON", NULL, NULL, NULL);
     }
-    if (rc == SQLITE_OK) rc = replayMode(rdb, aRun[i].mode, &curMode);
+    if (rc == SQLITE_OK) rc = replayMode(rdb, mode, &curMode);
     hpplite_clock_pin(aRun[i].now ? aRun[i].now
                                   : (sqlite3_int64)pBatch->timestamp * 1000 + 210866760000000LL);
+    if (isRow && rc == SQLITE_OK) {
+      char *zErr = NULL;
+      int trig = 1;
+      sqlite3_db_config(rdb, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &trig);
+      rc = hpplite_rows_apply_entry(rdb, zSql, &zErr);
+      sqlite3_db_config(rdb, SQLITE_DBCONFIG_ENABLE_TRIGGER, 1, &trig);
+      if (rc != SQLITE_OK) {
+        /* a record is what a write that succeeded did: one that cannot be
+        ** applied means the replica is not where the writer was */
+        fprintf(stderr, "hpplite: batch %llu row record %d cannot be applied: %s\n",
+                (unsigned long long)pBatch->height, i, zErr ? zErr : sqlite3_errmsg(rdb));
+        sqlite3_free(zErr);
+        rc = SQLITE_MISMATCH;
+        break;
+      }
+      continue;
+    }
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
       /* The statement failed here as it did at the sequencer (a failed
@@ -2626,16 +2719,28 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
   if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
 
   int saved = bkEnter(pCtx);
+  /* row records (#19) compare as the entry text the batch was built with */
   rc = sqlite3_prepare_v2(pCtx->bkDb,
+    "SELECT id, sql, mode, CASE WHEN txn = 0 THEN id ELSE txn END, now, op, tbl, rec FROM _hpplite_pending ORDER BY id LIMIT ?1",
+    -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT id, sql, mode, CASE WHEN txn = 0 THEN id ELSE txn END, now FROM _hpplite_pending ORDER BY id LIMIT ?1",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) { bkLeave(pCtx, saved); return rc; }
   sqlite3_bind_int(pStmt, 1, pBatch->nTxns);
   sqlite3_int64 fragRow = 0;
   size_t fragOff = 0;
+  char *zEntry = NULL;
   while (sqlite3_step(pStmt) == SQLITE_ROW && i < pBatch->nTxns) {
     sqlite3_int64 id = sqlite3_column_int64(pStmt, 0);
     const char *zSql = (const char*)sqlite3_column_text(pStmt, 1);
+    sqlite3_free(zEntry);
+    zEntry = NULL;
+    if (sqlite3_column_count(pStmt) > 5 && sqlite3_column_int(pStmt, 5) > 0) {
+      zEntry = hpplite_rows_entry(sqlite3_column_int(pStmt, 5), (const char*)sqlite3_column_text(pStmt, 6),
+                                  (const unsigned char*)sqlite3_column_blob(pStmt, 7), sqlite3_column_bytes(pStmt, 7));
+      zSql = zEntry;
+    }
     const char *zRow = zSql;
     const HppliteTxn *t = &pBatch->aTxns[i];
     /* the statement a previous batch posted part of: compare from where it stopped (#59) */
@@ -2660,6 +2765,7 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
     }
     i++;
   }
+  sqlite3_free(zEntry);
   sqlite3_finalize(pStmt);
   bkLeave(pCtx, saved);
   if (!ok || i != pBatch->nTxns) return SQLITE_MISMATCH;
@@ -3205,6 +3311,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
     nc->determinismWarn = cfg->determinismWarn;
+    nc->captureRows = cfg->captureRows;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
     nc->checkpointInterval = cfg->checkpointInterval;

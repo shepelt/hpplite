@@ -27,7 +27,10 @@ c.executemany("INSERT INTO notes(body, n) VALUES(?, ?)", [(f"note {i}", i) for i
 c.commit()
 c.execute("UPDATE notes SET body = body || '!' WHERE id % 7 = 0")
 c.commit()
-assert c.execute("SELECT pending FROM hpplite_status").fetchone()[0] == 302
+# a statement per log row; with row capture (#19) a changed row per log row:
+# 300 inserted, 42 updated (id % 7 = 0), and the CREATE TABLE
+rows = os.environ.get("HPPLITE_CAPTURE", "").lower() == "rows"
+assert c.execute("SELECT pending FROM hpplite_status").fetchone()[0] == (343 if rows else 302)
 h = c.execute("SELECT hpplite_flush()").fetchone()[0]       # the last height posted (40 KB batches: maybe 2)
 assert h >= 1, h
 assert c.execute("SELECT height, pending FROM hpplite_status").fetchone() == (h + 1, 0)

@@ -53,8 +53,9 @@ static const char *apply_log(sqlite3 *writer, sqlite3 *replica, int *pRecords, i
     *pRecords = *pTexts = 0;
     sqlite3_db_config(replica, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &on);
     exec(replica, "PRAGMA foreign_keys=OFF");
-    exec(replica, "BEGIN");
-    if (sqlite3_prepare_v2(writer, "SELECT sql, tbl, op, rec FROM _hpplite_pending ORDER BY id", -1, &st, NULL) != SQLITE_OK) return "read log";
+    /* entry by entry, in autocommit: a text write's foreign keys are the
+    ** writer's (its mode), and the pragma only switches outside a transaction */
+    if (sqlite3_prepare_v2(writer, "SELECT sql, tbl, op, rec, mode FROM _hpplite_pending ORDER BY id", -1, &st, NULL) != SQLITE_OK) return "read log";
     while (sqlite3_step(st) == SQLITE_ROW) {
         int op = sqlite3_column_int(st, 2);
         if (op > 0) {
@@ -70,7 +71,7 @@ static const char *apply_log(sqlite3 *writer, sqlite3 *replica, int *pRecords, i
             const char *sql = (const char *)sqlite3_column_text(st, 0);
             int on2;
             sqlite3_db_config(replica, SQLITE_DBCONFIG_ENABLE_TRIGGER, 1, &on2);   /* a text write's triggers are its effects */
-            exec(replica, "PRAGMA foreign_keys=ON");
+            if (sqlite3_column_int(st, 4) & 1) exec(replica, "PRAGMA foreign_keys=ON");
             if (!exec(replica, sql)) { snprintf(why, sizeof why, "text: %.200s: %s", sql, sqlite3_errmsg(replica)); sqlite3_finalize(st); return why; }
             exec(replica, "PRAGMA foreign_keys=OFF");
             sqlite3_db_config(replica, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &on2);
@@ -78,7 +79,6 @@ static const char *apply_log(sqlite3 *writer, sqlite3 *replica, int *pRecords, i
         }
     }
     sqlite3_finalize(st);
-    exec(replica, "COMMIT");
     return NULL;
 }
 
@@ -347,6 +347,21 @@ static void test_autoincrement_and_fts5(void) {
         exec(w.db, "UPDATE notes SET body = 'nothing here' WHERE id = 3");
         exec(w.db, "DELETE FROM notes WHERE id = 2");
         exec(w.db, "CREATE TABLE plain(x); INSERT INTO plain VALUES(1)");   /* still rows */
+        /* what decides is the table written, however it is spelled */
+        exec(w.db, "INSERT INTO plain SELECT body FROM notes");                          /* reads notes: rows */
+        exec(w.db, "WITH c(v) AS (SELECT 'x') INSERT OR REPLACE INTO main.\"notes\"(id, body) SELECT 9, v FROM c");  /* text */
+        exec(w.db, "/* orm */ UPDATE OR IGNORE [notes] SET body = 'capture late' WHERE id = 9");          /* text */
+        exec(w.db, "DELETE FROM `notes` WHERE id = 9");                                  /* text */
+        /* a parent whose cascade deletes notes reaches the index too */
+        exec(w.db, "PRAGMA foreign_keys = ON;"
+                   "CREATE TABLE author(id INTEGER PRIMARY KEY);"
+                   "CREATE TABLE notes2(id INTEGER PRIMARY KEY, author INTEGER REFERENCES author(id) ON DELETE CASCADE, body);"
+                   "CREATE VIRTUAL TABLE notes2_fts USING fts5(body, content='notes2', content_rowid='id');"
+                   "CREATE TRIGGER notes2_ad AFTER DELETE ON notes2 BEGIN"
+                   "  INSERT INTO notes2_fts(notes2_fts, rowid, body) VALUES('delete', old.id, old.body); END;"
+                   "INSERT INTO author VALUES(1); INSERT INTO notes2 VALUES(1, 1, 'gone soon');"
+                   "INSERT INTO notes2_fts(rowid, body) VALUES(1, 'gone soon');"
+                   "DELETE FROM author WHERE id = 1");                                   /* text: cascade */
     }
     int nr, nt;
     const char *why = replica_differs(&w, DIR "/fts_r.db", &nr, &nt);
@@ -354,12 +369,17 @@ static void test_autoincrement_and_fts5(void) {
     sqlite3_int64 hits = fts ? scalar(r, "SELECT count(*) FROM docs WHERE docs MATCH 'capture'") : -1;
     sqlite3_int64 nhits = fts ? scalar(r, "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH 'capture'") : -1;
     sqlite3_int64 plainRows = fts ? scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE tbl = 'plain'") : -1;
+    sqlite3_int64 noteText = fts ? scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND (sql LIKE '%notes\"(id%' "
+                                              "OR sql LIKE '%[notes]%' OR sql LIKE '%`notes`%')") : -1;
+    sqlite3_int64 authorText = fts ? scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND sql LIKE 'DELETE FROM author%'") : -1;
     sqlite3_close(r);
     close_writer(&w);
     if (why) FAIL(why);
     if (fts && hits != 1) FAILF("replica search: %lld hits, want 1", (long long)hits);
     if (fts && nhits != 1) FAILF("replica search, external content: %lld hits, want 1", (long long)nhits);
-    if (fts && plainRows != 1) FAILF("%lld row records for an ordinary table, want 1", (long long)plainRows);
+    if (fts && plainRows != 3) FAILF("%lld row records for an ordinary table, want 3 (one row, then two read from notes)", (long long)plainRows);
+    if (fts && noteText != 3) FAILF("%lld of the 3 writes to notes, however spelled, logged as text", (long long)noteText);
+    if (fts && authorText != 1) FAIL("a delete whose cascade reaches an FTS-synced table must be text");
     PASS();
 }
 

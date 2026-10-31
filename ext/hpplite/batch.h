@@ -36,6 +36,8 @@ struct HppliteTxn {
 */
 #define HPPLITE_MODE_FOREIGN_KEYS        1   /* PRAGMA foreign_keys: cascades, SET NULL/DEFAULT */
 #define HPPLITE_MODE_RECURSIVE_TRIGGERS  2   /* PRAGMA recursive_triggers */
+#define HPPLITE_MODE_ROW                 4   /* not SQL: a row record (#19), applied with triggers off;
+                                            ** a version without row capture refuses the batch */
 
 /*
 ** A batch of transactions with state transition

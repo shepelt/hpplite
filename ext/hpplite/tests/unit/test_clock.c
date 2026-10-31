@@ -15,11 +15,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+
+/* Row capture (#19, HPPLITE_CAPTURE=rows): cases about statement capture skip */
+static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return v && strcasecmp(v, "rows") == 0; }
+#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 #define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
@@ -183,6 +188,7 @@ static void test_reads_are_live(void) {
 
 static void test_only_clock_statements_carry_it(void) {
     TEST("only statements that read the clock carry its value in the batch");
+    SKIP_IF_ROWS("records carry values, not the time");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *w = open_node(DIR "/w.db", l1);
@@ -204,6 +210,7 @@ static void test_only_clock_statements_carry_it(void) {
 
 static void test_time_zones_refused(void) {
     TEST("'localtime' and 'utc' modifiers in writes are refused (machine time zone); reads are fine");
+    SKIP_IF_ROWS("accepted, replicas equal (test_rows_e2e)");
     reset_dir();
     HppliteNode *w = open_node(DIR "/w.db", NULL);
     if (!w) FAIL("open");
@@ -263,6 +270,7 @@ static void test_survives_restart_and_big_txn(void) {
 
 static void test_other_vfs_still_refused(void) {
     TEST("a connection on another VFS cannot pin the clock: clock SQL stays refused there");
+    SKIP_IF_ROWS("nothing needs the clock pinned");
     reset_dir();
     sqlite3 *db = NULL;
     if (sqlite3_open_v2("file:" DIR "/plain.db?hpplite=on&privkey=0x6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80&datadir=" DIR,

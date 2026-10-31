@@ -132,7 +132,12 @@ static void *write_autocommit(void *arg) {
     for (int i = 0; i < w->n; i++) {
         char sql[96];
         snprintf(sql, sizeof(sql), "INSERT INTO t(who, k) VALUES('%s', %d)", w->who, i);
-        if (sqlite3_exec(w->db, sql, NULL, NULL, NULL) != SQLITE_OK) w->failed++;
+        char *err = NULL;
+        if (sqlite3_exec(w->db, sql, NULL, NULL, &err) != SQLITE_OK) {
+            if (getenv("CONC_VERBOSE") && w->failed < 3) fprintf(stderr, "[%s] %s: %s\n", w->who, sql, err);
+            w->failed++;
+        }
+        sqlite3_free(err);
     }
     return NULL;
 }
@@ -155,7 +160,10 @@ static void *write_mixed(void *arg) {
         case 4: snprintf(sql, sizeof(sql), "DELETE FROM t WHERE id = (SELECT max(id) FROM t WHERE who = '%s')", w->who); break;
         default: snprintf(sql, sizeof(sql), "INSERT OR IGNORE INTO u(key, v, who) VALUES(%d, 100, '%s')", i % 23, w->who); break;
         }
-        if (sqlite3_exec(w->db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+        char *err = NULL;
+        if (sqlite3_exec(w->db, sql, NULL, NULL, &err) != SQLITE_OK) {
+            if (getenv("CONC_VERBOSE") && w->failed < 3) fprintf(stderr, "[%s] %.80s: %s\n", w->who, sql, err);
+            sqlite3_free(err);
             w->failed++;
             sqlite3_exec(w->db, "ROLLBACK", NULL, NULL, NULL);
         }

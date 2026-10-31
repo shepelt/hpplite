@@ -16,6 +16,7 @@ struct HppliteCtx;
 #define HPPLITE_ROW_INSERT 1
 #define HPPLITE_ROW_UPDATE 2
 #define HPPLITE_ROW_DELETE 3
+#define HPPLITE_ROW_SEQ    4   /* sqlite_sequence entry of a table, set exactly */
 
 /* Turn row capture on for the connection: functions, log columns, triggers */
 int hpplite_rows_enable(struct HppliteCtx *pCtx);
@@ -23,6 +24,8 @@ int hpplite_rows_enable(struct HppliteCtx *pCtx);
 /* Do the triggers cover the database's current schema? (a statement on a
 ** table they do not cover is logged as text instead) */
 int hpplite_rows_covered(struct HppliteCtx *pCtx);
+/* ...asked as a write starts: takes the write lock first (see the .c) */
+int hpplite_rows_covered_for_write(struct HppliteCtx *pCtx);
 
 /* Must this write be logged as text? (it names a virtual table, or a table
 ** or view whose triggers reach one) */
@@ -36,5 +39,23 @@ void hpplite_rows_after_statement(struct HppliteCtx *pCtx);
 ** business). Returns SQLITE_OK or an error with *pzErr set (sqlite3_free). */
 int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op,
                        const unsigned char *aRec, int nRec, char **pzErr);
+
+/* sqlite_sequence as it was when last looked at, and what moved since: a
+** write that changed no row can still create an entry (an INSERT ... SELECT
+** of nothing into a new AUTOINCREMENT table) that no record carries.
+** hpplite_rows_seq_changed() lists the entries that differ from the
+** snapshot ('\0'-separated name, seq pairs as text; sqlite3_free) without
+** taking them in; hpplite_rows_seq_take() takes the current state in. */
+char *hpplite_rows_seq_changed(struct HppliteCtx *pCtx, sqlite3 *db, int *pn);
+void hpplite_rows_seq_take(struct HppliteCtx *pCtx, sqlite3 *db);
+/* The record of one entry (sqlite3_free) */
+unsigned char *hpplite_rows_seq_rec(sqlite3_int64 seq, int *pnRec);
+
+/* A record as a batch entry's text (sqlite3_free), and back: applied onto
+** db the way hpplite_rows_apply does */
+char *hpplite_rows_entry(int op, const char *zTab, const unsigned char *aRec, int nRec);
+int hpplite_rows_apply_entry(sqlite3 *db, const char *zEntry, char **pzErr);
+/* What an entry is: its op and table (*pzTab: sqlite3_free) */
+int hpplite_rows_entry_info(const char *zEntry, int *pOp, char **pzTab);
 
 #endif

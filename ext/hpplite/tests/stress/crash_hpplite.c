@@ -14,6 +14,8 @@
 */
 #include "hpplite.h"
 #include "node.h"
+#include "batch.h"
+#include "capture_rows.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,12 +113,24 @@ static void check(const char *what) {
         HppliteBatch *b = hpplite_node_fetch_batch(n, h);
         CHECK(b != NULL, "%s: batch %llu missing or unreadable (heights not contiguous)", what, (unsigned long long)h);
         if (!b) break;
-        for (int i = 0; i < b->nTxns; i++) onL1 += b->aTxns[i].zSql && strncmp(b->aTxns[i].zSql, "INSERT", 6) == 0;
+        for (int i = 0; i < b->nTxns; i++) {
+            if (b->aTxns[i].mode & HPPLITE_MODE_ROW) {
+                /* row capture (#19): an insert record of t */
+                int op = 0; char *zTab = NULL;
+                if (hpplite_rows_entry_info(b->aTxns[i].zSql, &op, &zTab) == SQLITE_OK)
+                    onL1 += op == HPPLITE_ROW_INSERT && strcmp(zTab, "t") == 0;
+                sqlite3_free(zTab);
+            } else {
+                onL1 += b->aTxns[i].zSql && strncmp(b->aTxns[i].zSql, "INSERT", 6) == 0;
+            }
+        }
         hpplite_batch_free(b);
     }
     /* one INSERT per row; the CREATE TABLE IF NOT EXISTS of every restart is
     ** kept too (an autocommit no-op stays logged), so it is not counted */
     sqlite3_int64 pending = scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE sql LIKE 'INSERT%'");
+    if (n->config.captureRows)
+        pending += scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE op = 1 AND tbl = 't'");
     CHECK(onL1 + pending == rows, "%s: INSERTs on L1 (%lld) + pending (%lld) != rows (%lld)",
           what, (long long)onL1, (long long)pending, (long long)rows);
 

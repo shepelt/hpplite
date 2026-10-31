@@ -114,6 +114,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
+| `capture` | No | `text` (default): log each write statement; `rows`: log what each write changed (#19, below). Also `HPPLITE_CAPTURE` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -458,6 +459,17 @@ literals. Statements that cannot write (`SELECT`, `WITH ... SELECT`) are
 never refused: they are not logged (#54).
 `tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
 look-alikes it must let through.
+
+**Row capture (`capture=rows`, preview; #19).** Instead of each write's
+text, HPPLite logs what it changed: one record per inserted, updated or
+deleted row, written by TEMP triggers inside the application's transaction.
+A replica applies the records, so `random()`, the clock, `'localtime'`,
+application functions such as WordPress's `REGEXP`, and `CURRENT_TIMESTAMP`
+defaults all replay exactly and are no longer refused. Schema changes, and
+writes that reach a virtual table (FTS5, R*Tree - directly, or through the
+sync triggers of the table written), are still logged as statements, under
+the rules above. Batches with records cannot be read by v0.1 (they say so
+and stop). Design and measurements: `doc/design-row-capture.md`.
 
 **The clock is supported.** `CURRENT_TIMESTAMP`, `datetime('now')`,
 `unixepoch()`, `strftime('%f', 'now')` and columns with `DEFAULT

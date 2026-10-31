@@ -41,7 +41,9 @@ INSERT INTO t(v) VALUES('d');
 SQL
 )
     echo "$out" | tr '\n' ' '
-    echo "$out" | grep -q '^pending=2$' || { echo "cli: expected pending=2"; exit 1; }
+    # the CREATE and the INSERT; with row capture (#19), the CREATE and three rows
+    want=2; [ "${HPPLITE_CAPTURE:-}" = rows ] && want=4
+    echo "$out" | grep -q "^pending=$want\$" || { echo "cli: expected pending=$want"; exit 1; }
     echo "$out" | grep -q '^flush=1$' || { echo "cli: expected flush=1"; exit 1; }
     echo "$out" | grep -q '^height=2,pending=0$' || { echo "cli: expected height 2"; exit 1; }
     again=$(sqlite3 -batch "$uri" ".load $mod" "SELECT height || ',' || pending || ',' || (SELECT count(*) FROM t) FROM hpplite_status;")
