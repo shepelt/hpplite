@@ -52,3 +52,12 @@ lease the dead instance held must expire first (minutes).
   database from the anvil run with a fresh wallet; HPPLite took "this
   database is ahead of L1" for a reorg and re-posted the anvil history's
   first batch into the new rollup. A database is now bound to its rollup.
+
+## Row capture (`capture=rows`, #19; 2026-10-31, anvil)
+
+- First boot, all migrations and fixtures with records instead of
+  statements: booted in 16 s, no refusals, no HPPLite errors.
+- Admin API session (setup, 60 posts, 150 members, 34 published): every
+  call succeeded.
+- A replica rebuilt from the chain alone equals Ghost's database: 102 tables,
+  2207 rows, 17 batches, same state root.
