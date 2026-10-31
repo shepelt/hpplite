@@ -112,11 +112,11 @@ static char *dump(sqlite3 *db) {
         const char *t = (const char *)sqlite3_column_text(tabs, 0);
         char sql[512];
         sqlite3_stmt *probe, *st;
-        snprintf(sql, sizeof sql, "SELECT rowid FROM \"%s\" LIMIT 0", t);
+        snprintf(sql, sizeof sql, "SELECT rowid FROM main.\"%s\" LIMIT 0", t);
         int hasRowid = sqlite3_prepare_v2(db, sql, -1, &probe, NULL) == SQLITE_OK;
         sqlite3_finalize(probe);
-        if (hasRowid) snprintf(sql, sizeof sql, "SELECT rowid, * FROM \"%s\" ORDER BY rowid", t);
-        else snprintf(sql, sizeof sql, "SELECT * FROM \"%s\" ORDER BY 1, 2", t);
+        if (hasRowid) snprintf(sql, sizeof sql, "SELECT rowid, * FROM main.\"%s\" ORDER BY rowid", t);
+        else snprintf(sql, sizeof sql, "SELECT * FROM main.\"%s\" ORDER BY 1, 2", t);
         while (len + strlen(t) + 8 > cap) { cap *= 2; out = realloc(out, cap); }
         len += (size_t)sprintf(out + len, "[%s]", t);
         if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) continue;
@@ -436,6 +436,29 @@ static void test_write_beside_open_text_statement(void) {
     PASS();
 }
 
+/* A TEMP table named like a main table: main's triggers are shaped by
+** main's columns, and writes to main's table go through (#67) */
+static void test_temp_table_shadow(void) {
+    TEST("a TEMP table with a main table's name does not shape that table's capture");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/shadow.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(a, b)");
+    exec(w.db, "CREATE TEMP TABLE t(b, a, c)");
+    exec(w.db, "CREATE TABLE u(x)");                                  /* the triggers are rebuilt here */
+    if (!exec(w.db, "INSERT INTO main.t VALUES(1, 2)")) FAIL("the write to main.t failed");
+    exec(w.db, "INSERT INTO t VALUES(7, 8, 9)");                       /* temp.t: not captured, not main's */
+    exec(w.db, "UPDATE main.t SET b = 3");
+    exec(w.db, "CREATE TABLE v(y)");                                  /* rebuilt again, temp.t still there */
+    exec(w.db, "INSERT INTO main.t VALUES(4, 5)");
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/shadow_r.db", &nr, &nt);
+    close_writer(&w);
+    if (why) FAIL(why);
+    if (nr != 3) FAILF("%d records, want 3", nr);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -464,6 +487,7 @@ int main(void) {
     test_autoincrement_and_fts5();
     test_failures_and_rollbacks();
     test_write_beside_open_text_statement();
+    test_temp_table_shadow();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

@@ -190,12 +190,13 @@ static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
   memset(t, 0, sizeof(*t));
   t->ipk = -1;
   t->zName = sqlite3_mprintf("%s", zName);
-  /* a WITHOUT ROWID table has no rowid to select */
-  z = sqlite3_mprintf("SELECT rowid FROM \"%w\" LIMIT 0", zName);
+  /* a WITHOUT ROWID table has no rowid to select. main's table: a TEMP
+  ** table of the same name would answer first for an unqualified name (#67) */
+  z = sqlite3_mprintf("SELECT rowid FROM main.\"%w\" LIMIT 0", zName);
   hasRowid = sqlite3_prepare_v2(db, z, -1, &q, NULL) == SQLITE_OK;
   sqlite3_finalize(q); q = NULL;
   sqlite3_free(z);
-  z = sqlite3_mprintf("SELECT name, type, pk, hidden FROM pragma_table_xinfo(%Q) ORDER BY cid", zName);
+  z = sqlite3_mprintf("SELECT name, type, pk, hidden FROM pragma_table_xinfo(%Q, 'main') ORDER BY cid", zName);
   rc = sqlite3_prepare_v2(db, z, -1, &q, NULL);
   sqlite3_free(z);
   if (rc != SQLITE_OK) return rc;
@@ -809,7 +810,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
       zCols = sqlite3_mprintf("%z%s\"%w\"", zCols, zCols ? ", " : "", t.azCol[i]);
       zVals = sqlite3_mprintf("%z%s?%d", zVals, zVals ? ", " : "", p++);
     }
-    zSql = sqlite3_mprintf("INSERT OR REPLACE INTO \"%w\"(%s) VALUES(%s)", zTab, zCols, zVals);
+    zSql = sqlite3_mprintf("INSERT OR REPLACE INTO main.\"%w\"(%s) VALUES(%s)", zTab, zCols, zVals);
     sqlite3_free(zCols); sqlite3_free(zVals);
     rc = sqlite3_prepare_v2(db, zSql, -1, &st, NULL);
     if (rc == SQLITE_OK) {
@@ -821,7 +822,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
     int nKey = t.nKey ? t.nKey : 1;
     char *zWhere = whereKey(&t, 1);
     if (n != nKey) { *pzErr = sqlite3_mprintf("delete record for %s: key of %d values, table's has %d", zTab, n, nKey); sqlite3_free(zWhere); tabFree(&t); return SQLITE_ERROR; }
-    zSql = sqlite3_mprintf("DELETE FROM \"%w\" WHERE %s", zTab, zWhere);
+    zSql = sqlite3_mprintf("DELETE FROM main.\"%w\" WHERE %s", zTab, zWhere);
     sqlite3_free(zWhere);
     rc = sqlite3_prepare_v2(db, zSql, -1, &st, NULL);
     for (i = 0; rc == SQLITE_OK && i < nKey && !d.bad; i++) decBind(&d, st, 1 + i);
@@ -855,7 +856,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
       /* OR REPLACE as the insert: a REPLACE conflict on the writer removed
       ** the rows in the way without a delete trigger firing (recursive
       ** triggers off), so no record says so; here it removes the same (#64) */
-      zSql = sqlite3_mprintf("UPDATE OR REPLACE \"%w\" SET %s WHERE %s", zTab, zSet, zWhere);
+      zSql = sqlite3_mprintf("UPDATE OR REPLACE main.\"%w\" SET %s WHERE %s", zTab, zSet, zWhere);
       sqlite3_free(zSet); sqlite3_free(zWhere);
       rc = sqlite3_prepare_v2(db, zSql, -1, &st, NULL);
       if (rc == SQLITE_OK) {
