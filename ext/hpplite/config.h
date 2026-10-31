@@ -123,6 +123,7 @@ typedef struct HppliteConfig {
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
     int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */
     int captureSource;               /* ...where from: 0 default, 1 environment, 2 URI (the URI wins, #80) */
+    int localOnly;                   /* l1=local: finalize batches locally and keep no history (#38) */
     char *dbName;                    /* Its own rollup among the wallet's, by this name (#61);
                                      ** "{file}": the database file's name */
     size_t maxTxBytes;               /* Largest batch per transaction (0 = by chain id, else unknown) */

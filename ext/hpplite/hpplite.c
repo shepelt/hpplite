@@ -3589,7 +3589,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             if (node->state == HPPLITE_STATE_ERROR) z = "error";
             else if (node->state == HPPLITE_STATE_STOPPED) z = "stopped";
             else if (node->state == HPPLITE_STATE_INIT) z = "init";
-            else if (!node->l1) z = node->wantsL1 ? "disconnected" : "local";
+            else if (!node->l1) z = node->wantsL1 ? "disconnected" : node->config.localOnly ? "local" : "unposted";
             else if (node->follower) z = "follower";
             else if (node->leaseHeldElsewhere) z = "waiting";
             else if (node->retryAt) z = "retrying";
@@ -3755,6 +3755,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->determinismWarn = cfg->determinismWarn;
     nc->captureText = cfg->captureText;
     nc->captureSource = cfg->captureSource;
+    nc->localOnly = cfg->localOnly;
     nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;

@@ -41,7 +41,7 @@ int main(void) {
     tests++;
     TEST("Basic open/close");
     {
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open returned NULL");
 
@@ -56,7 +56,7 @@ int main(void) {
     tests++;
     TEST("Context retrieval");
     {
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -92,7 +92,7 @@ int main(void) {
     TEST("Initial state root is zero");
     {
         unlink("/tmp/test_simple_open.db");
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -116,7 +116,7 @@ int main(void) {
     TEST("State root changes after INSERT");
     {
         unlink("/tmp/test_simple_open.db");
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -161,7 +161,7 @@ int main(void) {
     TEST("Manual flush creates batch");
     {
         unlink("/tmp/test_simple_open.db");
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -187,7 +187,7 @@ int main(void) {
     TEST("Multiple operations accumulate");
     {
         unlink("/tmp/test_simple_open.db");
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -238,7 +238,7 @@ int main(void) {
     {
         unlink("/tmp/test_simple_open.db");
         /* Use 200ms interval for testing */
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&interval=200ms&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=200ms&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -247,7 +247,7 @@ int main(void) {
         if (cfg->batchIntervalMs != 200) FAIL("interval not set correctly");
         {   /* interval=0 means no timer at all; it used to fall back to the 5 s default */
             unlink("/tmp/test_simple_open_zero.db");
-            sqlite3 *z = hpplite_open("file:/tmp/test_simple_open_zero.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple");
+            sqlite3 *z = hpplite_open("file:/tmp/test_simple_open_zero.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple");
             if (!z) FAIL("open interval=0");
             if (hpplite_get_config(z)->batchIntervalMs != 0) FAIL("interval=0 should parse as 0");
             if (hpplite_get_node(z)->timerRunning) FAIL("interval=0 must not start the timer");
@@ -289,7 +289,7 @@ int main(void) {
          * No registration needed - HPPLite is built into SQLite. */
         sqlite3 *db;
         int rc = sqlite3_open_v2(
-            "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple",
+            "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple",
             &db,
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
             NULL
@@ -324,7 +324,7 @@ int main(void) {
     {
         unlink("/tmp/test_simple_open.db");
 
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
@@ -390,7 +390,7 @@ int main(void) {
         strcpy(longRpc, "http://example.invalid:8545/");
         for (size_t i = strlen(longRpc); i < 300; i++) longRpc[i] = 'p';
         unlink("/tmp/test_simple_open.db");
-        snprintf(uri, sizeof(uri), "file:/tmp/test_simple_open.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple"
+        snprintf(uri, sizeof(uri), "file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple"
                  "&dbname=%%7Bfile%%7D&nodeid=a%%20node&rpc=%s", longRpc);
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
@@ -411,7 +411,7 @@ int main(void) {
     TEST("hpplite_open: a parameter with %00 is ignored, not cut");
     {
         unlink("/tmp/test_simple_open.db");
-        sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple"
+        sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple"
                                    "&nodeid=cut%00here");
         if (!db) FAIL("hpplite_open failed");
         HppliteConfig *cfg = hpplite_get_config(db);

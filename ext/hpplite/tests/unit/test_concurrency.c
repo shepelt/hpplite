@@ -57,6 +57,7 @@ static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
     config.dataDir = DIR;
     config.dbPath = (char *)dbPath;
     config.checkpointInterval = 1000;
+    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
     node = hpplite_node_create(&config);
     if (node && l1) {
         hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);

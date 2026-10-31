@@ -84,6 +84,7 @@ static void test_node_create(void) {
     config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_seq";
     config.dbPath = "/tmp/hpplite_test_seq/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
 
     node = hpplite_node_create(&config);
     if (!node) {
@@ -162,6 +163,7 @@ static void test_sequencer_batches(void) {
     config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_seq2";
     config.dbPath = "/tmp/hpplite_test_seq2/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
 
     sequencer = hpplite_node_create(&config);
     if (!sequencer) {
@@ -244,6 +246,7 @@ static void test_multiple_batches(void) {
     config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_multi";
     config.dbPath = "/tmp/hpplite_test_multi/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
 
     sequencer = hpplite_node_create(&config);
     if (!sequencer) {
@@ -312,6 +315,7 @@ static void test_checkpoint_tracking(void) {
     config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_cp";
     config.dbPath = "/tmp/hpplite_test_cp/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     config.checkpointInterval = 3;  /* Checkpoint every 3 batches */
 
     sequencer = hpplite_node_create(&config);
@@ -367,6 +371,7 @@ static void test_node_lifecycle(void) {
     config.hasPrivkey = 1;
     config.dataDir = "/tmp/hpplite_test_life";
     config.dbPath = "/tmp/hpplite_test_life/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
 
     sequencer = hpplite_node_create(&config);
     if (!sequencer) {

@@ -32,6 +32,7 @@ static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
     config.hasPrivkey = 1;
     config.dataDir = DIR;
     config.dbPath = DIR "/test.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     config.checkpointInterval = checkpointInterval;
     node = hpplite_node_create(&config);
     if (node) {
@@ -138,6 +139,7 @@ static void test_checkpoint_without_l1(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "local"; memcpy(config.privkey, SEQ_PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/local.db"; config.checkpointInterval = 2;
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     node = hpplite_node_create(&config);
     if (!node) FAIL("open");
     hpplite_node_exec(node, "CREATE TABLE t (x)", NULL); hpplite_node_flush_batch(node);

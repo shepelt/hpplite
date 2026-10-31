@@ -858,6 +858,46 @@ static void test_state_and_last_error(void) {
     PASS();
 }
 
+/* No chain configured (#38): the log is the product, so it is kept pending
+** until one is; l1=local is the explicit throw-away mode */
+static HppliteNode *open_chainless(const char *dbPath, int localOnly) {
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "rows";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = (char *)dbPath;
+    config.checkpointInterval = 1000;
+    config.localOnly = localOnly;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (n) hpplite_node_start(n);
+    return n;
+}
+static void test_no_chain_keeps_the_log(void) {
+    TEST("hpplite=on with no chain keeps the log pending (state 'unposted'); l1=local finalizes batches locally");
+    reset_dir();
+    HppliteL1 *l1 = NULL;
+    HppliteNode *n = open_chainless(DIR "/nochain.db", 0);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(a)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    uint64_t h = hpplite_node_flush_batch(n);
+    if (h != 0) { hpplite_node_destroy(n); FAILF("finalized batch %llu with no chain: the history is gone", (unsigned long long)h); }
+    if (hpplite_node_pending_count(n) != 2) { hpplite_node_destroy(n); FAIL("the rows should stay pending"); }
+    WANT_STATUS(n->db, "state", "unposted", "with no chain");
+    hpplite_node_destroy(n);
+
+    n = open_chainless(DIR "/local.db", 1);
+    if (!n) FAIL("open local");
+    hpplite_node_exec(n, "CREATE TABLE t(a)", NULL);
+    if (hpplite_node_flush_batch(n) != 1) { hpplite_node_destroy(n); FAIL("l1=local should finalize locally"); }
+    if (hpplite_node_pending_count(n) != 0) { hpplite_node_destroy(n); FAIL("l1=local: pending should be empty"); }
+    WANT_STATUS(n->db, "state", "local", "with l1=local");
+    hpplite_node_destroy(n);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -880,6 +920,7 @@ int main(void) {
     test_connection_pragmas();
     test_foreign_writes_detected();
     test_state_and_last_error();
+    test_no_chain_keeps_the_log();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

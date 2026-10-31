@@ -67,6 +67,7 @@ static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBa
     config.maxBatchBytes = maxBatchBytes;
     config.noEncrypt = noEncrypt;
     config.checkpointInterval = 1000;
+    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
     node = hpplite_node_create(&config);
     if (node && l1) {
         /* the DA limit is the contract's; the mock stands in for it */

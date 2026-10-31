@@ -344,9 +344,10 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->chainIdSource = 2;
     }
 
-    /* L1 network alias */
+    /* L1 network alias; "local" is no chain at all, batches finalized here (#38) */
     if (get_uri_param(uri, HPPLITE_URI_L1, buf, sizeof(buf))) {
-        const HppliteNetworkAlias *network = hpplite_da_lookup_network(buf);
+        const HppliteNetworkAlias *network = strcasecmp(buf, "local") == 0 ? NULL : hpplite_da_lookup_network(buf);
+        if (strcasecmp(buf, "local") == 0) cfg->localOnly = 1;
         if (network) {
             cfg->chainId = network->chainId;
             cfg->chainIdSource = 2;
@@ -466,9 +467,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         cfg->chainIdSource = 2;
     }
 
-    /* L1 network alias */
+    /* L1 network alias; "local" is no chain at all, batches finalized here (#38) */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_L1);
-    if (val) {
+    if (val && strcasecmp(val, "local") == 0) cfg->localOnly = 1;
+    if (val && !cfg->localOnly) {
         uint64_t chainId = hpplite_da_resolve_alias(val);
         if (chainId > 0) {
             cfg->chainId = chainId;

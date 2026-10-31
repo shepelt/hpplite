@@ -62,6 +62,7 @@ typedef struct HppliteNodeConfig {
     int determinismWarn;            /* Warn about non-deterministic SQL instead of refusing it */
     int captureText;                /* Capture statements, as v0.1 (default 0: rows, #19) */
     int captureSource;              /* ...2 when a URI said so: HPPLITE_CAPTURE does not override it (#80) */
+    int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
@@ -109,6 +110,7 @@ typedef struct HppliteNode {
     int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
     char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
     int warnedNoL1;                 /* "L1 requested but not connected" said once */
+    int warnedNoChain;              /* "no chain configured, the log is kept" said once (#38) */
 
     /* Checkpoint tracking */
     uint64_t lastCheckpointHeight;

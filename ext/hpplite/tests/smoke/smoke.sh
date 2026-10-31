@@ -28,7 +28,7 @@ done
 if command -v sqlite3 >/dev/null 2>&1 \
    && ! sqlite3 :memory: ".load /nonexistent/module" 2>&1 | grep -q "unknown command"; then
     key=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
-    uri="file:$dir/cli.db?hpplite=on&privkey=0x$key&datadir=$dir"
+    uri="file:$dir/cli.db?hpplite=on&l1=local&privkey=0x$key&datadir=$dir"
     mod=${ext%.*}
     out=$(sqlite3 -batch -bail <<SQL
 .load $mod

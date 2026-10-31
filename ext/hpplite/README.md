@@ -104,7 +104,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `hpplite` | Yes | Set to `on` to enable |
-| `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory` |
+| `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory`. `local`: no chain, batches are finalized in the file and the history is kept nowhere (#38) |
 | `rpc` | Yes* | L1 RPC URL (if no `l1`) |
 | `factory` | Yes* | Factory contract address (if no `l1`) |
 | `contract` | No | Connect to an existing rollup instead of using the factory |
@@ -402,7 +402,8 @@ changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
-`local` (no chain configured), `disconnected` (a chain was configured but
+`unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
+finalized here, no history kept), `disconnected` (a chain was configured but
 is not reachable), `error` (sync stopped: the history and the file do not
 agree), `stopped`. `last_error` is the last failure said on stderr - a post
 not confirmed, a batch that cannot be decoded or replayed, a root mismatch,
@@ -585,8 +586,11 @@ reaches HPPLite before open, in order of precedence:
 
 Without a key the database works and keeps capturing, but nothing is posted
 (`hpplite_status.keyed = 0`): with an L1 configured the batches stay pending
-until a key arrives; with no L1 configured at all (`hpplite=on` alone) batches
-are finalized locally, which is a development mode, not a backup. `encrypt=off`
+until a key arrives. With no L1 configured at all (`hpplite=on` alone) the
+log is kept pending too - the first flush says so once on stderr, and
+`hpplite_status.state` is `unposted` - and posts in full once `l1=` names a
+chain. `l1=local` is the explicit development mode: batches are finalized in
+the file and the history is kept nowhere (#38). `encrypt=off`
 is the only way to post plaintext and must be explicit. A URI with
 `hpplite=on` that cannot be honoured (unreadable key file, malformed key)
 makes `sqlite3_open_v2()` fail rather than open without capture. v0.2 splits the roles (owner / sequencer / data /

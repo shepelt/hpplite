@@ -9,7 +9,7 @@ import sqlite3, sys, os
 
 ext, d = sys.argv[1], sys.argv[2]
 key = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-uri = f"file:{d}/py.db?hpplite=on&privkey=0x{key}&datadir={d}"
+uri = f"file:{d}/py.db?hpplite=on&l1=local&privkey=0x{key}&datadir={d}"
 for f in os.listdir(d):
     if f.startswith("py.db"):
         os.unlink(os.path.join(d, f))

@@ -21,7 +21,7 @@ static int tests_run = 0, tests_passed = 0;
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
-#define DB_URI "file:/tmp/hpplite_test_loadable.db?hpplite=on&datadir=/tmp/hpplite_test_loadable"
+#define DB_URI "file:/tmp/hpplite_test_loadable.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_loadable"
 
 static sqlite3_int64 scalar(sqlite3 *db, const char *sql, int *ok) {
     sqlite3_stmt *stmt;

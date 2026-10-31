@@ -115,6 +115,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
+    node->config.localOnly = config->localOnly;
     /* the environment chooses for any node whose configuration did not say
     ** (every suite runs in both modes); a URI's capture= stands (#80) */
     if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
@@ -1080,6 +1081,20 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                             "(check the key and the RPC endpoint)");
             node->warnedNoL1 = 1;
         }
+        return 0;
+    }
+
+    if (!node->l1 && !node->config.localOnly) {
+        /* No chain at all. Finalizing here would delete the log - the one
+        ** thing this is for - with nothing anywhere else. Keep it until a
+        ** chain is configured; l1=local is the explicit throw-away mode (#38). */
+        if (!node->warnedNoChain) {
+            fprintf(stderr, "hpplite: no chain configured: the log is kept pending (%lld rows) until l1= names one; "
+                            "l1=local finalizes batches locally and keeps no history\n",
+                    (long long)hpplite_pending_count(ctx));
+            node->warnedNoChain = 1;
+        }
+        *pMore = 0;
         return 0;
     }
 

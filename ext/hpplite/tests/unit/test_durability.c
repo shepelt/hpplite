@@ -65,6 +65,7 @@ static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determ
     config.hasPrivkey = 1;
     config.dataDir = DIR;
     config.dbPath = (char *)dbPath;
+    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
     node = hpplite_node_create(&config);
     if (node && l1) {
         hpplite_node_set_l1(node, l1);
@@ -458,7 +459,7 @@ static void test_divergence_refused(void) {
 static void test_timer_vs_open_transaction(void) {
     TEST("background flush never sees or disturbs an open transaction");
     reset_dir();
-    sqlite3 *db = hpplite_open("file:" DIR "/timer.db?hpplite=on&interval=100ms&datadir=" DIR);
+    sqlite3 *db = hpplite_open("file:" DIR "/timer.db?hpplite=on&l1=local&interval=100ms&datadir=" DIR);
     if (!db) FAIL("open");
     HppliteCtx *ctx = hpplite_context(db);
     char *err = NULL;
@@ -490,6 +491,7 @@ static void test_checkpoint_persists(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "cp"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/cp.db"; config.checkpointInterval = 2;
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     HppliteNode *n = hpplite_node_create(&config);
     if (!n) FAIL("open");
     hpplite_node_set_l1(n, l1); hpplite_node_start(n);
@@ -498,6 +500,7 @@ static void test_checkpoint_persists(void) {
     if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("flush should have submitted the checkpoint");
     hpplite_node_destroy(n);
 
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     n = hpplite_node_create(&config);
     if (!n) FAIL("reopen");
     hpplite_node_set_l1(n, l1);
@@ -509,6 +512,7 @@ static void test_checkpoint_persists(void) {
     ** still reach the next checkpoint - the count is derived from heights */
     hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL); hpplite_node_flush_batch(n);
     hpplite_node_destroy(n);
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     n = hpplite_node_create(&config);
     if (!n) FAIL("reopen 2");
     hpplite_node_set_l1(n, l1);
@@ -759,6 +763,7 @@ static void test_encryption_default(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "stranger"; memcpy(config.privkey, PRIVKEY, 32); config.privkey[31] ^= 1;
     config.hasPrivkey = 1; config.dataDir = DIR; config.dbPath = DIR "/enc_x.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     HppliteNode *x = hpplite_node_create(&config);
     if (!x) FAIL("open stranger");
     hpplite_node_set_l1(x, l1);
@@ -873,6 +878,7 @@ static void test_capture_corner_cases(void) {
     config.nodeId = "corner"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/corner.db"; config.checkpointInterval = 1;
     config.determinismWarn = 1;    /* this case checks detection, not refusal */
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     HppliteNode *n = hpplite_node_create(&config);
     if (!n) FAIL("open");
     hpplite_node_set_l1(n, l1); hpplite_node_start(n);
@@ -945,6 +951,7 @@ static void test_memory_no_timer(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "mem"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = ":memory:"; config.batchIntervalMs = 1;
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     HppliteNode *n = hpplite_node_create(&config);
     if (!n) FAIL("open");
     hpplite_node_set_l1(n, l1);
@@ -967,7 +974,7 @@ static void test_close_busy_keeps_capturing(void) {
     reset_dir();
     sqlite3 *db = NULL;
     sqlite3_stmt *leak = NULL;
-    const char *uri = "file:" DIR "/busy.db?hpplite=on&privkey=0x" PRIVKEY_HEX "&datadir=" DIR;
+    const char *uri = "file:" DIR "/busy.db?hpplite=on&l1=local&privkey=0x" PRIVKEY_HEX "&datadir=" DIR;
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("open");
     sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
     sqlite3_prepare_v2(db, "SELECT x FROM t", -1, &leak, NULL);
@@ -1052,6 +1059,7 @@ static void test_second_connection_is_follower(void) {
     memset(&config, 0, sizeof(config));
     config.nodeId = "b"; memcpy(config.privkey, PRIVKEY, 32); config.hasPrivkey = 1;
     config.dataDir = DIR; config.dbPath = DIR "/pool.db";
+    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
     HppliteNode *b = hpplite_node_create(&config);
     if (!b) FAIL("open b");
     if (!b->follower || a->follower) FAIL("b should be the follower, a the sequencer");
