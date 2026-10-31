@@ -90,8 +90,8 @@ static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
     return v;
 }
 
-enum { F_NONE, F_SUBMIT_FAILS, F_CONFIRMATION_LOST, F_TX_PENDING, F_CLAIM_REVERTS, F_COMMIT_FAILS, F_REORG, F_LEASE_EXPIRES, F_COUNT };
-static const char *fault_name[] = { "none", "submit fails", "confirmation lost", "tx pending", "claim reverts", "commit fails", "reorg", "lease expires" };
+enum { F_NONE, F_SUBMIT_FAILS, F_CONFIRMATION_LOST, F_TX_PENDING, F_CLAIM_REVERTS, F_COMMIT_FAILS, F_REORG, F_LEASE_EXPIRES, F_RPC_DOWN, F_COUNT };
+static const char *fault_name[] = { "none", "submit fails", "confirmation lost", "tx pending", "claim reverts", "commit fails", "reorg", "lease expires", "rpc down" };
 
 static void arm(HppliteL1 *l1, HppliteNode *n, int f) {
     uint64_t last = 0, total = 0;
@@ -111,6 +111,7 @@ static void arm(HppliteL1 *l1, HppliteNode *n, int f) {
             if (last >= 2) hpplite_l1_mock_truncate(l1, last - 1 - (rnd() % 2 ? 1 : 0));
             break;
         case F_LEASE_EXPIRES:     hpplite_l1_mock_advance_time(l1, 400); n->leaseRecheckAt = 0; break;
+        case F_RPC_DOWN:          hpplite_l1_mock_set_rpc_down(l1, 1); break;
         default: break;
     }
 }
@@ -119,6 +120,7 @@ static void disarm(HppliteL1 *l1) {
     hpplite_l1_mock_set_lose_confirmation(l1, 0);
     hpplite_l1_mock_set_tx_pending(l1, 0);
     hpplite_l1_mock_set_claim_reverts(l1, 0);
+    hpplite_l1_mock_set_rpc_down(l1, 0);
     hpplite_test_fail_commits = 0;
 }
 

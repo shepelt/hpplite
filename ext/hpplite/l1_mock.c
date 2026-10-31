@@ -64,6 +64,7 @@ struct HppliteL1 {
     int loseConfirmation;        /* Test hook: store but report failure */
     int txPending;               /* Test hook: wait_for_tx never confirms */
     int claimReverts;            /* Test hook: a claim is mined and reverts (hash returned, no lease) */
+    int rpcDown;                 /* Test hook: every call fails (the endpoint is unreachable) */
     int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
     size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
     size_t maxTxBytes;           /* Test hook: the RPC's transaction size limit (0 = none) */
@@ -308,6 +309,7 @@ void hpplite_l1_disconnect(HppliteL1 *l1) {
 ** Get system configuration
 */
 HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1) return NULL;
 
     HppliteSystemConfig *config = sqlite3_malloc(sizeof(HppliteSystemConfig));
@@ -336,6 +338,7 @@ void hpplite_l1_system_config_free(HppliteSystemConfig *config) {
 ** Get current L1 state
 */
 HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1) return NULL;
 
     HppliteL1State *state = sqlite3_malloc(sizeof(HppliteL1State));
@@ -446,6 +449,7 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
 ** Release the lease (owner expires it)
 */
 char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
     if (!instanceId) {
         /* forceExpireLease(): onlyOwner */
@@ -480,6 +484,7 @@ char *hpplite_l1_claim_sequencer(
     HppliteL1 *l1,
     const unsigned char instanceId[32]
 ) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId) return NULL;
     if (!l1->hasPrivkey) return NULL;
     if (memcmp(l1->sequencer, l1->myAddress, 20) != 0) return NULL;   /* "Not the sequencer" */
@@ -520,6 +525,7 @@ char *hpplite_l1_renew_lease(
     HppliteL1 *l1,
     const unsigned char instanceId[32]
 ) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId) return NULL;
     if (!l1->hasPrivkey) return NULL;
 
@@ -553,6 +559,7 @@ char *hpplite_l1_submit_checkpoint(
     const HppliteCheckpoint *checkpoint,
     const unsigned char instanceId[32]
 ) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !checkpoint || !instanceId) return NULL;
 
     /* onlyActiveSequencer(instanceId): the holder's wallet and instance, while active */
@@ -647,6 +654,10 @@ char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     l1->checkpointInterval = interval;
     mockSaveState(l1);
     return sqlite3_mprintf("0x%08xckpt%08x", (unsigned int)l1->currentBlock, (unsigned int)interval);
+}
+
+void hpplite_l1_mock_set_rpc_down(HppliteL1 *l1, int down) {
+    if (l1) l1->rpcDown = down;
 }
 
 void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert) {
@@ -851,6 +862,7 @@ char *hpplite_l1_submit_batch(
     const uint8_t *data,
     size_t data_len
 ) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
     l1->lastOversized = 0;
@@ -904,6 +916,7 @@ uint8_t *hpplite_l1_get_batch(
     uint64_t height,
     size_t *data_len_out
 ) {
+    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || height == 0 || height > MAX_BATCHES) {
         if (data_len_out) *data_len_out = 0;
         return NULL;
@@ -953,6 +966,7 @@ int hpplite_l1_get_da_state(
     uint64_t *total_batches,
     uint8_t latest_batch_hash[32]
 ) {
+    if (l1 && l1->rpcDown) return -1;   /* the endpoint is down */
     if (!l1) {
         if (last_batch_height) *last_batch_height = 0;
         if (total_batches) *total_batches = 0;
