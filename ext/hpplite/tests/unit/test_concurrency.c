@@ -316,7 +316,13 @@ static void test_mixed_threads_and_processes(void) {
     for (int i = 0; i < nthreads; i++) { if (i > 0) pthread_join(th[i], NULL); failed += w[i].failed; }
     for (int p = 0; p < nprocs; p++) {
         int status = 0; waitpid(pids[p], &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) childFailed++;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            /* say how it ended: 2 = could not open (the write lock past its
+            ** timeout under load), 1 = statements failed, a signal = crashed (#94) */
+            childFailed++;
+            if (WIFEXITED(status)) printf("[process %d exited %d] ", p, WEXITSTATUS(status));
+            else printf("[process %d killed by signal %d] ", p, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        }
     }
     f.stop = 1; pthread_join(tf, NULL);
     for (int i = 1; i < nthreads; i++) hpplite_node_destroy(conn[i]);
@@ -326,10 +332,10 @@ static void test_mixed_threads_and_processes(void) {
     hpplite_node_destroy(a);
     hpplite_l1_disconnect(l1);
     printf("(%d flushes) ", f.flushes);
-    if (failed) FAILF("%d thread statements failed", failed);
-    if (childFailed) FAILF("%d processes had failures", childFailed);
-    if (left) FAIL("pending left");
-    if (why) FAIL(why);
+    /* everything that went wrong, not the first thing (#94) */
+    if (failed || childFailed || left || why)
+        FAILF("%d thread statements failed, %d processes had failures, %d pending left%s%s",
+              failed, childFailed, left, why ? ", " : "", why ? why : "");
     PASS();
 }
 
@@ -358,8 +364,13 @@ static int holder_main(char **argv) {
 
 /* a writer process (spawn_writer): captures into the shared log, no L1 of its own */
 static int writer_main(char **argv) {
-    HppliteNode *c = open_node(argv[2], NULL);
-    if (!c) return 1;
+    HppliteNode *c = NULL;
+    /* the open needs the write lock too, under the node's 5 s busy timeout:
+    ** under load (ctest -j4, the parent's flusher, the other writers) one
+    ** contender can starve past it - the open is tried again, as the
+    ** statements get a longer timeout below (#94) */
+    for (int k = 0; k < 5 && !c; k++) c = open_node(argv[2], NULL);
+    if (!c) { fprintf(stderr, "writer %s: could not open the database (the write lock, five times)\n", argv[3]); return 2; }
     sqlite3_busy_timeout(c->db, 20000);
     Writer w = { c->db, argv[3], atoi(argv[4]), 0 };
     if (strcmp(argv[1], "--mixed") == 0) write_mixed(&w); else write_autocommit(&w);
