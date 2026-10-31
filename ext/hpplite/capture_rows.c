@@ -553,7 +553,7 @@ int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
                               SQLITE_PREPARE_PERSISTENT, &pCtx->pRowsLockStmt, NULL) != SQLITE_OK) {
       pCtx->pRowsLockStmt = NULL;
     }
-    rc = pCtx->pRowsLockStmt ? sqlite3_step(pCtx->pRowsLockStmt) : SQLITE_ERROR;
+    rc = pCtx->pRowsLockStmt ? hpplite_step_write(pCtx->pRowsLockStmt) : SQLITE_ERROR;
     if (pCtx->pRowsLockStmt) sqlite3_reset(pCtx->pRowsLockStmt);
     pCtx->bInternal = savedInternal;
     if (rc != SQLITE_DONE) return 0;      /* no lock (busy past the timeout): text, as v1 - its own insert waits */
@@ -771,7 +771,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
     if (rc == SQLITE_OK) {
       decBind(&d, st, 1);
       sqlite3_bind_text(st, 2, zTab, -1, SQLITE_STATIC);
-      rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      rc = hpplite_step_write(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
       sqlite3_finalize(st);
       st = NULL;
     }
@@ -781,7 +781,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
       if (rc == SQLITE_OK) {
         decBind(&d, st, 1);
         sqlite3_bind_text(st, 2, zTab, -1, SQLITE_STATIC);
-        rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+        rc = hpplite_step_write(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
         sqlite3_finalize(st);
       }
     }
@@ -872,7 +872,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
   }
   if (rc == SQLITE_OK && d.bad) { *pzErr = sqlite3_mprintf("malformed record for %s", zTab); rc = SQLITE_CORRUPT; }
   if (rc == SQLITE_OK) {
-    rc = sqlite3_step(st);
+    rc = hpplite_step_write(st);
     rc = rc == SQLITE_DONE ? SQLITE_OK : rc;
     if (rc != SQLITE_OK) *pzErr = sqlite3_mprintf("%s: %s", zSql, sqlite3_errmsg(db));
   } else if (!*pzErr) {

@@ -656,6 +656,59 @@ static void test_vacuum_logged(void) {
     PASS();
 }
 
+/* PRAGMA count_changes=1 (deprecated, supported): every INSERT/UPDATE/DELETE
+** prepared on the connection returns its change count as a row - HPPLite's
+** own writes there too, which then looked failed: every write was refused.
+** Found by SQLite's fkey2.test run with HPPLite on every connection. */
+static void test_count_changes(void) {
+    TEST("PRAGMA count_changes=1: writes run, are captured, and replay");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/cc.db", l1);
+    if (!n) FAIL("open");
+    int ok = sqlite3_exec(n->db, "PRAGMA count_changes = 1; CREATE TABLE t(id INTEGER PRIMARY KEY, v);"
+                                 "INSERT INTO t(v) VALUES('a'), ('b'); UPDATE t SET v = v || '!'; DELETE FROM t WHERE id = 1;"
+                                 "BEGIN; INSERT INTO t(v) VALUES('c'); COMMIT; VACUUM", NULL, NULL, NULL) == SQLITE_OK;
+    while (hpplite_node_pending_count(n) > 0 && hpplite_node_flush_batch(n) > 0) { }
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    hpplite_node_destroy(n);
+    HppliteNode *r = open_node(DIR "/cc_replica.db", l1);
+    if (!r) FAIL("replica");
+    hpplite_node_get_state_root(r, rb);
+    int rows = count_rows(r->db, "t");
+    hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    if (!ok) FAIL("a write was refused");
+    if (rows != 2 || memcmp(ra, rb, 32) != 0) FAIL("replica differs");
+    PASS();
+}
+
+/* The file stays in WAL: leaving it failed as "database is locked" (the
+** bookkeeping connection holds it), found by SQLite's changes.test */
+static void test_journal_mode_kept(void) {
+    TEST("leaving WAL is refused with the reason; reading the mode and WAL itself are fine");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/jm.db", l1);
+    if (!n) FAIL("open");
+    int readOk = sqlite3_exec(n->db, "PRAGMA journal_mode", NULL, NULL, NULL) == SQLITE_OK;
+    int walOk = sqlite3_exec(n->db, "PRAGMA journal_mode = WAL", NULL, NULL, NULL) == SQLITE_OK;
+    int offRc = sqlite3_exec(n->db, "PRAGMA journal_mode = DELETE", NULL, NULL, NULL);
+    char why[256] = "";
+    sqlite3_stmt *q;
+    if (sqlite3_prepare_v2(n->db, "SELECT last_refusal FROM hpplite_status", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_text(q, 0)) snprintf(why, sizeof(why), "%s", sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+    }
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (!readOk || !walOk) FAIL("reading the mode or setting WAL failed");
+    if (offRc != SQLITE_AUTH) FAILF("leaving WAL: rc %d, want SQLITE_AUTH", offRc);
+    if (!strstr(why, "WAL")) FAILF("the refusal does not say why: %s", why);
+    PASS();
+}
+
 /* The timer's bookkeeping commit can land between an application
 ** transaction's read and its write however the flags are checked at its
 ** start: stress it with the timer thread flushing continuously */
@@ -1226,6 +1279,8 @@ int main(void) {
     test_bookkeeping_waits_for_app_transaction();
     test_zero_row_insert_into_autoincrement();
     test_vacuum_logged();
+    test_count_changes();
+    test_journal_mode_kept();
     test_read_then_write_under_timer();
     test_no_op_rows_vs_adoption();
     test_wrong_height_batch();

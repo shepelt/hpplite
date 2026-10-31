@@ -167,6 +167,15 @@ void hpplite_internal_open_begin(void);
 void hpplite_internal_open_end(void);
 int hpplite_internal_open_active(void);
 
+/* Step a write of HPPLite's to its end. With PRAGMA count_changes=1 on the
+** connection (deprecated, still supported) an INSERT/UPDATE/DELETE returns
+** its change count as a row before SQLITE_DONE */
+static inline int hpplite_step_write(sqlite3_stmt *pStmt) {
+  int rc;
+  while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {}
+  return rc;
+}
+
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
 /* ...for a connection that will capture rows: a SQLite whose sqlite3_expanded_sql()
 ** cuts bound values (better-sqlite3) is accepted, its text statements may bind nothing (#62) */

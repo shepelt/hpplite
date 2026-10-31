@@ -613,7 +613,7 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   }
   if (pCtx->pUnlogStmt) {
     sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->lastLogId);
-    sqlite3_step(pCtx->pUnlogStmt);
+    hpplite_step_write(pCtx->pUnlogStmt);
     sqlite3_reset(pCtx->pUnlogStmt);
     /* changes() now says 1 (our DELETE); the application's statement changed
     ** nothing - that is why its row went. A zero-row UPDATE says 0 again. */
@@ -623,7 +623,7 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
       pCtx->pZeroStmt = NULL;
     }
     if (pCtx->pZeroStmt) {
-      sqlite3_step(pCtx->pZeroStmt);
+      hpplite_step_write(pCtx->pZeroStmt);
       sqlite3_reset(pCtx->pZeroStmt);
     }
   }
@@ -951,6 +951,17 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       ** mode each statement ran in (#52); foreign keys are read from the
       ** connection flags, recursive_triggers only after it was touched */
       if (z1 && sqlite3_stricmp(z1, "recursive_triggers") == 0) pCtx->bRecTrigSeen = 1;
+      /* The file stays in WAL: HPPLite's bookkeeping connection reads beside
+      ** the application, and a journal that is off or truncated would void
+      ** the crash safety the log relies on. Leaving WAL failed anyway, as
+      ** "database is locked" (the bookkeeping connection holds it open):
+      ** say why instead. Reading the mode is fine. */
+      if (z1 && z2 && sqlite3_stricmp(z1, "journal_mode") == 0 && sqlite3_stricmp(z2, "wal") != 0
+          && pCtx->bkDb != pCtx->db) {
+        pCtx->zDenyWhy = "HPPLite keeps the database in WAL mode (journal_mode cannot be changed)";
+        pCtx->nAuthDenied++;
+        return SQLITE_DENY;
+      }
       return SQLITE_OK;
     case SQLITE_FUNCTION:
       /* Checked when a write is captured (functionVerdict), not here: a
@@ -1301,7 +1312,7 @@ static void logVacuum(HppliteCtx *pCtx) {
   pCtx->bInternal = 1;
   if (sqlite3_prepare_v2(pCtx->db, "INSERT INTO _hpplite_pending(txn, sql, mode, now) VALUES(0, 'VACUUM', 0, 0)",
                          -1, &q, NULL) == SQLITE_OK) {
-    if (sqlite3_step(q) != SQLITE_DONE) pCtx->nLogErrors++;
+    if (hpplite_step_write(q) != SQLITE_DONE) pCtx->nLogErrors++;
   } else {
     pCtx->nLogErrors++;
   }
@@ -1572,7 +1583,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     {
       /* our row's id is not the application's last_insert_rowid() */
       sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
-      rc = sqlite3_step(pCtx->pLogStmt);
+      rc = hpplite_step_write(pCtx->pLogStmt);
       if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
     }
@@ -3659,6 +3670,10 @@ static int hpplite_auto_init(
     const char *filename = sqlite3_db_filename(db, "main");
     if (!filename) return SQLITE_OK;
     if (hpplite_internal_open_active()) return SQLITE_OK;   /* our own bookkeeping connection */
+    /* A read-only connection (mode=ro, SQLITE_OPEN_READONLY, a file without
+    ** write permission) writes nothing to capture: it opens as it would
+    ** without HPPLite - a reader beside the application must not fail */
+    if (sqlite3_db_readonly(db, "main") == 1) return SQLITE_OK;
 
     /* Enabled by the URI (hpplite=on), or - for drivers that cannot open
     ** URIs - by HPPLITE_FILES naming this file (#55); a URI that says

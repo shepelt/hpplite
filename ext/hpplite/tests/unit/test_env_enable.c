@@ -151,6 +151,31 @@ static void test_truncating_sqlite_rows(void) {
     PASS();
 }
 
+/* A read-only connection writes nothing to capture: it opens as it would
+** without HPPLite (it failed: "cannot start", found by SQLite's delete.test) */
+static void test_read_only_open(void) {
+    TEST("a read-only connection to a captured file opens and reads (HPPLite stands aside)");
+    reset_dir();
+    sqlite3 *w = NULL, *r = NULL;
+    int rc = sqlite3_open_v2("file:" DIR "/ro.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &w,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    if (rc != SQLITE_OK) FAIL("writer open");
+    sqlite3_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    rc = sqlite3_open_v2("file:" DIR "/ro.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &r,
+                         SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+    int n = -1;
+    sqlite3_stmt *q;
+    if (rc == SQLITE_OK && sqlite3_prepare_v2(r, "SELECT count(*) FROM t", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW) n = sqlite3_column_int(q, 0);
+        sqlite3_finalize(q);
+    }
+    sqlite3_close(r);
+    sqlite3_close(w);
+    if (rc != SQLITE_OK) FAIL("read-only open refused");
+    if (n != 1) FAIL("read-only connection cannot read");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite enabled from the environment (#55) ===\n");
     test_plain_path_enabled();
@@ -158,6 +183,7 @@ int main(void) {
     test_uri_still_wins();
     test_truncating_sqlite_refused();
     test_truncating_sqlite_rows();
+    test_read_only_open();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
