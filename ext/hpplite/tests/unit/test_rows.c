@@ -510,6 +510,36 @@ static void test_wide_table(void) {
     PASS();
 }
 
+/* Columns named rowid, oid or _rowid_ shadow the rowid in trigger and
+** replay SQL; a WITHOUT ROWID table with one looks like a rowid table to a
+** "SELECT rowid" probe (#72) */
+static void test_rowid_named_columns(void) {
+    TEST("columns named rowid / oid / _rowid_ do not stand in for the rowid");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/rid.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(rowid TEXT, x)");
+    exec(w.db, "CREATE TABLE wr(a, rowid TEXT, PRIMARY KEY(a)) WITHOUT ROWID");
+    exec(w.db, "CREATE TABLE o(oid, y)");
+    exec(w.db, "CREATE TABLE all3(rowid, oid, _rowid_)");                 /* no name left: text */
+    exec(w.db, "INSERT INTO t VALUES('a', 1), ('a', 2), ('b', 3)");
+    exec(w.db, "DELETE FROM t WHERE x = 2");                              /* one row, by its real rowid */
+    exec(w.db, "UPDATE t SET rowid = 'c' WHERE x = 3");                   /* the column, not the rowid */
+    exec(w.db, "INSERT INTO wr VALUES(1, 'r1'), (2, 'r2')");
+    exec(w.db, "UPDATE wr SET rowid = 'R2' WHERE a = 2");
+    exec(w.db, "DELETE FROM wr WHERE a = 1");
+    exec(w.db, "INSERT INTO o VALUES('p', 1), ('p', 2)");
+    exec(w.db, "DELETE FROM o WHERE y = 1");
+    exec(w.db, "INSERT INTO all3 VALUES(1, 2, 3), (1, 2, 4)");
+    exec(w.db, "DELETE FROM all3 WHERE _rowid_ = 3");
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/rid_r.db", &nr, &nt);
+    close_writer(&w);
+    if (why) FAIL(why);
+    if (nr != 12) FAILF("%d records, want 12", nr);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -541,6 +571,7 @@ int main(void) {
     test_temp_table_shadow();
     test_integer_primary_key_desc();
     test_wide_table();
+    test_rowid_named_columns();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

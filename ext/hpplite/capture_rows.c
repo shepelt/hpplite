@@ -174,6 +174,8 @@ typedef struct Tab {
   int nCol; char **azCol;       /* stored columns, in order */
   int nKey; char **azKey;       /* key columns (WITHOUT ROWID); 0 = rowid */
   int ipk;                      /* rowid table whose INTEGER PRIMARY KEY is the rowid: its index, else -1 */
+  const char *zRowid;           /* the rowid's name that no column takes: rowid, _rowid_ or oid; NULL when
+                                ** all three are columns (the table cannot be addressed by row, #72) */
 } Tab;
 
 static void tabFree(Tab *t) {
@@ -187,14 +189,15 @@ static void tabFree(Tab *t) {
 static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
   sqlite3_stmt *q = NULL;
   char *z;
-  int rc, nPk = 0, i, hasRowid;
+  int rc, nPk = 0, i, hasRowid = 0;
   memset(t, 0, sizeof(*t));
   t->ipk = -1;
   t->zName = sqlite3_mprintf("%s", zName);
-  /* a WITHOUT ROWID table has no rowid to select. main's table: a TEMP
-  ** table of the same name would answer first for an unqualified name (#67) */
-  z = sqlite3_mprintf("SELECT rowid FROM main.\"%w\" LIMIT 0", zName);
-  hasRowid = sqlite3_prepare_v2(db, z, -1, &q, NULL) == SQLITE_OK;
+  /* WITHOUT ROWID or not, as the schema says (a column named rowid would
+  ** make "SELECT rowid" succeed on either, #72). main's table: a TEMP table
+  ** of the same name would answer first for an unqualified name (#67) */
+  z = sqlite3_mprintf("SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = %Q", zName);
+  if (sqlite3_prepare_v2(db, z, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) hasRowid = sqlite3_column_int(q, 0) == 0;
   sqlite3_finalize(q); q = NULL;
   sqlite3_free(z);
   z = sqlite3_mprintf("SELECT name, type, pk, hidden FROM pragma_table_xinfo(%Q, 'main') ORDER BY cid", zName);
@@ -245,6 +248,15 @@ static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
     }
     sqlite3_free(azPkByOrder); sqlite3_free(aPkOrder);
   }
+  if (hasRowid) {
+    /* the rowid under a name no column shadows */
+    static const char *aAlias[] = { "rowid", "_rowid_", "oid" };
+    int a;
+    for (a = 0; a < 3 && !t->zRowid; a++) {
+      for (i = 0; i < t->nCol && sqlite3_stricmp(t->azCol[i], aAlias[a]) != 0; i++) {}
+      if (i == t->nCol) t->zRowid = aAlias[a];
+    }
+  }
   return SQLITE_OK;
 }
 
@@ -252,7 +264,7 @@ static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
 static char *keyList(const Tab *t, const char *zRow) {
   char *z = NULL;
   int i;
-  if (t->nKey == 0) return sqlite3_mprintf("%s.rowid", zRow);
+  if (t->nKey == 0) return sqlite3_mprintf("%s.%s", zRow, t->zRowid);
   for (i = 0; i < t->nKey; i++) {
     char *n = sqlite3_mprintf("%z%s%s.\"%w\"", z, i ? ", " : "", zRow, t->azKey[i]);
     z = n;
@@ -262,7 +274,7 @@ static char *keyList(const Tab *t, const char *zRow) {
 
 static int buildTriggers(HppliteCtx *pCtx, const Tab *t, int k) {
   char *zNewKey = keyList(t, "new"), *zOldKey = keyList(t, "old");
-  char *zIns = NULL, *zUpd = NULL, *zSql;
+  char *zIns = NULL, *zUpd = NULL, *zSql, *zNewRowid = t->nKey ? NULL : sqlite3_mprintf("new.%s", t->zRowid);
   int i, rc, nKey = t->nKey ? t->nKey : 1;
   for (i = 0; i < t->nCol; i++) {
     zIns = sqlite3_mprintf("%z, new.\"%w\"", zIns, t->azCol[i]);
@@ -283,11 +295,11 @@ static int buildTriggers(HppliteCtx *pCtx, const Tab *t, int k) {
     " INSERT INTO _hpplite_pending(txn, sql, mode, now, tbl, op, rec)"
     "  VALUES(hpplite_grp(), '', hpplite_mode(), 0, %Q, %d, hpplite_rec(%s));"
     " SELECT hpplite_note(last_insert_rowid()); END;",
-    k, t->zName, t->zName, HPPLITE_ROW_INSERT, t->nKey ? "" : "new.rowid", t->nKey ? (zIns ? zIns + 2 : "") : (zIns ? zIns : ""),
+    k, t->zName, t->zName, HPPLITE_ROW_INSERT, t->nKey ? "" : zNewRowid, t->nKey ? (zIns ? zIns + 2 : "") : (zIns ? zIns : ""),
     k, t->zName, t->zName, HPPLITE_ROW_UPDATE, nKey, zOldKey, zNewKey, zUpd ? zUpd : "",
     k, t->zName, t->zName, HPPLITE_ROW_DELETE, zOldKey);
   rc = zSql ? sqlite3_exec(pCtx->db, zSql, NULL, NULL, NULL) : SQLITE_NOMEM;
-  sqlite3_free(zSql); sqlite3_free(zIns); sqlite3_free(zUpd); sqlite3_free(zNewKey); sqlite3_free(zOldKey);
+  sqlite3_free(zSql); sqlite3_free(zIns); sqlite3_free(zUpd); sqlite3_free(zNewKey); sqlite3_free(zOldKey); sqlite3_free(zNewRowid);
   return rc;
 }
 
@@ -445,6 +457,11 @@ static int rebuild(HppliteCtx *pCtx) {
           if (!textOnlyHas(pCtx->zRowsTextOnly, t.zName))
             fprintf(stderr, "hpplite: table %s has %d columns, past this SQLite's function argument limit (%d)"
                     " for row capture; its writes are logged as text\n", t.zName, t.nCol, argLimit);
+          rc = textOnlyAdd(&zSkip, &nSkip, t.zName);
+        } else if (!t.nKey && !t.zRowid) {
+          if (!textOnlyHas(pCtx->zRowsTextOnly, t.zName))
+            fprintf(stderr, "hpplite: table %s names columns rowid, _rowid_ and oid, leaving no name for its rows'"
+                    " rowid; its writes are logged as text\n", t.zName);
           rc = textOnlyAdd(&zSkip, &nSkip, t.zName);
         } else {
           rc = buildTriggers(pCtx, &t, i);
@@ -781,7 +798,7 @@ static void decSkip(Dec *d) {
 static char *whereKey(const Tab *t, int firstParam) {
   char *z = NULL;
   int i;
-  if (t->nKey == 0) return sqlite3_mprintf("rowid = ?%d", firstParam);
+  if (t->nKey == 0) return sqlite3_mprintf("%s = ?%d", t->zRowid, firstParam);
   for (i = 0; i < t->nKey; i++) z = sqlite3_mprintf("%z%s\"%w\" = ?%d", z, i ? " AND " : "", t->azKey[i], firstParam + i);
   return z;
 }
@@ -826,6 +843,11 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
     tabFree(&t);
     return SQLITE_ERROR;
   }
+  if (!t.nKey && !t.zRowid) {
+    *pzErr = sqlite3_mprintf("record for table %s, whose rows have no name for their rowid (the writer logs its writes as text)", zTab);
+    tabFree(&t);
+    return SQLITE_ERROR;
+  }
   n = (int)decVarint(&d);
   if (op == HPPLITE_ROW_INSERT) {
     /* INSERT OR REPLACE with the writer's key: a REPLACE conflict on the
@@ -833,7 +855,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
     char *zCols = NULL, *zVals = NULL;
     int nWant = (t.nKey ? 0 : 1) + t.nCol, p = 1;
     if (n != nWant) { *pzErr = sqlite3_mprintf("insert record for %s: %d values, table has %d", zTab, n, nWant); tabFree(&t); return SQLITE_ERROR; }
-    if (!t.nKey && t.ipk < 0) { zCols = sqlite3_mprintf("rowid"); zVals = sqlite3_mprintf("?%d", p++); }
+    if (!t.nKey && t.ipk < 0) { zCols = sqlite3_mprintf("%s", t.zRowid); zVals = sqlite3_mprintf("?%d", p++); }
     for (i = 0; i < t.nCol; i++) {
       zCols = sqlite3_mprintf("%z%s\"%w\"", zCols, zCols ? ", " : "", t.azCol[i]);
       zVals = sqlite3_mprintf("%z%s?%d", zVals, zVals ? ", " : "", p++);
@@ -877,7 +899,7 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
       p = nKey + 1;
       /* a rowid table's key moving is a column (its INTEGER PRIMARY KEY, in
       ** the bitmap) or the bare rowid */
-      if (keyChanged && !t.nKey && t.ipk < 0) zSet = sqlite3_mprintf("rowid = ?%d", p++);
+      if (keyChanged && !t.nKey && t.ipk < 0) zSet = sqlite3_mprintf("%s = ?%d", t.zRowid, p++);
       for (i = 0; i < nCol; i++) if (bitmap[i / 8] & (1 << (i % 8))) zSet = sqlite3_mprintf("%z%s\"%w\" = ?%d", zSet, zSet ? ", " : "", t.azCol[i], p++);
       if (!zSet) { tabFree(&t); return SQLITE_OK; }   /* nothing changed */
       zWhere = whereKey(&t, 1);
