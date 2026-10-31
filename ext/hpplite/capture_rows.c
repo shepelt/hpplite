@@ -649,7 +649,8 @@ int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
     rc = pCtx->pRowsLockStmt ? hpplite_step_write(pCtx->pRowsLockStmt) : SQLITE_ERROR;
     if (pCtx->pRowsLockStmt) sqlite3_reset(pCtx->pRowsLockStmt);
     pCtx->bInternal = savedInternal;
-    if (rc != SQLITE_DONE) return 0;      /* no lock (busy past the timeout): text, as v1 - its own insert waits */
+    if ((rc & 0xff) == SQLITE_BUSY) return HPPLITE_ROWS_BUSY;   /* held elsewhere past the timeout (#92) */
+    if (rc != SQLITE_DONE) return 0;      /* no lock for another reason: text, as v1 - its own insert says why */
   }
   return schemaVersionOf(pCtx) == pCtx->rowsBuiltFor && tempSchemaVersionOf(pCtx) == pCtx->rowsTempBuiltFor;
 }

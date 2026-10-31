@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
 
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
@@ -957,6 +959,103 @@ static void test_verify_role(void) {
     PASS();
 }
 
+/* Another connection on the file holds the write lock until released (or
+** for ms when set); an ALTER first when asked, committed before the hold:
+** the writer's triggers are then stale for the schema its statement is
+** prepared on */
+struct holder { HppliteNode *f; int alter, ms; volatile int held, release; };
+static void *hold_lock(void *a) {
+    struct holder *h = a;
+    if (h->alter) sqlite3_exec(h->f->db, "BEGIN IMMEDIATE; ALTER TABLE t ADD COLUMN c DEFAULT 'x'; COMMIT", NULL, NULL, NULL);
+    sqlite3_exec(h->f->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    h->held = 1;
+    if (h->ms) usleep((useconds_t)h->ms * 1000);
+    else while (!h->release) usleep(1000);
+    sqlite3_exec(h->f->db, "COMMIT", NULL, NULL, NULL);
+    return NULL;
+}
+static double now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0; }
+/* one step of sql on db while h holds the lock: the step's result and its
+** time; the hold is released after the step and joined */
+static int step_under_hold(sqlite3 *db, const char *sql, struct holder *h, double *pMs) {
+    sqlite3_stmt *s = NULL;
+    pthread_t t;
+    int rc;
+    double t0;
+    h->held = 0; h->release = 0;
+    pthread_create(&t, NULL, hold_lock, h);
+    while (!h->held) usleep(1000);
+    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return SQLITE_ERROR;
+    t0 = now_ms();
+    rc = sqlite3_step(s);
+    *pMs = now_ms() - t0;
+    sqlite3_finalize(s);
+    h->release = 1;
+    pthread_join(t, NULL);
+    return rc;
+}
+
+/* 21. The write lock held elsewhere past busy_timeout (#92): one wait, then
+** SQLite's own SQLITE_BUSY (retryable), not a refusal; the retry is rows */
+static void test_lock_contention(void) {
+    TEST("write lock held elsewhere past busy_timeout: one wait and SQLITE_BUSY (in a transaction too, after a schema change too, never a refusal); retried, random() and the write under the new schema are rows");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/lk.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = { "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", "INSERT INTO t(v) VALUES(0)", NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    HppliteNode *f = open_node(DIR "/lk.db", l1);     /* second connection, same file: it captures its writes too */
+    if (!f) FAIL("second connection open");
+    sqlite3_busy_timeout(w->db, 500);
+    struct holder h = { f, 0, 0, 0, 0 };
+    double ms = 0;
+    int rc;
+
+    /* a value row capture takes and text refuses, under a lock held throughout */
+    rc = step_under_hold(w->db, "INSERT INTO t(v) VALUES(random())", &h, &ms);
+    if (rc != SQLITE_BUSY) FAILF("random() under a held lock: rc %d (%s) after %.0f ms, want SQLITE_BUSY (%d)", rc, sqlite3_errmsg(w->db), ms, SQLITE_BUSY);
+    if (ms > 900) FAILF("random() under a held lock: SQLITE_BUSY after %.0f ms (busy_timeout 500: one wait, not two)", ms);
+    if (sqlite3_exec(w->db, "INSERT INTO t(v) VALUES(random())", NULL, NULL, NULL) != SQLITE_OK) FAILF("retry after the lock was released: %s", sqlite3_errmsg(w->db));
+
+    /* the lock released between the wait and a second one: SQLITE_BUSY or
+    ** success, never a refusal (which the driver reports as "interrupted") */
+    h.ms = 750;
+    rc = step_under_hold(w->db, "INSERT INTO t(v) VALUES(random())", &h, &ms);
+    h.ms = 0;
+    if (rc != SQLITE_BUSY && rc != SQLITE_DONE) FAILF("random() with the lock released after 750 ms: rc %d (%s) after %.0f ms, want SQLITE_BUSY or SQLITE_DONE", rc, sqlite3_errmsg(w->db), ms);
+    if (rc == SQLITE_BUSY && sqlite3_exec(w->db, "INSERT INTO t(v) VALUES(random())", NULL, NULL, NULL) != SQLITE_OK) FAILF("retry: %s", sqlite3_errmsg(w->db));
+
+    /* the same inside the application's transaction: BUSY, and the transaction is still the application's */
+    if (sqlite3_exec(w->db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) FAIL("BEGIN");
+    rc = step_under_hold(w->db, "INSERT INTO t(v) VALUES(2)", &h, &ms);
+    if (rc != SQLITE_BUSY) FAILF("in a transaction under a held lock: rc %d (%s) after %.0f ms, want SQLITE_BUSY", rc, sqlite3_errmsg(w->db), ms);
+    if (ms > 900) FAILF("in a transaction under a held lock: SQLITE_BUSY after %.0f ms (one wait, not two)", ms);
+    if (sqlite3_get_autocommit(w->db)) FAIL("in a transaction under a held lock: the transaction was rolled back (SQLITE_BUSY leaves it to the application)");
+    if (sqlite3_exec(w->db, "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) FAILF("ROLLBACK: %s", sqlite3_errmsg(w->db));
+    if (sqlite3_exec(w->db, "BEGIN; INSERT INTO t(v) VALUES(2); COMMIT", NULL, NULL, NULL) != SQLITE_OK) FAILF("retry in a transaction: %s", sqlite3_errmsg(w->db));
+
+    /* the other connection moves the schema, then holds the lock: the writer's statement is prepared on
+    ** the new schema while its triggers are for the old one */
+    h.alter = 1;
+    rc = step_under_hold(w->db, "INSERT INTO t(v) VALUES(random())", &h, &ms);
+    h.alter = 0;
+    if (rc != SQLITE_BUSY) FAILF("schema moved, lock held: rc %d (%s) after %.0f ms, want SQLITE_BUSY", rc, sqlite3_errmsg(w->db), ms);
+    if (ms > 900) FAILF("schema moved, lock held: SQLITE_BUSY after %.0f ms (one wait, not two)", ms);
+    if (sqlite3_exec(w->db, "INSERT INTO t(v) VALUES(random())", NULL, NULL, NULL) != SQLITE_OK) FAILF("retry after the schema moved: %s", sqlite3_errmsg(w->db));
+    if (scalar(w->db, "SELECT count(*) FROM t WHERE c = 'x'") != 5) FAILF("writer premise: five rows with the new column, %lld", scalar(w->db, "SELECT count(*) FROM t WHERE c = 'x'"));
+    if (scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE rec IS NULL AND sql LIKE 'INSERT%'") != 0)
+        FAILF("every INSERT should be a record, none text: %lld text INSERTs",
+              scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE rec IS NULL AND sql LIKE 'INSERT%'"));
+    if (scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE rec IS NOT NULL") < 5)
+        FAILF("five inserted rows should have records: %lld", scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE rec IS NOT NULL"));
+    hpplite_node_destroy(f);
+    const char *why = replica_matches(w, l1, "lk_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -981,6 +1080,7 @@ int main(void) {
     test_state_and_last_error();
     test_no_chain_keeps_the_log();
     test_verify_role();
+    test_lock_contention();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

@@ -1600,7 +1600,28 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** is a write that may reach a virtual table (FTS5, R*Tree): what those
   ** store cannot carry triggers. */
   if (pCtx->bRows) {
-    if (isRowsDml(zSql) && hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) {
+    int covered = isRowsDml(zSql) ? hpplite_rows_covered_for_write(pCtx) : 0;
+    if (covered == HPPLITE_ROWS_BUSY && !hpplite_rows_text_only(pCtx, zSql) && rerunTrack(pCtx, pS)) {
+      /* The write lock is held elsewhere past busy_timeout (#92). Waiting
+      ** again (the text path's own insert) and refusing would double the
+      ** wait and end in SQLITE_INTERRUPT, which no driver retries. Instead
+      ** the statement itself takes the lock, as a plain SQLite write would,
+      ** under a snapshot opened here (rerunTrack's schema read, in a
+      ** transaction of HPPLite's when in autocommit): with a read open
+      ** SQLite does not wait again - the lock still held, or a commit since
+      ** the snapshot, is SQLITE_BUSY at once, the driver's retry catches it
+      ** and comes back through this trace; else the write runs on exactly
+      ** the schema read here, and its triggers (rebuilt under the snapshot
+      ** when stale) record it as rows. HPPLite's transaction is committed at
+      ** the statement's end, as after a stale rerun. */
+      hpplite_rows_after_statement(pCtx);            /* the rebuild, when the triggers are not the snapshot's */
+      if (hpplite_rows_covered(pCtx)) {
+        pCtx->changesAtLog = -1;                     /* no text row: the rerun's effect check keeps nothing */
+        pCtx->bSeqAtLog = 0;
+        covered = 1;
+      }
+    }
+    if (covered == 1 && !hpplite_rows_text_only(pCtx, zSql)) {
       /* A text statement still open (a RETURNING not read to the end) did
       ** all its writing in its first step: its silence must not cover this
       ** one (#63). Its own next run arrives as a new trace, silenced again */

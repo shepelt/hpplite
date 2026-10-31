@@ -27,6 +27,10 @@ void hpplite_rows_disable(struct HppliteCtx *pCtx);
 ** table they do not cover is logged as text instead) */
 int hpplite_rows_covered(struct HppliteCtx *pCtx);
 /* ...asked as a write starts: takes the write lock first (see the .c) */
+/* ...as a write starts, the write lock taken first (a no-op write that waits
+** busy_timeout): 1 covered, 0 not (text), HPPLITE_ROWS_BUSY the lock is held
+** elsewhere past the timeout - nothing was read, the caller decides (#92) */
+#define HPPLITE_ROWS_BUSY (-1)
 int hpplite_rows_covered_for_write(struct HppliteCtx *pCtx);
 
 /* Must this write be logged as text? (it names a virtual table, or a table

@@ -647,9 +647,13 @@ flushes, height continues, nothing is replayed twice. A batch that L1 does
 not confirm stays pending and is retried at the same height.
 
 File databases are switched to WAL mode on open (bookkeeping runs on a
-second connection) and get a 5 s busy timeout. In-memory databases work
-through the C API (`hpplite_node_create` with `:memory:`), with bookkeeping
-on the same connection and no timer: flush explicitly or on close.
+second connection) and get a 5 s busy timeout. A write that cannot take the
+write lock within that timeout (another process holds it) fails with
+`SQLITE_BUSY` after one wait, as it would without HPPLite, and the driver's
+retry runs it again through capture; it is never refused for that. In-memory
+databases work through the C API (`hpplite_node_create` with `:memory:`),
+with bookkeeping on the same connection and no timer: flush explicitly or on
+close.
 
 Three things a statement can be refused for, all with `SQLITE_INTERRUPT`
 and a line on stderr, so the log never silently disagrees with the data:
