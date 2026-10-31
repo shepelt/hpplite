@@ -1255,6 +1255,9 @@ static void noteNoClock(HppliteCtx *pCtx, sqlite3_int64 id, sqlite3_int64 now) {
 ** statement rolls back there - but its PROFILE must not unlog the row) */
 static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   if (pCtx->pRerunStmt) return 0;
+  if (getenv("HPPLITE_TRACE_RERUN"))
+    fprintf(stderr, "hpplite: rerun-tracking (schema %d, seen %d, autocommit %d): %.80s\n", schemaVersion(pCtx),
+            pCtx->seenSchema, sqlite3_get_autocommit(pCtx->db), sqlite3_sql(pS) ? sqlite3_sql(pS) : "?");
   if (sqlite3_get_autocommit(pCtx->db)) {
     if (internalExec(pCtx, pCtx->db, "BEGIN") != SQLITE_OK) return 0;
     pCtx->rerunOwnTxn = 1;
@@ -1277,11 +1280,19 @@ static void rerunCommit(HppliteCtx *pCtx) {
   pCtx->pRerunStmt = NULL;
   pCtx->rerunStage = 0;
   pCtx->rerunOwnTxn = 0;
-  if (own && !sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
-    /* what the commit hook does for an application commit (ours it skips) */
-    pCtx->curTxn = 0;
-    pCtx->bRootDirty = 1;
-    if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
+  if (own && !sqlite3_get_autocommit(pCtx->db)) {
+    if (internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
+      /* what the commit hook does for an application commit (ours it skips) */
+      pCtx->curTxn = 0;
+      pCtx->bRootDirty = 1;
+      if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
+    } else {
+      /* ours, still open: the application's autocommit writes since are in
+      ** it, unseen by other connections until something commits */
+      fprintf(stderr, "hpplite: could not commit the transaction opened for a stale statement's rerun (%s)\n",
+              sqlite3_errmsg(pCtx->db));
+      pCtx->nLogErrors++;
+    }
   }
   pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   gateLeaveAppIfIdle(pCtx);

@@ -669,6 +669,7 @@ static void test_refused_stale_statement(void) {
     reset_dir();
     W a, b;
     if (!open_writer(DIR "/stale.db", &a) || !open_writer(DIR "/stale.db", &b)) FAIL("open");
+    setenv("HPPLITE_TRACE_RERUN", "1", 1);
     int ok1 = exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
     int ok2 = exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
     int ok3 = exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
@@ -683,6 +684,7 @@ static void test_refused_stale_statement(void) {
     exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
     int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
     sqlite3_finalize(st);
+    unsetenv("HPPLITE_TRACE_RERUN");
     /* the refusal says why this write was text, not that a version lacks something (#85) */
     int saysText = strstr(b.ctx->zLastRefusal, "logged as text") != NULL, saysV01 = strstr(b.ctx->zLastRefusal, "v0.1") != NULL;
     sqlite3_int64 rows = scalar(b.db, "SELECT count(*) FROM c");
