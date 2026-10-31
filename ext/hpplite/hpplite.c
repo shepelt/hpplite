@@ -3154,7 +3154,8 @@ static void hpplite_on_close(sqlite3 *db);
 ** keyed, nondeterministic, contract, da_contract, last_batch_tx, foreign_batches,
 ** hooks_replaced, roots_compared, root_mismatches, txns_dropped, last_refusal,
 ** sequencer (1 if this connection posts the file's batches; 0 if another
-** connection, in this process or another, does and this one captures only).
+** connection, in this process or another, does and this one captures only),
+** capture ('rows' or 'text': what this connection logs).
 **
 ** The table is referenced once when the node is registered so that an
 ** instance exists for the life of the connection; its xDisconnect then fires
@@ -3192,6 +3193,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_TXNS_DROPPED     18
 #define STATUS_COL_LAST_REFUSAL     19
 #define STATUS_COL_SEQUENCER        20
+#define STATUS_COL_CAPTURE          21
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -3204,7 +3206,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER)");
+        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -3365,6 +3367,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_SEQUENCER:
             sqlite3_result_int(ctx, node->follower ? 0 : 1);
+            break;
+        case STATUS_COL_CAPTURE:              /* what this connection logs: records or statements (#83) */
+            sqlite3_result_text(ctx, node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);

@@ -207,6 +207,7 @@ static void test_sequence(void) {
         "INSERT INTO b(v) SELECT v FROM src",                           /* (b, 0) again */
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT capture = 'rows' FROM hpplite_status") != 1) FAIL("hpplite_status.capture is not 'rows' (#83)");
     if (scalar(w->db, "SELECT count(*) FROM sqlite_sequence") != 3) FAIL("writer premise: three entries");
     const char *why = replica_matches(w, l1, "seq_r.db");
     hpplite_l1_disconnect(l1);

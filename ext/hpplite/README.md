@@ -375,14 +375,15 @@ checkpoint (`checkpoint=`, default every 100 batches) there is no posted
 root yet: compare `SELECT state_root FROM hpplite_status` of the writer and
 the rebuilt file yourself, or use a smaller `checkpoint` in development.
 
-`hpplite_status` columns: `height` (next batch number), `pending` (statements
-logged, not yet posted), `state_root`, `prev_block_hash`,
+`hpplite_status` columns: `height` (next batch number), `pending` (log rows -
+records or statements - not yet posted), `state_root`, `prev_block_hash`,
 `last_checkpoint_height`, `lease` (1 = this instance may post), `log_errors`,
 `replay_skipped`, `encryption`, `keyed`, `nondeterministic`, `contract`,
 `da_contract`, `last_batch_tx`, `foreign_batches`, `hooks_replaced`,
 `roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`,
 `sequencer` (1 = this connection posts the file's batches; 0 = another
-connection, in this process or another, does).
+connection, in this process or another, does), `capture` (`rows` or `text`:
+what this connection logs).
 
 
 What exists in v0.1 is **rebuild and compare**: open an empty file with the

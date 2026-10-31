@@ -18,6 +18,7 @@ static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 #define DIR "/tmp/hpplite_test_env"
 #define KEY "0x8182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0"
@@ -193,10 +194,19 @@ static void test_capture_values(void) {
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     HppliteNode *n = rc == SQLITE_OK ? hpplite_get_node(db) : NULL;
     int text = n && n->config.captureText;
+    char status[16] = "";
+    if (n) {
+        sqlite3_stmt *q;
+        if (sqlite3_prepare_v2(db, "SELECT capture FROM hpplite_status", -1, &q, NULL) == SQLITE_OK) {
+            if (sqlite3_step(q) == SQLITE_ROW) snprintf(status, sizeof(status), "%s", sqlite3_column_text(q, 0));
+            sqlite3_finalize(q);
+        }
+    }
     sqlite3_close(db);
     unsetenv("HPPLITE_CAPTURE");
     if (!n) FAIL("capture=text did not open");
     if (!text) FAIL("HPPLITE_CAPTURE=rows overrode the URI's capture=text");
+    if (strcmp(status, "text") != 0) FAILF("hpplite_status.capture is '%s', want 'text' (#83)", status);
     PASS();
 }
 
