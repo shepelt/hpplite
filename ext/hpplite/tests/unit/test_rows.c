@@ -662,6 +662,32 @@ static void test_long_virtual_table_name(void) {
     PASS();
 }
 
+/* A refused statement prepared on a stale schema: SQLite reruns it with
+** the interrupt cleared and no trace; it must still not run (#89) */
+static void test_refused_stale_statement(void) {
+    TEST("a refused statement that is also stale does not run on its rerun");
+    reset_dir();
+    W a, b;
+    if (!open_writer(DIR "/stale.db", &a) || !open_writer(DIR "/stale.db", &b)) FAIL("open");
+    exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
+    exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
+    exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
+    exec(b.db, "SELECT count(*) FROM c");                              /* b sees the schema */
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(b.db, "INSERT INTO c(v) VALUES(random())", -1, &st, NULL) != SQLITE_OK) FAIL("prepare");
+    exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
+    int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
+    sqlite3_finalize(st);
+    sqlite3_int64 rows = scalar(b.db, "SELECT count(*) FROM c");
+    int again = exec(b.db, "INSERT INTO c(v) VALUES('fine')");        /* the connection goes on */
+    close_writer(&b);
+    close_writer(&a);
+    if (rc == SQLITE_DONE) FAIL("the refused statement's rerun ran (SQLITE_DONE)");
+    if (rows != 0) FAILF("%lld rows in c, want 0: the refused write happened", (long long)rows);
+    if (!again) FAIL("the next statement on the connection failed");
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -699,6 +725,7 @@ int main(void) {
     test_malformed_records();
     test_rebuild_rolled_back();
     test_long_virtual_table_name();
+    test_refused_stale_statement();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

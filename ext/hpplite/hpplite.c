@@ -991,6 +991,13 @@ static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2,
     return SQLITE_OK;
   }
   if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  if (pCtx->pRefusedStmt) {
+    /* the reprepare of a refused statement whose first run failed stale:
+    ** SQLite reruns it with the interrupt cleared and no trace, so it is
+    ** stopped here, once (the next prepare on the connection is it) (#89) */
+    pCtx->pRefusedStmt = NULL;
+    return SQLITE_DENY;
+  }
   /* VACUUM copies the database through one it attaches itself (its own
   ** statements, tables named as ours included); it is logged as text */
   if (pCtx->pVacuumStmt) return SQLITE_OK;
@@ -1058,8 +1065,9 @@ static int mentionsHppliteTable(const char *z) {
 ** is about to execute fail with SQLITE_INTERRUPT (inside an explicit
 ** transaction SQLite rolls the transaction back, as a disk-full would).
 */
-static void refuseStatement(HppliteCtx *pCtx, const char *zWhy, const char *zSql) {
+static void refuseStatement(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zWhy, const char *zSql) {
   pCtx->nLogErrors++;
+  pCtx->pRefusedStmt = pS;
   fprintf(stderr, "hpplite: %s; statement refused (SQLITE_INTERRUPT): %.80s\n", zWhy, zSql);
   snprintf(pCtx->zLastRefusal, sizeof(pCtx->zLastRefusal), "%s (the driver reports \"interrupted\"): %.160s", zWhy, zSql);
   sqlite3_interrupt(pCtx->db);
@@ -1344,6 +1352,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt) {
     rerunCommit(pCtx);                    /* the rerun never came (its first run failed otherwise) */
   }
+  if (mask == SQLITE_TRACE_STMT) pCtx->pRefusedStmt = NULL;      /* a new statement: the refused one ran or failed */
   if (mask == SQLITE_TRACE_STMT) {
     /* Sub-programs are traced too and have no PROFILE event of their own.
     ** Named triggers say so ("-- TRIGGER x"); foreign key actions (ON
@@ -1393,6 +1402,10 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     int bWasLogged = pS == pCtx->pLastLogged;
+    /* a refused statement done - unless this is its first run failing stale
+    ** (expired: SQLite reprepares and reruns it inside this step): the rerun
+    ** must be refused too (#89) */
+    if (pS == pCtx->pRefusedStmt && !stmtExpired(pS)) pCtx->pRefusedStmt = NULL;
     if (pS == pCtx->pVacuumStmt) {
       /* Done: rowids of tables without an INTEGER PRIMARY KEY may have been
       ** renumbered, and statements and records after it address the new
@@ -1504,7 +1517,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       if (!pCtx->bDeterminismWarn) {
         char why[200];
         snprintf(why, sizeof(why), "%s; unsupported in v0.1, bind the value instead", zWhy);
-        refuseStatement(pCtx, why, zSql);
+        refuseStatement(pCtx, pS, why, zSql);
         return 0;
       }
       if (pCtx->nNondeterministic == 1) {
@@ -1517,7 +1530,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     /* A write that names our tables where the authorizer could not see it
     ** (RENAME TO _hpplite_x, a subquery over the log whose rows differ on
     ** every replica): not logged, so not allowed either. */
-    refuseStatement(pCtx, "application writes may not reference _hpplite_ tables", zSql);
+    refuseStatement(pCtx, pS, "application writes may not reference _hpplite_ tables", zSql);
     return 0;
   }
   {
@@ -1532,7 +1545,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     const char *zWhy = functionVerdict(pCtx, pS);
     if (zWhy && strncmp(zWhy, "could not check", 15) == 0) {
       /* the check itself failed (out of memory): refused, nothing to advise */
-      refuseStatement(pCtx, zWhy, zSql);
+      refuseStatement(pCtx, pS, zWhy, zSql);
       return 0;
     }
     if (zWhy) {
@@ -1543,7 +1556,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       ** a function the replica does not have never replays at all */
       if (!pCtx->bDeterminismWarn || bAppFn) {
         snprintf(why, sizeof(why), "%s; unsupported in v0.1, compute the value in the application and bind it", zWhy);
-        refuseStatement(pCtx, why, zSql);
+        refuseStatement(pCtx, pS, why, zSql);
         return 0;
       }
     }
@@ -1553,7 +1566,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** row capture only (#62): the few statements still logged as text are
   ** refused when they bind anything, which would replay cut */
   if (pCtx->bExpandTruncates && pS && sqlite3_bind_parameter_count(pS) > 0) {
-    refuseStatement(pCtx, "this SQLite truncates bound values in sqlite3_expanded_sql() (better-sqlite3's "
+    refuseStatement(pCtx, pS, "this SQLite truncates bound values in sqlite3_expanded_sql() (better-sqlite3's "
                     "bundled SQLite), and this statement is logged as text (a schema change, a write that "
                     "reaches a virtual table, or the first write to a table another connection just "
                     "created): put the values in its text, or run it on a stock SQLite", zSql);
@@ -1562,7 +1575,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
   if (!zExpanded) {
-    refuseStatement(pCtx, "cannot expand bound parameters (out of memory?)", zSql);
+    refuseStatement(pCtx, pS, "cannot expand bound parameters (out of memory?)", zSql);
     return 0;
   }
   /* No size limit here: a transaction larger than a batch spans several
@@ -1638,7 +1651,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   if (rc != SQLITE_DONE) {
     char why[160];
     snprintf(why, sizeof(why), "could not log statement (%s)", sqlite3_errmsg(pCtx->db));
-    refuseStatement(pCtx, why, zSql);
+    refuseStatement(pCtx, pS, why, zSql);
   }
   sqlite3_free(zExpanded);
   return 0;
