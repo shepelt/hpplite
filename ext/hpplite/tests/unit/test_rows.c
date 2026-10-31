@@ -583,6 +583,28 @@ static void test_shutdown_leaves_connection_usable(void) {
     PASS();
 }
 
+/* A record is bytes from the chain: malformed ones are refused, never
+** read past (#69) */
+static void test_malformed_records(void) {
+    TEST("a malformed record is refused, not read past");
+    reset_dir();
+    sqlite3 *db;
+    if (sqlite3_open(DIR "/mal.db", &db) != SQLITE_OK) FAIL("open");
+    exec(db, "CREATE TABLE t(a)");
+    /* an update record: key of 1 value, a text whose length claims 2^31 bytes */
+    static const unsigned char rec[] = { 0x01, 0x03, 0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x01, 0x00 };
+    char *err = NULL;
+    int rc = hpplite_rows_apply(db, "t", HPPLITE_ROW_UPDATE, rec, (int)sizeof(rec), &err);
+    sqlite3_free(err);
+    if (rc == SQLITE_OK) FAIL("a record with a length past its end was applied");
+    static const unsigned char rec2[] = { 0x01, 0x04, 0x7f };                 /* a delete key: blob of 127 bytes, 0 given */
+    rc = hpplite_rows_apply(db, "t", HPPLITE_ROW_DELETE, rec2, (int)sizeof(rec2), &err);
+    sqlite3_free(err);
+    if (rc == SQLITE_OK) FAIL("a record with a short value was applied");
+    sqlite3_close(db);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -617,6 +639,7 @@ int main(void) {
     test_rowid_named_columns();
     test_sqlite_tables_are_text();
     test_shutdown_leaves_connection_usable();
+    test_malformed_records();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

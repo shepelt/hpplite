@@ -827,7 +827,11 @@ static void decSkip(Dec *d) {
   tag = d->a[d->i++];
   if (tag == 1) decVarint(d);
   else if (tag == 2) d->i += 8;
-  else if (tag == 3 || tag == 4) d->i += (int)decVarint(d);
+  else if (tag == 3 || tag == 4) {
+    sqlite3_uint64 len = decVarint(d);                 /* bounded first: a length past int would wrap the cursor (#69) */
+    if (d->bad || len > (sqlite3_uint64)(d->n - d->i)) { d->bad = 1; return; }
+    d->i += (int)len;
+  }
   if (d->i > d->n) d->bad = 1;
 }
 
