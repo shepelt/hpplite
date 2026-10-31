@@ -3468,6 +3468,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->noEncrypt = !cfg->encrypt;
     nc->determinismWarn = cfg->determinismWarn;
     nc->captureText = cfg->captureText;
+    nc->captureSource = cfg->captureSource;
     nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
@@ -3492,6 +3493,11 @@ sqlite3 *hpplite_open(const char *uri) {
     /* Load configuration */
     HppliteConfig *config = hpplite_config_load(uri);
     if (!config) return NULL;
+    if (hpplite_config_error()) {
+        fprintf(stderr, "hpplite: cannot open %s: %s\n", uri, hpplite_config_error());
+        hpplite_config_free(config);
+        return NULL;
+    }
 
     /* Check if hpplite is enabled */
     if (!config->dbPath) {
@@ -3718,6 +3724,12 @@ static int hpplite_auto_init(
         if (!config) return SQLITE_OK;
     } else {
         return SQLITE_OK;                                   /* not an HPPLite database */
+    }
+    if (hpplite_config_error()) {
+        /* a setting that is not one of its values: not a default in its place (#80) */
+        if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s: %s", filename, hpplite_config_error());
+        hpplite_config_free(config);
+        return SQLITE_ERROR;
     }
 
     /* Convert to node config */

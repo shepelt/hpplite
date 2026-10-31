@@ -115,9 +115,14 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
-    /* the environment chooses for any node, however its configuration was
-    ** made (every suite runs in both modes) */
-    if (getenv("HPPLITE_CAPTURE")) node->config.captureText = strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0;
+    /* the environment chooses for any node whose configuration did not say
+    ** (every suite runs in both modes); a URI's capture= stands (#80) */
+    if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
+        const char *z = getenv("HPPLITE_CAPTURE");
+        if (strcasecmp(z, "text") == 0) node->config.captureText = 1;
+        else if (strcasecmp(z, "rows") == 0) node->config.captureText = 0;
+        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is neither rows nor text; ignored\n", z);
+    }
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
     ** file's own, node_take_file_lock) */

@@ -122,6 +122,7 @@ typedef struct HppliteConfig {
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
     int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */
+    int captureSource;               /* ...where from: 0 default, 1 environment, 2 URI (the URI wins, #80) */
     char *dbName;                    /* Its own rollup among the wallet's, by this name (#61);
                                      ** "{file}": the database file's name */
     size_t maxTxBytes;               /* Largest batch per transaction (0 = by chain id, else unknown) */
@@ -144,6 +145,10 @@ HppliteConfig *hpplite_config_create(void);
 ** Free config and all allocated strings.
 */
 void hpplite_config_free(HppliteConfig *cfg);
+
+/* A value the last load refused (capture= not rows or text), or NULL: an
+** open with such a setting fails rather than runs with another (#80) */
+const char *hpplite_config_error(void);
 
 /*
 ** Load config from environment variables.

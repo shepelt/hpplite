@@ -97,9 +97,21 @@ const char *hpplite_config_role_str(HppliteConfigRole role) {
     }
 }
 
+static char gConfigError[160];
+const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError : NULL; }
+
+/* capture=rows|text, nothing else: a misspelling must not quietly choose (#80) */
+static void parse_capture(HppliteConfig *cfg, const char *val, int source) {
+    if (strcasecmp(val, "rows") == 0) cfg->captureText = 0;
+    else if (strcasecmp(val, "text") == 0) cfg->captureText = 1;
+    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is neither rows nor text", val); return; }
+    cfg->captureSource = source;
+}
+
 HppliteConfig *hpplite_config_create(void) {
     HppliteConfig *cfg = calloc(1, sizeof(HppliteConfig));
     if (!cfg) return NULL;
+    gConfigError[0] = 0;
 
     /* Set defaults */
     cfg->chainId = HPPLITE_DEFAULT_CHAIN_ID;
@@ -207,7 +219,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_DETERMINISM);
     if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
     val = getenv(HPPLITE_ENV_CAPTURE);
-    if (val) cfg->captureText = (strcasecmp(val, "text") == 0);
+    if (val) parse_capture(cfg, val, 1);
     val = getenv(HPPLITE_ENV_DBNAME);
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
     val = getenv(HPPLITE_ENV_MAX_TX);
@@ -406,9 +418,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_DETERMINISM, buf, sizeof(buf))) {
         cfg->determinismWarn = (strcasecmp(buf, "warn") == 0);
     }
-    if (get_uri_param(uri, HPPLITE_URI_CAPTURE, buf, sizeof(buf))) {
-        cfg->captureText = (strcasecmp(buf, "text") == 0);
-    }
+    if (get_uri_param(uri, HPPLITE_URI_CAPTURE, buf, sizeof(buf))) parse_capture(cfg, buf, 2);
     if (get_uri_param(uri, HPPLITE_URI_DBNAME, buf, sizeof(buf)) && buf[0]) {
         free(cfg->dbName);
         cfg->dbName = strdup(buf);
@@ -540,7 +550,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DETERMINISM);
     if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CAPTURE);
-    if (val) cfg->captureText = (strcasecmp(val, "text") == 0);
+    if (val) parse_capture(cfg, val, 2);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DBNAME);
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX);

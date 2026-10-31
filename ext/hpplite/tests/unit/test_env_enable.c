@@ -176,6 +176,30 @@ static void test_read_only_open(void) {
     PASS();
 }
 
+/* capture= takes rows or text, nothing else; a URI's choice stands over
+** HPPLITE_CAPTURE (#80) */
+static void test_capture_values(void) {
+    TEST("capture=rowz fails the open; a URI's capture=text stands over HPPLITE_CAPTURE=rows");
+    reset_dir();
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("file:" DIR "/cap.db?hpplite=on&capture=rowz&privkey=" KEY "&datadir=" DIR, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    int opened = rc == SQLITE_OK && hpplite_get_node(db) != NULL;
+    sqlite3_close(db);
+    if (opened) FAIL("capture=rowz opened (as rows)");
+    setenv("HPPLITE_CAPTURE", "rows", 1);
+    db = NULL;
+    rc = sqlite3_open_v2("file:" DIR "/cap2.db?hpplite=on&capture=text&privkey=" KEY "&datadir=" DIR "&interval=0", &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    HppliteNode *n = rc == SQLITE_OK ? hpplite_get_node(db) : NULL;
+    int text = n && n->config.captureText;
+    sqlite3_close(db);
+    unsetenv("HPPLITE_CAPTURE");
+    if (!n) FAIL("capture=text did not open");
+    if (!text) FAIL("HPPLITE_CAPTURE=rows overrode the URI's capture=text");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite enabled from the environment (#55) ===\n");
     test_plain_path_enabled();
@@ -184,6 +208,7 @@ int main(void) {
     test_truncating_sqlite_refused();
     test_truncating_sqlite_rows();
     test_read_only_open();
+    test_capture_values();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
