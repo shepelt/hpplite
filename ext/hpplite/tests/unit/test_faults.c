@@ -107,8 +107,9 @@ static void arm(HppliteL1 *l1, HppliteNode *n, int f) {
             break;
         case F_COMMIT_FAILS:      hpplite_test_fail_commits = 1; break;
         case F_REORG:
+            /* one to four batches gone, within what the node keeps (HPPLITE_POSTED_KEEP) */
             hpplite_l1_get_da_state(l1, &last, &total, NULL);
-            if (last >= 2) hpplite_l1_mock_truncate(l1, last - 1 - (rnd() % 2 ? 1 : 0));
+            if (last >= 2) { uint64_t depth = 1 + rnd() % 4; hpplite_l1_mock_truncate(l1, depth < last ? last - depth : 1); }
             break;
         case F_LEASE_EXPIRES:     hpplite_l1_mock_advance_time(l1, 400); n->leaseRecheckAt = 0; break;
         case F_RPC_DOWN:          hpplite_l1_mock_set_rpc_down(l1, 1); break;
