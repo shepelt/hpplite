@@ -674,7 +674,8 @@ static void test_refused_stale_statement(void) {
     exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
     exec(b.db, "SELECT count(*) FROM c");                              /* b sees the schema */
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(b.db, "INSERT INTO c(v) VALUES(random())", -1, &st, NULL) != SQLITE_OK) FAIL("prepare");
+    if (sqlite3_prepare_v2(b.db, "INSERT INTO c(v) VALUES(random())", -1, &st, NULL) != SQLITE_OK)
+        FAILF("prepare: %s (%d)", sqlite3_errmsg(b.db), sqlite3_extended_errcode(b.db));
     exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
     int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
     sqlite3_finalize(st);
