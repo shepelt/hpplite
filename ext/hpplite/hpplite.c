@@ -1515,6 +1515,11 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   {
     const char *zWhy = functionVerdict(pCtx, pS);
+    if (zWhy && strncmp(zWhy, "could not check", 15) == 0) {
+      /* the check itself failed (out of memory): refused, nothing to advise */
+      refuseStatement(pCtx, zWhy, zSql);
+      return 0;
+    }
     if (zWhy) {
       int bAppFn = strstr(zWhy, "defined by the application") != NULL;
       char why[240];
