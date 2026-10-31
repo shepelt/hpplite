@@ -224,6 +224,14 @@ static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
     }
     sqlite3_finalize(q);
     if (hasRowid && nPk != 1) t->ipk = -1;
+    if (t->ipk >= 0) {
+      /* INTEGER PRIMARY KEY DESC is not the rowid (SQLite's documented
+      ** quirk): it gets an index of its own, origin 'pk' (#73) */
+      z = sqlite3_mprintf("SELECT 1 FROM pragma_index_list(%Q, 'main') WHERE origin = 'pk'", zName);
+      if (sqlite3_prepare_v2(db, z, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) t->ipk = -1;
+      sqlite3_finalize(q); q = NULL;
+      sqlite3_free(z);
+    }
     if (!hasRowid) {
       /* the key is the primary key, in its declared order */
       t->nKey = nPk;

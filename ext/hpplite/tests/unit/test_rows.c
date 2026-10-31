@@ -459,6 +459,26 @@ static void test_temp_table_shadow(void) {
     PASS();
 }
 
+/* INTEGER PRIMARY KEY DESC: a key column with an index of its own, not the
+** rowid - rowids must travel with the records (#73) */
+static void test_integer_primary_key_desc(void) {
+    TEST("INTEGER PRIMARY KEY DESC is not the rowid: rowids replay as the writer's");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/desc.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, x)");
+    exec(w.db, "INSERT INTO t(rowid, id, x) VALUES(100, 5, 1)");
+    exec(w.db, "INSERT INTO t(id, x) VALUES(3, 2)");
+    exec(w.db, "UPDATE t SET rowid = 7 WHERE id = 3");
+    exec(w.db, "UPDATE t SET id = 9 WHERE rowid = 7");
+    exec(w.db, "DELETE FROM t WHERE rowid = 100");
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/desc_r.db", &nr, &nt);
+    close_writer(&w);
+    if (why) FAIL(why);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -488,6 +508,7 @@ int main(void) {
     test_failures_and_rollbacks();
     test_write_beside_open_text_statement();
     test_temp_table_shadow();
+    test_integer_primary_key_desc();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
