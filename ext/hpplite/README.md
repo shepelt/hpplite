@@ -403,7 +403,12 @@ holds the log and the roots, the key holder is the one who checks them.
 
 ## Versions
 
-Scope is tied to versions. The current branch is **v0.1 in progress**.
+Scope is tied to versions. **This branch, `release-0.1`, is end-of-life.**
+v0.1.1 is the last v0.1 release and there will be no v0.1.2. Everything v0.1
+does, v0.2 (branch `hpplite`) does with `capture=text`, and the bugs found
+since in code the two share are fixed only there - issue #96 lists them and
+the upgrade path (replicas first, then the writer; `capture=text` on the
+writer until every replica is on v0.2).
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
