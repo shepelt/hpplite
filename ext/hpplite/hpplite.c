@@ -3756,6 +3756,10 @@ int sqlite3_hpplite_init(
       dup = (sqlite3_step(pStmt) == SQLITE_ROW);
       sqlite3_finalize(pStmt);
     }
+    /* ...but this copy already on this connection (its auto-extension ran at
+    ** open; Rails' `extensions:`, and drivers like it, load the module on
+    ** every connection) is a load with nothing left to do */
+    if (dup && findNode(db)) return SQLITE_OK;
     if (dup) {
       if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite is already loaded in this connection");
       return SQLITE_ERROR;

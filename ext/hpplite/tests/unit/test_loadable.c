@@ -56,12 +56,28 @@ static void test_load_and_use(void) {
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 1 || !ok) FAIL("height should be 1 after load");
     PASS();
 
-    TEST("loading HPPLite twice into one connection is refused (it would silence the first)");
+    TEST("loading the module again into a connection it is on does nothing (Rails loads extensions per connection)");
     rc = sqlite3_load_extension(db, HPPLITE_EXT_PATH, NULL, &err);
-    if (rc == SQLITE_OK) FAIL("second load should fail");
-    if (!err || !strstr(err, "already loaded")) { printf("(%s) ", err ? err : "?"); sqlite3_free(err); FAIL("error text"); }
+    if (rc != SQLITE_OK) { printf("(%s) ", err ? err : "?"); sqlite3_free(err); FAIL("second load of the same module should succeed"); }
     sqlite3_free(err); err = NULL;
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 1 || !ok) FAIL("first instance must stay intact");
+    if (scalar(db, "SELECT hooks_replaced FROM hpplite_status", &ok) != 0 || !ok) FAIL("its hooks must stay its own");
+    PASS();
+
+    TEST("a connection opened after the first load has HPPLite already; loading it there is a no-op too");
+    {
+        sqlite3 *db2 = NULL;
+        int ok2 = 0;
+        rc = sqlite3_open_v2(DB_URI, &db2, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+        if (rc != SQLITE_OK) FAIL("open second connection");
+        sqlite3_enable_load_extension(db2, 1);
+        rc = sqlite3_load_extension(db2, HPPLITE_EXT_PATH, NULL, &err);
+        if (rc != SQLITE_OK) { printf("(%s) ", err ? err : "?"); sqlite3_free(err); sqlite3_close(db2); FAIL("load on a connection the auto-extension set up"); }
+        sqlite3_free(err); err = NULL;
+        scalar(db2, "SELECT height FROM hpplite_status", &ok2);
+        sqlite3_close(db2);
+        if (!ok2) FAIL("the second connection has HPPLite");
+    }
     PASS();
 
     TEST("writes are captured and flushed through the extension");

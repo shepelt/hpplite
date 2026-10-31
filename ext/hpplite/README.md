@@ -161,6 +161,7 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 | npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
 | better-sqlite3 (Drizzle's and Knex's default) | - | **refused at open**: its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()` - writes would replay truncated |
 | Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
+| Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `database: "file:...?hpplite=on&..."` and `extensions: [<module>]` in `database.yml`, one key per database file (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
 
 One SQLite library per process: loading the module into a second one
 (better-sqlite3's copy and Node's own) is refused.
