@@ -53,8 +53,11 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op,
 ** hpplite_rows_seq_changed() lists the entries that differ from the
 ** snapshot ('\0'-separated name, seq pairs as text; sqlite3_free) without
 ** taking them in; hpplite_rows_seq_take() takes the current state in. */
-char *hpplite_rows_seq_changed(struct HppliteCtx *pCtx, sqlite3 *db, int *pn);
+char *hpplite_rows_seq_changed(struct HppliteCtx *pCtx, sqlite3 *db, int *pn, char **pzNow);
 void hpplite_rows_seq_take(struct HppliteCtx *pCtx, sqlite3 *db);
+/* ...and takes in the state hpplite_rows_seq_changed() read (*pzNow): the
+** one the records were made from, not a later one (#91) */
+void hpplite_rows_seq_install(struct HppliteCtx *pCtx, char *zSnap);
 /* The record of one entry (sqlite3_free) */
 unsigned char *hpplite_rows_seq_rec(sqlite3_int64 seq, int *pnRec);
 

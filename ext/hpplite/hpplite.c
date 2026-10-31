@@ -2075,14 +2075,14 @@ static void cutToGroupStart(HppliteBatch *pBatch) {
 ** log: what any committed transaction did, by then.
 */
 int hpplite_rows_seq_flush(HppliteCtx *pCtx) {
-  char *zMoved;
+  char *zMoved, *zNow = NULL;
   int n = 0, rc, saved;
   sqlite3_stmt *q = NULL;
   const char *z;
   if (!pCtx || !pCtx->bRows || pCtx->bkDb == pCtx->db) return SQLITE_OK;
   if (bkBegin(pCtx, 1) != SQLITE_OK) return SQLITE_BUSY;
   saved = bkEnter(pCtx);
-  zMoved = hpplite_rows_seq_changed(pCtx, pCtx->bkDb, &n);
+  zMoved = hpplite_rows_seq_changed(pCtx, pCtx->bkDb, &n, &zNow);
   rc = zMoved ? SQLITE_OK : SQLITE_NOMEM;
   if (rc == SQLITE_OK && n > 0) {
     rc = sqlite3_prepare_v2(pCtx->bkDb,
@@ -2105,7 +2105,10 @@ int hpplite_rows_seq_flush(HppliteCtx *pCtx) {
   sqlite3_free(zMoved);
   bkLeave(pCtx, saved);
   rc = bkEnd(pCtx, rc);
-  if (rc == SQLITE_OK && n > 0) hpplite_rows_seq_take(pCtx, pCtx->bkDb);
+  /* the snapshot is what the records were made from, read in the
+  ** transaction - not read again after it, when another connection's
+  ** commit in between would be taken in unlogged (#91) */
+  if (rc == SQLITE_OK) hpplite_rows_seq_install(pCtx, zNow); else sqlite3_free(zNow);
   return rc;
 }
 

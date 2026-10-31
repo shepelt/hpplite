@@ -539,7 +539,7 @@ static const char *seqFind(const char *zSnap, const char *zName) {
   return NULL;
 }
 
-char *hpplite_rows_seq_changed(HppliteCtx *pCtx, sqlite3 *db, int *pn) {
+char *hpplite_rows_seq_changed(HppliteCtx *pCtx, sqlite3 *db, int *pn, char **pzNow) {
   char *zNow = seqRead(db), *zOut;
   const char *z;
   sqlite3_str *s = sqlite3_str_new(NULL);
@@ -554,9 +554,14 @@ char *hpplite_rows_seq_changed(HppliteCtx *pCtx, sqlite3 *db, int *pn) {
     z = v + strlen(v) + 1;
   }
   sqlite3_str_appendchar(s, 1, 0);
-  sqlite3_free(zNow);
+  if (pzNow) *pzNow = zNow; else sqlite3_free(zNow);
   zOut = sqlite3_str_finish(s);
   return zOut;
+}
+
+void hpplite_rows_seq_install(HppliteCtx *pCtx, char *zSnap) {
+  sqlite3_free(pCtx->zRowsSeq);
+  pCtx->zRowsSeq = zSnap;
 }
 
 void hpplite_rows_seq_take(HppliteCtx *pCtx, sqlite3 *db) {
