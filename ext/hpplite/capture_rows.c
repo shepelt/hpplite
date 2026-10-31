@@ -22,6 +22,7 @@
 #include "hpplite.h"
 #include "capture_rows.h"
 #include "batch.h"
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -344,14 +345,17 @@ static int textOnlyAdd(char **pzList, int *pnList, const char *zName) {
   return SQLITE_OK;
 }
 
-/* The names whose writes are text: virtual tables, then - to a fixpoint -
-** every table or view with a trigger that mentions one already listed */
-static int loadTextOnly(HppliteCtx *pCtx) {
+/* The names whose writes are text: virtual tables, the tables given (ones
+** the triggers cannot be built for), then - to a fixpoint - every table or
+** view with a trigger that mentions one already listed */
+static int loadTextOnly(HppliteCtx *pCtx, const char *zSeed) {
   sqlite3_stmt *q = NULL;
   char *zList = NULL;
+  const char *z;
   int nList = 0, rc, grew;
   /* sqlite_sequence carries no triggers either: a write to it is text */
   rc = textOnlyAdd(&zList, &nList, "sqlite_sequence");
+  for (z = zSeed; rc == SQLITE_OK && z && *z; z += strlen(z) + 1) rc = textOnlyAdd(&zList, &nList, z);
   if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->db,
     "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'virtual'", -1, &q, NULL);
   while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
@@ -396,11 +400,16 @@ static int loadTextOnly(HppliteCtx *pCtx) {
   return SQLITE_OK;
 }
 
-/* Drop every capture trigger and build them again for the current schema */
+/* Drop every capture trigger and build them again for the current schema.
+** A table they cannot be built for is logged as text instead, the v1 way:
+** one too wide for this SQLite's function argument limit (127 before 3.48,
+** on distribution SQLites; a record passes every column as an argument, an
+** update record two per column, #65). */
 static int rebuild(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
-  char **azName = NULL, *zDrop = NULL;
-  int n = 0, cap = 0, i, rc, v, savedInternal = pCtx->bInternal;
+  char **azName = NULL, *zDrop = NULL, *zSkip = NULL;
+  int n = 0, cap = 0, nSkip = 0, i, rc, v, savedInternal = pCtx->bInternal;
+  int argLimit = sqlite3_limit(pCtx->db, SQLITE_LIMIT_FUNCTION_ARG, -1);
   pCtx->bInternal = 1;
   v = schemaVersionOf(pCtx);
   rc = sqlite3_prepare_v2(pCtx->db,
@@ -430,13 +439,24 @@ static int rebuild(HppliteCtx *pCtx) {
     if (rc == SQLITE_OK) {
       Tab t;
       rc = tabLoad(pCtx->db, azName[i], &t);
-      if (rc == SQLITE_OK) rc = buildTriggers(pCtx, &t, i);
+      if (rc == SQLITE_OK) {
+        int nArgs = 1 + 2 * (t.nKey ? t.nKey : 1) + 2 * t.nCol;      /* hpplite_upd's, the widest call */
+        if (nArgs > argLimit) {
+          if (!textOnlyHas(pCtx->zRowsTextOnly, t.zName))
+            fprintf(stderr, "hpplite: table %s has %d columns, past this SQLite's function argument limit (%d)"
+                    " for row capture; its writes are logged as text\n", t.zName, t.nCol, argLimit);
+          rc = textOnlyAdd(&zSkip, &nSkip, t.zName);
+        } else {
+          rc = buildTriggers(pCtx, &t, i);
+        }
+      }
       tabFree(&t);
     }
     sqlite3_free(azName[i]);
   }
   sqlite3_free(azName);
-  if (rc == SQLITE_OK) rc = loadTextOnly(pCtx);
+  if (rc == SQLITE_OK) rc = loadTextOnly(pCtx, zSkip);
+  sqlite3_free(zSkip);
   pCtx->rowsBuiltFor = rc == SQLITE_OK ? v : -1;
   pCtx->bInternal = savedInternal;
   return rc;

@@ -37,12 +37,14 @@ static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
 }
 
 typedef struct { sqlite3 *db; HppliteCtx *ctx; } W;
-static int open_writer(const char *path, W *w) {
+static int open_writer_ex(const char *path, W *w, int fnArgLimit) {
     if (sqlite3_open(path, &w->db) != SQLITE_OK) return 0;
     exec(w->db, "PRAGMA journal_mode=WAL");
+    if (fnArgLimit > 0) sqlite3_limit(w->db, SQLITE_LIMIT_FUNCTION_ARG, fnArgLimit);
     if (hpplite_init(w->db, &w->ctx) != SQLITE_OK) return 0;
     return hpplite_rows_enable(w->ctx) == SQLITE_OK;
 }
+static int open_writer(const char *path, W *w) { return open_writer_ex(path, w, 0); }
 static void close_writer(W *w) { hpplite_shutdown(w->ctx); sqlite3_close(w->db); }
 
 /* Apply the writer's whole log, in order, to a plain database */
@@ -479,6 +481,35 @@ static void test_integer_primary_key_desc(void) {
     PASS();
 }
 
+/* A table too wide for the SQLite's function argument limit (127 on host
+** SQLites before 3.48): its writes are text, every other table's stay
+** records, and nothing is rebuilt per statement (#65) */
+static void test_wide_table(void) {
+    TEST("a table past the function argument limit is logged as text; the rest stays rows");
+    reset_dir();
+    W w;
+    if (!open_writer_ex(DIR "/wide.db", &w, 127)) FAIL("open");
+    char *sql = sqlite3_mprintf("CREATE TABLE wide(id INTEGER PRIMARY KEY");
+    for (int i = 0; i < 70; i++) sql = sqlite3_mprintf("%z, c%d", sql, i);
+    sql = sqlite3_mprintf("%z)", sql);
+    exec(w.db, sql);
+    sqlite3_free(sql);
+    exec(w.db, "CREATE TABLE narrow(x)");
+    if (w.ctx->rowsBuiltFor < 0) FAIL("the triggers were not built");
+    exec(w.db, "INSERT INTO wide(c0, c69) VALUES('a', 'z')");
+    exec(w.db, "UPDATE wide SET c1 = 'b'");
+    exec(w.db, "INSERT INTO narrow VALUES(1), (2)");
+    exec(w.db, "DELETE FROM narrow WHERE x = 1");
+    if (w.ctx->rowsBuiltFor < 0) FAIL("the triggers were torn down by a write");
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/wide_r.db", &nr, &nt);
+    close_writer(&w);
+    if (why) FAIL(why);
+    if (nr != 3) FAILF("%d records, want 3 (narrow's)", nr);
+    if (nt != 4) FAILF("%d text statements, want 4 (two CREATEs, wide's two writes)", nt);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -509,6 +540,7 @@ int main(void) {
     test_write_beside_open_text_statement();
     test_temp_table_shadow();
     test_integer_primary_key_desc();
+    test_wide_table();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
