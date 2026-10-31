@@ -409,6 +409,32 @@ static void test_failures_and_rollbacks(void) {
     PASS();
 }
 
+/* A text-logged statement held open (its RETURNING rows not read to the
+** end) must not silence a row-captured write made meanwhile (#63) */
+static void test_write_beside_open_text_statement(void) {
+    TEST("a row write while a text-logged statement is still open is recorded");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/open.db", &w)) FAIL("open");
+    exec(w.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
+    exec(w.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, body)");
+    exec(w.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.body); END");
+    exec(w.db, "CREATE TABLE other(x)");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(w.db, "INSERT INTO c(body) VALUES('hello') RETURNING id", -1, &st, NULL) != SQLITE_OK) FAIL("prepare");
+    if (sqlite3_step(st) != SQLITE_ROW) FAIL("step");            /* held open: not reset */
+    exec(w.db, "INSERT INTO other VALUES(1)");
+    exec(w.db, "INSERT INTO other VALUES(2)");
+    sqlite3_finalize(st);
+    exec(w.db, "INSERT INTO other VALUES(3)");
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/open_r.db", &nr, &nt);
+    close_writer(&w);
+    if (why) FAIL(why);
+    if (nr != 3) FAILF("%d records, want 3", nr);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -436,6 +462,7 @@ int main(void) {
     test_table_from_another_connection();
     test_autoincrement_and_fts5();
     test_failures_and_rollbacks();
+    test_write_beside_open_text_statement();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

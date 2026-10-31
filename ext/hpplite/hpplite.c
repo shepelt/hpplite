@@ -1459,7 +1459,14 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** is a write that may reach a virtual table (FTS5, R*Tree): what those
   ** store cannot carry triggers. */
   if (pCtx->bRows) {
-    if (isRowsDml(zSql) && hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
+    if (isRowsDml(zSql) && hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) {
+      /* A text statement still open (a RETURNING not read to the end) did
+      ** all its writing in its first step: its silence must not cover this
+      ** one (#63). Its own next run arrives as a new trace, silenced again */
+      pCtx->pRowsTextStmt = NULL;
+      pCtx->bRowsCapOff = 0;
+      return 0;
+    }
     /* Everything else is text, and a statement's text replays all it does:
     ** its triggers record nothing - a DROP TABLE's implicit delete cascades
     ** through foreign keys too (Alembic rebuilding a self-referencing table
