@@ -899,7 +899,15 @@ HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
     if (!node || !node->l1) return NULL;
     data = hpplite_l1_get_batch(node->l1, height, &dataLen);
     batch = node_decode_batch(node, height, data, dataLen);
-    free(data);
+    if (batch) {
+        /* the sealed bytes stay with the batch: adopted, it is kept as
+        ** posted, so a reorg that drops it can be repaired (#99) */
+        batch->pPosted = data;
+        batch->nPosted = dataLen;
+        batch->bOwnsPosted = 1;
+    } else {
+        free(data);
+    }
     return batch;
 }
 

@@ -64,6 +64,7 @@ struct HppliteBatch {
   int64_t openGroup;                         /* Writer only, not posted: log id of the open group */
   const uint8_t *pPosted;                    /* Writer only: the bytes posted for it (kept for a reorg) */
   size_t nPosted;
+  int bOwnsPosted;                           /* ... malloc'd with the batch (a fetch): freed with it (#99) */
   int64_t fragRow;                           /* Writer only: log id of the statement it ends a piece of */
   size_t fragOff;                            /* ...and how many bytes of its text are posted after it */
   int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */

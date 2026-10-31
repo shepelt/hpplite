@@ -1374,6 +1374,35 @@ static void test_finalize_commit_fails(void) {
     PASS();
 }
 
+/* A batch the node adopted from L1 (posted, confirmation lost, found there
+** at the next flush) must be kept like one it finalized itself, or a reorg
+** that drops it cannot be repaired: "no longer kept to post again" (#99,
+** found by the fault harness, #98) */
+static void test_adopted_batch_kept_for_reorg(void) {
+    TEST("an adopted batch is kept for a reorg: dropped by the chain, it is posted again, not a dead end");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/adopt_keep.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    hpplite_l1_mock_set_lose_confirmation(l1, 1);        /* posted, the caller never hears: found on L1 and adopted */
+    if (hpplite_node_flush_batch(n) != 1 || hpplite_node_pending_count(n) != 0) FAIL("premise: batch 1 posted and adopted from L1");
+    hpplite_l1_mock_set_lose_confirmation(l1, 0);
+    hpplite_l1_mock_truncate(l1, 0);                     /* a reorg drops batch 1 */
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    uint64_t h = hpplite_node_flush_batch(n);
+    uint64_t last = 0, total = 0;
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    int err = n->state == HPPLITE_STATE_ERROR;
+    int pending = hpplite_node_pending_count(n);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (err) FAIL("the node stopped: the adopted batch was not kept to post again");
+    if (last != 2 || h != 2 || pending != 0) FAILF("chain %llu batches, flush %llu, pending %d: want 2, 2, 0", (unsigned long long)last, (unsigned long long)h, pending);
+    PASS();
+}
+
 static void test_unsupported_sql_refused(void) {
     TEST("non-deterministic SQL and ATTACH are refused (strict); warn mode counts");
     SKIP_IF_ROWS("non-deterministic SQL is accepted; ATTACH (test_rows_e2e)");
@@ -1464,6 +1493,7 @@ int main(void) {
     test_unsupported_sql_refused();
     test_claim_reverted_on_chain();
     test_finalize_commit_fails();
+    test_adopted_batch_kept_for_reorg();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
