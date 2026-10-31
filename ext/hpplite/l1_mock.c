@@ -881,13 +881,14 @@ uint8_t *hpplite_l1_get_batch(
         return NULL;
     }
 
-    uint8_t *copy = malloc(l1->batchLen[idx]);
+    uint8_t *copy = malloc(l1->batchLen[idx] + 1);     /* terminated, as the chain's copy is (#77) */
     if (!copy) {
         if (data_len_out) *data_len_out = 0;
         return NULL;
     }
 
     memcpy(copy, l1->batchData[idx], l1->batchLen[idx]);
+    copy[l1->batchLen[idx]] = 0;
     if (data_len_out) *data_len_out = l1->batchLen[idx];
     return copy;
 }

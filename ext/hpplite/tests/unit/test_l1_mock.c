@@ -339,6 +339,12 @@ static void test_batch_da(void) {
         hpplite_l1_disconnect(l1);
         return;
     }
+    if (data[dataLen] != 0) {         /* a plaintext batch is parsed as a C string (#77) */
+        FAIL("Batch data not terminated");
+        free(data);
+        hpplite_l1_disconnect(l1);
+        return;
+    }
     free(data);
 
     /* Check DA state */

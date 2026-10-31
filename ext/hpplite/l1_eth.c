@@ -918,8 +918,10 @@ uint8_t *hpplite_l1_get_batch(
         return NULL;
     }
 
-    /* Copy data */
-    uint8_t *data = malloc(len);
+    /* Copy data, terminated: a plaintext batch is parsed as a C string, and
+    ** one cut short (by the chain, or by whoever posted it) must not run
+    ** the parser past the end (#77) */
+    uint8_t *data = malloc(len + 1);
     if (!data) {
         free(result);
         *data_len_out = 0;
@@ -927,6 +929,7 @@ uint8_t *hpplite_l1_get_batch(
     }
 
     memcpy(data, result + offset + 32, len);
+    data[len] = 0;
     *data_len_out = len;
 
     free(result);
