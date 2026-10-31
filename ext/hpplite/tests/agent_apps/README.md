@@ -26,7 +26,7 @@ from the chain alone, that the app's database is what the chain says?
 # local chain (anvil + the factory deployed with forge), per app:
 tests/agent_apps/verify_app.sh <app dir> http://127.0.0.1:8545 <factory> 31337 9201 anvil
 # HPP Sepolia (wallet funded with 0.01 ETH from the key in ext/hpplite/.env):
-tests/agent_apps/verify_app.sh <app dir> https://sepolia.hpp.io 0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d 181228 9201 sepolia
+tests/agent_apps/verify_app.sh <app dir> https://sepolia.hpp.io 0xc0fa50eb3076ed0e1ce73639097e40784950b8d8 181228 9201 sepolia
 ```
 
 ## What the agents found (2026-10-30)

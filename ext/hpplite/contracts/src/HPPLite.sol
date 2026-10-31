@@ -10,10 +10,16 @@ pragma solidity ^0.8.19;
  *      chain holds the ordered, encrypted history and the state roots; the
  *      key holder rebuilds and compares. No fraud proofs, no challenge period.
  */
+/* The one thing the coordinator asks its DA contract (HPPLiteDA imports
+** this file, so an interface rather than an import) */
+interface IHPPLiteDAHeight {
+    function lastBatchHeight() external view returns (uint256);
+}
+
 contract HPPLite {
     // ============ Constants ============
     uint256 public constant LEASE_DURATION = 5 minutes;
-    uint256 public constant VERSION = 6;
+    uint256 public constant VERSION = 7;   // 7: a checkpoint cannot reach past the DA's height (#44)
 
     // ============ State ============
     address public owner;
@@ -135,6 +141,9 @@ contract HPPLite {
     ) external onlyActiveSequencer(instanceId) {
         require(fromHeight == lastCheckpointHeight + 1 || lastCheckpointHeight == 0, "Non-sequential");
         require(toHeight >= fromHeight, "Invalid range");
+        // a root for batches the DA does not hold would be a root nobody can
+        // check (#44); the DA contract is this rollup's, set by the factory
+        require(daContract == address(0) || toHeight <= IHPPLiteDAHeight(daContract).lastBatchHeight(), "Beyond DA height");
 
         lastCheckpointHeight = toHeight;
         lastStateRoot = stateRoot;

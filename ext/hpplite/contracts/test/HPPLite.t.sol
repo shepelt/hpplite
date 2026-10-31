@@ -43,7 +43,7 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 6);
+        assertEq(hpplite.VERSION(), 7);
     }
 
     function test_ClaimSequencer() public {
@@ -179,9 +179,31 @@ contract HPPLiteTest is Test {
         hpplite.renewLease(instanceId2);
     }
 
+    /* the DA holds n batches, posted by the sequencer under instanceId1 */
+    function postBatches(uint256 n) internal {
+        for (uint256 h = da.lastBatchHeight() + 1; h <= n; h++) {
+            vm.prank(sequencer);
+            da.submitBatch(instanceId1, h, abi.encodePacked("batch ", h));
+        }
+    }
+
+    function test_SubmitCheckpoint_BeyondDAHeight() public {
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId1);
+        postBatches(3);
+        // a checkpoint cannot claim a root for batches the DA does not hold (#44)
+        vm.prank(sequencer);
+        vm.expectRevert("Beyond DA height");
+        hpplite.submitCheckpoint(instanceId1, 1, 4, keccak256("state"));
+        vm.prank(sequencer);
+        hpplite.submitCheckpoint(instanceId1, 1, 3, keccak256("state"));
+        assertEq(hpplite.lastCheckpointHeight(), 3);
+    }
+
     function test_SubmitCheckpoint() public {
         vm.prank(sequencer);
         hpplite.claimSequencer(instanceId1);
+        postBatches(10);
 
         bytes32 stateRoot = keccak256("state");
 
@@ -195,6 +217,7 @@ contract HPPLiteTest is Test {
     function test_SubmitCheckpoint_AutoRenewsLease() public {
         vm.prank(sequencer);
         hpplite.claimSequencer(instanceId1);
+        postBatches(10);
 
         // Fast forward 4 minutes (almost expired)
         vm.warp(block.timestamp + 4 minutes);
@@ -273,7 +296,7 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 6);
+        assertEq(version, 7);
         assertEq(checkpointInterval, 100);
         assertEq(leaseDuration, 5 minutes);
     }

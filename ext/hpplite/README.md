@@ -93,7 +93,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 6 (sequencer-only lease claim; rotating the sequencer ends its lease); rollups from earlier factories keep working with the rules they were created with (`0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
+| HPPLiteFactory | `0xc0fa50eb3076ed0e1ce73639097e40784950b8d8` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 7 (a checkpoint cannot reach past the DA's height, #44; sequencer-only lease claim; rotating the sequencer ends its lease); rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
 | HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
@@ -316,7 +316,7 @@ gas, `submitCheckpoint` 3%, lease claim/renew/release 3%.
 
 | Operation | Gas | Cost (ETH @ 0.01 gwei) |
 |-----------|-----|------------------------|
-| Factory deploy (VERSION 6, optimizer on) | 2.8M | 0.000028 |
+| Factory deploy (VERSION 7, optimizer on) | 2.8M | 0.000028 |
 | Rollup creation (`getOrCreateRollup`, `createRollup` for a named database) | ~2.5M | 0.000025 |
 | Batch submit (~250 B sealed; ~0.7k gas per further byte) | 323k | 0.0000032 |
 | Batch submit (29 KB sealed, as cut on HPP Sepolia) | 20.7M | 0.00023 |
