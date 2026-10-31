@@ -527,7 +527,13 @@ statement does to other rows (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`,
 text. HPPLite records the state each statement ran under and replays it in
 that state, so an application that turns foreign keys on at connect (as
 Django and Rails do) needs no change for it, and switching the pragmas
-mid-session is fine (#52).
+mid-session is fine (#52). The same goes for `legacy_alter_table`,
+`writable_schema`, `ignore_check_constraints` and `case_sensitive_like`
+(#28): each statement and record carries the state they were in, replay
+sets it before applying, and `PRAGMA schema_version = N` (the reload after
+editing `sqlite_schema`) is logged like `user_version`. Set them on the
+connection itself; a pragma set before `hpplite_init()` is read then,
+except `case_sensitive_like`, which SQLite cannot report.
 
 Not detectable, so not refused - know these:
 

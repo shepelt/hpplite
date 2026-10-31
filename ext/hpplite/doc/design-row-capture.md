@@ -92,8 +92,11 @@ is replayed as in v0.1.
 
 ## Format and compatibility
 
-Each entry carries its kind in its mode bits (`HPPLITE_MODE_ROW`, 4): a
-batch mixes records and statements. A replica keeps replaying v0.1
+Each entry carries its kind in its mode bits (`HPPLITE_MODE_ROW`, 4), and
+the connection pragmas it ran under (foreign keys, recursive triggers, and
+since #28 `legacy_alter_table`, `writable_schema`,
+`ignore_check_constraints`, `case_sensitive_like`: bits 8 to 64): a batch
+mixes records and statements. A replica keeps replaying v0.1
 (statement) entries, so existing histories continue; a v0.1 database
 upgrades in place, its next entries being records. v0.1 refuses a mode
 bit it does not know and stops.

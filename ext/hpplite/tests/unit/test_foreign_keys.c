@@ -444,7 +444,7 @@ static void test_unknown_mode_refused(void) {
     if (hpplite_node_flush_batch(w) != 1) FAIL("batch 1");
     HppliteBatch *b = hpplite_batch_new(2);
     hpplite_batch_add_stmt(b, "INSERT INTO t VALUES(1)", -1, 0);
-    b->aTxns[0].mode = 8;                      /* 4 is a row record since #19 */
+    b->aTxns[0].mode = 128;                    /* 4 is a row record since #19, 8-64 connection pragmas since #28 */
     char *json = hpplite_batch_to_json(b);
     size_t len = 0;
     uint8_t *sealed = hpplite_envelope_seal(w->cipher, w->encKey, 2, HPPLITE_ENCODING_NONE,

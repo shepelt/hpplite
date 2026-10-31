@@ -38,6 +38,14 @@ struct HppliteTxn {
 #define HPPLITE_MODE_RECURSIVE_TRIGGERS  2   /* PRAGMA recursive_triggers */
 #define HPPLITE_MODE_ROW                 4   /* not SQL: a row record (#19), applied with triggers off;
                                             ** a version without row capture refuses the batch */
+/* Connection pragmas that change what a statement does without showing in
+** its text (#28); tracked from the application's PRAGMA statements */
+#define HPPLITE_MODE_LEGACY_ALTER        8   /* PRAGMA legacy_alter_table: RENAME leaves references as they are */
+#define HPPLITE_MODE_WRITABLE_SCHEMA    16   /* PRAGMA writable_schema: writes to sqlite_schema */
+#define HPPLITE_MODE_IGNORE_CHECKS      32   /* PRAGMA ignore_check_constraints */
+#define HPPLITE_MODE_CASE_LIKE          64   /* PRAGMA case_sensitive_like */
+#define HPPLITE_MODE_PRAGMAS (HPPLITE_MODE_LEGACY_ALTER | HPPLITE_MODE_WRITABLE_SCHEMA | HPPLITE_MODE_IGNORE_CHECKS | HPPLITE_MODE_CASE_LIKE)
+#define HPPLITE_MODE_KNOWN (HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_RECURSIVE_TRIGGERS | HPPLITE_MODE_ROW | HPPLITE_MODE_PRAGMAS)
 
 /*
 ** A batch of transactions with state transition

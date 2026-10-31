@@ -453,8 +453,54 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
 /* PRAGMA [schema.]user_version / application_id = N (or (N)): the two header
 ** fields an application writes - migration tools keep their version there.
 ** Deterministic, so captured and replayed like any write; their reads are not. */
+/*
+** Connection pragmas that change what a statement does without showing in
+** its text (#28): legacy_alter_table, writable_schema,
+** ignore_check_constraints, case_sensitive_like. Their state is kept from
+** the application's own PRAGMA statements (the authorizer sees each one)
+** and read once at init for the three that can be read; case_sensitive_like
+** has no query form. Each logged statement and record carries the bits, and
+** replay sets them before it, as it does foreign keys (#52).
+*/
+static int pragmaBoolean(const char *z) {
+  while (*z == ' ' || *z == '\t') z++;
+  if ((*z >= '0' && *z <= '9') || *z == '-') return atoi(z) != 0;
+  return sqlite3_strnicmp(z, "on", 2) == 0 || sqlite3_strnicmp(z, "yes", 3) == 0 || sqlite3_strnicmp(z, "true", 4) == 0;
+}
+static int pragmaModeBit(const char *zName) {
+  if (sqlite3_stricmp(zName, "legacy_alter_table") == 0) return HPPLITE_MODE_LEGACY_ALTER;
+  if (sqlite3_stricmp(zName, "writable_schema") == 0) return HPPLITE_MODE_WRITABLE_SCHEMA;
+  if (sqlite3_stricmp(zName, "ignore_check_constraints") == 0) return HPPLITE_MODE_IGNORE_CHECKS;
+  if (sqlite3_stricmp(zName, "case_sensitive_like") == 0) return HPPLITE_MODE_CASE_LIKE;
+  return 0;
+}
+static void pragmaModeSet(HppliteCtx *pCtx, const char *zName, const char *zValue) {
+  int bit = pragmaModeBit(zName);
+  if (!bit) return;
+  /* writable_schema=RESET turns it off (and reloads the schema) */
+  if (pragmaBoolean(zValue)) pCtx->pragmaMode |= bit; else pCtx->pragmaMode &= ~bit;
+}
+static void pragmaModeRead(HppliteCtx *pCtx) {
+  static const char *aRead[] = { "legacy_alter_table", "writable_schema", "ignore_check_constraints", NULL };
+  int i, saved = pCtx->bInternal;
+  pCtx->bInternal = 1;
+  for (i = 0; aRead[i]; i++) {
+    sqlite3_stmt *q = NULL;
+    char *zSql = sqlite3_mprintf("PRAGMA %s", aRead[i]);
+    if (zSql && sqlite3_prepare_v2(pCtx->db, zSql, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
+      if (sqlite3_column_int(q, 0)) pCtx->pragmaMode |= pragmaModeBit(aRead[i]);
+      else pCtx->pragmaMode &= ~pragmaModeBit(aRead[i]);
+    }
+    sqlite3_finalize(q);
+    sqlite3_free(zSql);
+  }
+  pCtx->bInternal = saved;
+}
+
 static int isHeaderPragmaWrite(const char *z) {
-  static const char *aName[] = { "user_version", "application_id", NULL };
+  /* schema_version: set by hand after editing sqlite_schema under
+  ** writable_schema, so every connection reloads the schema (#28) */
+  static const char *aName[] = { "user_version", "application_id", "schema_version", NULL };
   int i;
   while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
   if (sqlite3_strnicmp(z, "pragma", 6) != 0) return 0;
@@ -962,6 +1008,7 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       ** mode each statement ran in (#52); foreign keys are read from the
       ** connection flags, recursive_triggers only after it was touched */
       if (z1 && sqlite3_stricmp(z1, "recursive_triggers") == 0) pCtx->bRecTrigSeen = 1;
+      if (z1 && z2) pragmaModeSet(pCtx, z1, z2);
       /* The file stays in WAL: HPPLite's bookkeeping connection reads beside
       ** the application, and a journal that is off or truncated would void
       ** the crash safety the log relies on. Leaving WAL failed anyway, as
@@ -1109,7 +1156,7 @@ static int currentMode(HppliteCtx *pCtx) {
       sqlite3_reset(pCtx->pRecTrigStmt);
     }
   }
-  return mode;
+  return mode | pCtx->pragmaMode;
 }
 
 /* 'localtime' / 'utc' as a time function's modifier; zIn lower-cased.
@@ -1851,6 +1898,7 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   loadMeta(pCtx);
   pCtx->seenSchema = schemaVersion(pCtx);
   pCtx->bClockPin = hpplite_clock_on(db);
+  pragmaModeRead(pCtx);
 
   sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
@@ -2590,6 +2638,23 @@ static int replayMode(sqlite3 *rdb, int mode, int *pCur) {
     rc = sqlite3_exec(rdb, want ? "PRAGMA recursive_triggers = 1" : "PRAGMA recursive_triggers = 0", NULL, NULL, NULL);
     if (rc == SQLITE_OK) *pCur = (*pCur & ~HPPLITE_MODE_RECURSIVE_TRIGGERS) | (want ? HPPLITE_MODE_RECURSIVE_TRIGGERS : 0);
   }
+  /* the connection pragmas (#28); writable_schema goes off with RESET, which
+  ** also reloads the schema the statements under it may have edited */
+  {
+    static const struct { int bit; const char *zOn, *zOff; } aPragma[] = {
+      { HPPLITE_MODE_LEGACY_ALTER,    "PRAGMA legacy_alter_table = 1",       "PRAGMA legacy_alter_table = 0" },
+      { HPPLITE_MODE_WRITABLE_SCHEMA, "PRAGMA writable_schema = 1",          "PRAGMA writable_schema = RESET" },
+      { HPPLITE_MODE_IGNORE_CHECKS,   "PRAGMA ignore_check_constraints = 1", "PRAGMA ignore_check_constraints = 0" },
+      { HPPLITE_MODE_CASE_LIKE,       "PRAGMA case_sensitive_like = 1",      "PRAGMA case_sensitive_like = 0" },
+    };
+    size_t i;
+    for (i = 0; rc == SQLITE_OK && i < sizeof(aPragma) / sizeof(aPragma[0]); i++) {
+      want = (mode & aPragma[i].bit) != 0;
+      if (want == ((*pCur & aPragma[i].bit) != 0)) continue;
+      rc = sqlite3_exec(rdb, want ? aPragma[i].zOn : aPragma[i].zOff, NULL, NULL, NULL);
+      if (rc == SQLITE_OK) *pCur = (*pCur & ~aPragma[i].bit) | (want ? aPragma[i].bit : 0);
+    }
+  }
   return rc;
 }
 
@@ -2729,7 +2794,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   /* A mode this version does not know cannot be reproduced: stop rather
   ** than replay into a different state */
   for (i = 0; i < pBatch->nTxns; i++) {
-    if (pBatch->aTxns[i].mode & ~(HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_RECURSIVE_TRIGGERS | HPPLITE_MODE_ROW)) {
+    if (pBatch->aTxns[i].mode & ~HPPLITE_MODE_KNOWN) {
       fprintf(stderr, "hpplite: batch %llu statement %d ran under connection state this version cannot apply (mode %d)\n",
               (unsigned long long)pBatch->height, i, pBatch->aTxns[i].mode);
       return SQLITE_MISMATCH;
@@ -2854,7 +2919,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     ** finds nothing left) and leaves recursive_triggers as it is: triggers
     ** are off for it, their effects are records of their own */
     int isRow = (aRun[i].mode & HPPLITE_MODE_ROW) != 0;
-    int mode = isRow ? (aRun[i].mode & HPPLITE_MODE_FOREIGN_KEYS) | (curMode & HPPLITE_MODE_RECURSIVE_TRIGGERS)
+    int mode = isRow ? (aRun[i].mode & (HPPLITE_MODE_FOREIGN_KEYS | HPPLITE_MODE_PRAGMAS)) | (curMode & HPPLITE_MODE_RECURSIVE_TRIGGERS)
                      : aRun[i].mode;
     if (!zSql) continue;
     if (useTxn && aRun[i].group != lastTxn) {

@@ -678,6 +678,74 @@ static void test_temp_triggers(void) {
     PASS();
 }
 
+/* Connection pragmas that change what a statement does without appearing
+** in its text travel with it, as foreign keys do (#28, #52) */
+static void test_connection_pragmas(void) {
+    TEST("legacy_alter_table, ignore_check_constraints, writable_schema (records) and case_sensitive_like (text) replay as the writer had them");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/prag.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = {
+        "CREATE TABLE t(a INTEGER CHECK(a > 0))",
+        "CREATE VIEW v AS SELECT a FROM t",
+        "PRAGMA legacy_alter_table = ON",
+        "ALTER TABLE t RENAME TO u",                 /* the view keeps saying t */
+        "PRAGMA legacy_alter_table = OFF",
+        "INSERT INTO u VALUES(1)",
+        "PRAGMA ignore_check_constraints = ON",
+        "INSERT INTO u VALUES(-1)",                  /* a row the CHECK would refuse */
+        "PRAGMA ignore_check_constraints = OFF",
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_schema SET sql = 'CREATE TABLE u(a INTEGER)' WHERE name = 'u'",
+        "PRAGMA writable_schema = RESET",
+        "INSERT INTO u VALUES(-2)",                  /* allowed now: the CHECK is gone */
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT count(*) FROM u") != 3) FAIL("writer premise: 3 rows");
+    if (scalar(w->db, "SELECT count(*) FROM sqlite_schema WHERE name = 'v' AND sql LIKE '%FROM t'") != 1) FAIL("writer premise: the view still names t");
+    const char *why = replica_matches(w, l1, "prag_r.db");
+    if (!why) {
+        HppliteNode *r = open_node(DIR "/prag_r.db", l1);
+        sqlite3_int64 view = r ? scalar(r->db, "SELECT count(*) FROM sqlite_schema WHERE name = 'v' AND sql LIKE '%FROM t'") : -1;
+        sqlite3_int64 check = r ? scalar(r->db, "SELECT count(*) FROM sqlite_schema WHERE name = 'u' AND sql LIKE '%CHECK%'") : -1;
+        if (r) hpplite_node_destroy(r);
+        if (view != 1) why = "replica: the view names u, the writer's names t (legacy_alter_table)";
+        else if (check != 0) why = "replica: table u still has its CHECK (writable_schema)";
+    }
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+
+    /* text capture: LIKE's case sensitivity decides which rows a write touches */
+    l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "rows";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = DIR "/like.db";
+    config.checkpointInterval = 1000;
+    config.captureText = 1;
+    w = hpplite_node_create(&config);
+    if (!w) FAIL("open text");
+    hpplite_node_set_l1(w, l1);
+    hpplite_node_sync_from_l1(w, 1);
+    hpplite_node_start(w);
+    const char *sql2[] = {
+        "CREATE TABLE s(x)",
+        "INSERT INTO s VALUES('Abc'), ('abc')",
+        "PRAGMA case_sensitive_like = ON",
+        "UPDATE s SET x = x || '!' WHERE x LIKE 'a%'",   /* one row on the writer */
+        NULL };
+    if (run(w, sql2) != 0) FAIL("writer SQL (text)");
+    if (scalar(w->db, "SELECT count(*) FROM s WHERE x = 'abc!'") != 1 || scalar(w->db, "SELECT count(*) FROM s WHERE x = 'Abc'") != 1) FAIL("writer premise: one row touched");
+    why = replica_matches(w, l1, "like_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -697,6 +765,7 @@ int main(void) {
     test_drop_table_cascade();
     test_deferred_finalize_not_reposted();
     test_temp_triggers();
+    test_connection_pragmas();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

@@ -57,6 +57,7 @@ struct HppliteCtx {
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
   sqlite3_stmt *pRecTrigStmt; /* Cached PRAGMA recursive_triggers (read) */
   int bRecTrigSeen;           /* The application prepared PRAGMA recursive_triggers: read it per statement */
+  int pragmaMode;             /* HPPLITE_MODE_PRAGMAS bits as the application last set them (#28) */
   int bCollectFns;            /* Authorizer is checking the functions of a write (#53, #54) */
   char zCollectWhy[160];      /* ...first reason it cannot replay ("" = none) */
   char **azReplicaFns;        /* Functions a replica has (fresh connection), sorted, lower case */

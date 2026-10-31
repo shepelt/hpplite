@@ -159,7 +159,10 @@ static void fnMode(sqlite3_context *c, int n, sqlite3_value **v) {
   int fk = 0;
   (void)n; (void)v;
   sqlite3_db_config(p->db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &fk);
-  sqlite3_result_int(c, HPPLITE_MODE_ROW | (fk ? HPPLITE_MODE_FOREIGN_KEYS : 0));
+  /* a record carries the connection pragmas too (#28): whether its row is
+  ** accepted (checks ignored, LIKE's case in a CHECK), and whether the
+  ** schema the writer edited under writable_schema has been reloaded */
+  sqlite3_result_int(c, HPPLITE_MODE_ROW | (fk ? HPPLITE_MODE_FOREIGN_KEYS : 0) | (p->pragmaMode & HPPLITE_MODE_PRAGMAS));
 }
 static void fnNote(sqlite3_context *c, int n, sqlite3_value **v) {
   HppliteCtx *p = sqlite3_user_data(c);
