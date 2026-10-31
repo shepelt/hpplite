@@ -74,6 +74,7 @@ void hpplite_batch_free(HppliteBatch *pBatch) {
       sqlite3_free(pBatch->aTxns[i].zSql);
     }
     sqlite3_free(pBatch->aTxns);
+    sqlite3_free(pBatch->zDbName);
     sqlite3_free(pBatch);
   }
 }
@@ -228,6 +229,13 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
   /* a transaction larger than one batch (#57); only when set */
   if (pBatch->openTxn) sqlite3_str_appendf(pStr, "\"open\":1,");
   if (pBatch->contTxn) sqlite3_str_appendf(pStr, "\"cont\":1,");
+  if (pBatch->zDbName) {
+    /* the first batch of a named database names it: a replica finds its
+    ** rollup among the wallet's by this (#61) */
+    char *esc = json_escape_string(pBatch->zDbName);
+    sqlite3_str_appendf(pStr, "\"db\":\"%s\",", esc ? esc : "");
+    sqlite3_free(esc);
+  }
 
   sqlite3_str_appendf(pStr, "\"transactions\":[");
   for (i = 0; i < pBatch->nTxns; i++) {
@@ -392,6 +400,9 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
       pBatch->openTxn = json_parse_number(&p) != 0;
     } else if (strcmp(zKey, "cont") == 0) {
       pBatch->contTxn = json_parse_number(&p) != 0;
+    } else if (strcmp(zKey, "db") == 0) {
+      sqlite3_free(pBatch->zDbName);
+      pBatch->zDbName = json_parse_string(&p);
     } else if (strcmp(zKey, "pre_state_root") == 0) {
       zVal = json_parse_string(&p);
       if (zVal) {

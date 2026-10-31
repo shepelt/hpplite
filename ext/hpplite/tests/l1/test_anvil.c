@@ -528,6 +528,57 @@ static void test_reorg(void) {
     PASS();
 }
 
+static void text_of(sqlite3 *db, const char *sql, char *out, size_t n) {
+    sqlite3_stmt *s;
+    out[0] = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_text(s, 0)) snprintf(out, n, "%s", sqlite3_column_text(s, 0));
+    sqlite3_finalize(s);
+}
+
+/* 10. One wallet, several databases (#61): each named database gets its own
+** rollup beside the wallet's first (which already has history here), and a
+** replica that only knows the name finds it; {file} names a database by its
+** file, so one setting serves all of an application's */
+static void test_named_databases(void) {
+    TEST("one key, named databases: a rollup each beside the wallet's first; replicas find theirs by name");
+    char ca[64], cb[64], cc[64], cu[64], ra[64], rb[64], rc_[64];
+    unsigned char rootA[32], rootB[32], rootC[32], r1[32], r2[32], r3[32];
+    sqlite3 *a = open_db("named_a.db", KEY1, "&dbname=alpha");
+    sqlite3 *b = open_db("named_b.db", KEY1, "&dbname=beta");
+    sqlite3 *c = open_db("orders.db", KEY1, "&dbname={file}");
+    sqlite3 *u = open_db("named_u.db", KEY1, NULL);
+    if (!a || !b || !c || !u) FAIL("open");
+    sqlite3_exec(a, "CREATE TABLE t(v); INSERT INTO t VALUES('alpha'), (random())", NULL, NULL, NULL);
+    sqlite3_exec(b, "CREATE TABLE t(v); INSERT INTO t VALUES('beta')", NULL, NULL, NULL);
+    sqlite3_exec(c, "CREATE TABLE o(id INTEGER PRIMARY KEY, n); INSERT INTO o(n) VALUES(1), (2), (3)", NULL, NULL, NULL);
+    scalar(a, "SELECT hpplite_flush()"); scalar(b, "SELECT hpplite_flush()"); scalar(c, "SELECT hpplite_flush()");
+    text_of(a, "SELECT contract FROM hpplite_status", ca, sizeof(ca));
+    text_of(b, "SELECT contract FROM hpplite_status", cb, sizeof(cb));
+    text_of(c, "SELECT contract FROM hpplite_status", cc, sizeof(cc));
+    text_of(u, "SELECT contract FROM hpplite_status", cu, sizeof(cu));
+    hpplite_state_root(a, rootA); hpplite_state_root(b, rootB); hpplite_state_root(c, rootC);
+    sqlite3_close(a); sqlite3_close(b); sqlite3_close(c); sqlite3_close(u);
+    if (!ca[0] || !cb[0] || !cc[0] || !cu[0]) FAIL("a database without a contract");
+    if (!strcmp(ca, cb) || !strcmp(ca, cc) || !strcmp(cb, cc)) { printf("(%s %s %s) ", ca, cb, cc); FAIL("named databases share a rollup"); }
+    if (!strcmp(ca, cu) || !strcmp(cb, cu) || !strcmp(cc, cu)) { printf("(a %s b %s c %s u %s) ", ca, cb, cc, cu); FAIL("a named database took the wallet's first rollup"); }
+    /* replicas: new files that know only the key and the name */
+    a = open_db("named_a_replica.db", KEY1, "&dbname=alpha");
+    b = open_db("named_b_replica.db", KEY1, "&dbname=beta");
+    c = open_db("orders_replica.db", KEY1, "&dbname=orders.db");
+    if (!a || !b || !c) FAIL("open replicas");
+    text_of(a, "SELECT contract FROM hpplite_status", ra, sizeof(ra));
+    text_of(b, "SELECT contract FROM hpplite_status", rb, sizeof(rb));
+    text_of(c, "SELECT contract FROM hpplite_status", rc_, sizeof(rc_));
+    hpplite_state_root(a, r1); hpplite_state_root(b, r2); hpplite_state_root(c, r3);
+    sqlite3_int64 na = scalar(a, "SELECT count(*) FROM t"), nc = scalar(c, "SELECT count(*) FROM o");
+    sqlite3_close(a); sqlite3_close(b); sqlite3_close(c);
+    if (strcmp(ra, ca) || strcmp(rb, cb) || strcmp(rc_, cc)) FAIL("a replica found another rollup than its writer's");
+    if (na != 2 || nc != 3) FAIL("replica rows");
+    if (memcmp(r1, rootA, 32) || memcmp(r2, rootB, 32) || memcmp(r3, rootC, 32)) FAIL("replica root differs");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -545,6 +596,7 @@ int main(void) {
     test_big_transaction_end_to_end();
     test_l1_outage();
     test_reorg();
+    test_named_databases();
     printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     (void)!system("rm -rf " DIR);
     return tests_passed == tests_run ? 0 : 1;

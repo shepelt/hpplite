@@ -111,6 +111,7 @@ struct HppliteCtx {
   sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */
   int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */
   char zDropTable[128];       /* The table the statement being prepared drops (its triggers go with it) */
+  char *zDbName;              /* This database's name among its wallet's rollups (#61), or NULL */
   char *zRowsTextOnly;        /* Names a write must not mention to be captured as rows: virtual
                               ** tables and what reaches them through triggers ('\0'-separated,
                               ** ends with an empty name) */

@@ -115,6 +115,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
 | `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
+| `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. `{file}` = the file's name, so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. Also `HPPLITE_DBNAME` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -161,7 +162,7 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 | npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
 | better-sqlite3 (Drizzle's and Knex's default) | - | **refused at open**: its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()` - writes would replay truncated |
 | Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
-| Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `database: "file:...?hpplite=on&..."` and `extensions: [<module>]` in `database.yml`, one key per database file (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
+| Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `extensions: [<module>]` in `database.yml`, `HPPLITE_FILES` for the files and `dbname={file}` in `HPPLITE_PARAMS` (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
 
 One SQLite library per process: loading the module into a second one
 (better-sqlite3's copy and Node's own) is refused.

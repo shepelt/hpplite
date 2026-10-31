@@ -99,6 +99,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.hasPrivkey = config->hasPrivkey;
     node->config.dataDir = node_strdup(config->dataDir);
     node->config.dbPath = node_strdup(config->dbPath);
+    node->config.dbName = node_strdup(config->dbName);
     node->config.rpcUrl = node_strdup(config->rpcUrl);
     memcpy(node->config.factory, config->factory, 20);
     node->config.hasFactory = config->hasFactory;
@@ -258,6 +259,17 @@ static int node_init_tracking(HppliteNode *node) {
     rc = hpplite_init(node->db, &node->ctx);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
+    if (node->config.dbName && node->config.dbName[0]) {
+        /* {file}: the file's own name, so one setting names every database
+        ** of an application (HPPLITE_FILES, #61) */
+        if (strcmp(node->config.dbName, "{file}") == 0) {
+            const char *z = zFile && zFile[0] ? zFile : "memory";
+            const char *slash = strrchr(z, '/');
+            node->ctx->zDbName = sqlite3_mprintf("%s", slash ? slash + 1 : z);
+        } else {
+            node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
+        }
+    }
     if (!node->config.captureText) {
         rc = hpplite_rows_enable(node->ctx);
         if (rc != SQLITE_OK) {
@@ -299,6 +311,76 @@ static void node_learn_batch_limit(HppliteNode *node);
 */
 static int node_ensure_lease(HppliteNode *node);
 
+static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
+                                       const uint8_t *data, size_t dataLen);
+
+/*
+** A named database's rollup among its wallet's (#61): the one it is bound to
+** already; else the one whose first batch carries its name (a replica, or a
+** writer that lost its file); else a new one. 1 with the address, 0 not.
+*/
+static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
+                             const char *factoryHex, uint8_t rollup[20]) {
+    const char *zName = node->ctx->zDbName;
+    const char *colon = strchr(node->ctx->zRollup, ':');
+    uint8_t (*all)[20] = NULL;
+    int n, i;
+    if (node->ctx->zRollup[0] && colon && strlen(colon + 1) == 42) {
+        for (i = 0; i < 20; i++) {
+            unsigned v;
+            if (sscanf(colon + 3 + 2 * i, "%2x", &v) != 1) return 0;
+            rollup[i] = (uint8_t)v;
+        }
+        return 1;
+    }
+    all = sqlite3_malloc(256 * 20);
+    if (!all) return 0;
+    n = hpplite_l1_factory_list_my_rollups(config->rpcUrl, factoryHex, config->privkey, all, 256);
+    for (i = 0; i < n; i++) {
+        char hex[43];
+        HppliteL1 *l1;
+        snprintf(hex, sizeof(hex), "0x");
+        for (int k = 0; k < 20; k++) snprintf(hex + 2 + 2 * k, 3, "%02x", all[i][k]);
+        l1 = hpplite_l1_connect(config->rpcUrl, hex);
+        if (l1) {
+            size_t len = 0;
+            uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
+            HppliteBatch *b = data ? node_decode_batch(node, 1, data, len) : NULL;
+            int match = b && b->zDbName && strcmp(b->zDbName, zName) == 0;
+            hpplite_batch_free(b);
+            free(data);
+            hpplite_l1_disconnect(l1);
+            if (match) {
+                memcpy(rollup, all[i], 20);
+                sqlite3_free(all);
+                return 1;
+            }
+        }
+    }
+    sqlite3_free(all);
+    if (n < 0) return 0;                  /* could not list: do not create a second one */
+    /* The factory makes a wallet's first rollup its primary - the one an
+    ** unnamed database uses. A named database's must never be it: the
+    ** primary comes first (getOrCreateRollup is idempotent, also when two
+    ** processes ask at once) */
+    if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) == 0) {
+        char *txHash = hpplite_l1_factory_get_or_create_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
+        if (txHash) {
+            HppliteL1 *tempL1 = hpplite_l1_connect(config->rpcUrl, factoryHex);
+            if (tempL1) {
+                hpplite_l1_wait_for_tx(tempL1, txHash, 60);
+                hpplite_l1_disconnect(tempL1);
+            }
+            sqlite3_free(txHash);
+        }
+        if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) return 0;
+    }
+    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet; creating one\n", zName);
+    return hpplite_l1_factory_create_rollup(config->rpcUrl, factoryHex, config->privkey,
+                                            config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100,
+                                            rollup);
+}
+
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (node->follower) return;
     if (!config->rpcUrl) return;
@@ -316,10 +398,11 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
 
         /* Check if rollup exists */
         unsigned char rollup[20];
-        int result = hpplite_l1_factory_get_my_rollup(
-            config->rpcUrl, factoryHex, config->privkey, rollup);
+        int named = node->ctx && node->ctx->zDbName;
+        int result = named ? node_named_rollup(node, config, factoryHex, rollup)
+                           : hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
 
-        if (result == 0) {
+        if (result == 0 && !named) {
             /* No rollup exists - create one */
             char *txHash = hpplite_l1_factory_get_or_create_rollup(
                 config->rpcUrl, factoryHex, config->privkey, rollup);
@@ -339,7 +422,15 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
             }
         }
 
-        if (result == 1) {
+        if (result == 1 && named) {
+            /* its own rollup, not the wallet's first */
+            char rollupHex[43];
+            snprintf(rollupHex, sizeof(rollupHex), "0x");
+            for (int i = 0; i < 20; i++) snprintf(rollupHex + 2 + i * 2, 3, "%02x", rollup[i]);
+            node->l1 = hpplite_l1_connect(config->rpcUrl, rollupHex);
+            if (node->l1) hpplite_l1_set_privkey(node->l1, config->privkey);
+            node->ownsL1 = (node->l1 != NULL);
+        } else if (result == 1) {
             /* Connect to the rollup */
             node->l1 = hpplite_l1_connect_factory(
                 config->rpcUrl, factoryHex, config->privkey);
@@ -582,6 +673,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.nodeId);
     sqlite3_free(node->config.dataDir);
     sqlite3_free(node->config.dbPath);
+    sqlite3_free(node->config.dbName);
     sqlite3_free(node->config.rpcUrl);
     sqlite3_free(node->canonicalPath);
     if (node->flushMutex) {

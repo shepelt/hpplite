@@ -767,6 +767,39 @@ int hpplite_l1_factory_get_my_rollup(
     return 0;
 }
 
+int hpplite_l1_factory_list_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20],
+    uint8_t (*out)[20],
+    int max
+) {
+    (void)rpc_url; (void)factory_address; (void)owner_address; (void)out; (void)max;
+    return 0;
+}
+
+int hpplite_l1_factory_create_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint64_t checkpointInterval,
+    uint8_t rollup_out[20]
+) {
+    (void)rpc_url; (void)factory_address; (void)privkey; (void)checkpointInterval; (void)rollup_out;
+    return 0;
+}
+
+int hpplite_l1_factory_list_my_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t (*out)[20],
+    int max
+) {
+    (void)rpc_url; (void)factory_address; (void)privkey; (void)out; (void)max;
+    return 0;
+}
+
 HppliteL1 *hpplite_l1_connect_factory(
     const char *rpc_url,
     const char *factory_address,

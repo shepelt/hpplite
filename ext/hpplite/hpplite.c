@@ -1793,6 +1793,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   sqlite3_free(pCtx->aNoClock);
   sqlite3_free(pCtx->zRowsTextOnly);
   sqlite3_free(pCtx->zRowsSeq);
+  sqlite3_free(pCtx->zDbName);
   if (pCtx->pNoClockMutex) sqlite3_mutex_free(pCtx->pNoClockMutex);
   sqlite3_free(pCtx);
 }
@@ -1866,6 +1867,7 @@ void hpplite_block_hash(const HppliteBatch *pBatch, const unsigned char *pPrevHa
   /* tagged, and only when set: hashes of batches without them are unchanged */
   if (pBatch->openTxn) sha256_update(&h, (const uint8_t*)"O", 1);
   if (pBatch->contTxn) sha256_update(&h, (const uint8_t*)"C", 1);
+  if (pBatch->zDbName) { sha256_update(&h, (const uint8_t*)"D", 1); hashText(&h, (const unsigned char*)pBatch->zDbName); }
   for (i = 0; i < pBatch->nTxns; i++) {
     hashText(&h, (const unsigned char*)pBatch->aTxns[i].zSql);
     if (pBatch->aTxns[i].mode) {
@@ -2068,6 +2070,8 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       if (!pBatch) {
         pBatch = hpplite_batch_new(pCtx->blockHeight);
         if (!pBatch) break;
+        /* a named database's first batch says its name (#61) */
+        if (pCtx->zDbName && pBatch->height == 1) pBatch->zDbName = sqlite3_mprintf("%s", pCtx->zDbName);
       }
       /* the statement the last batch posted part of continues where it stopped (#59) */
       if (pCtx->fragId && id == pCtx->fragId && pCtx->fragOff <= strlen(zText)) {
@@ -3380,6 +3384,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->noEncrypt = !cfg->encrypt;
     nc->determinismWarn = cfg->determinismWarn;
     nc->captureText = cfg->captureText;
+    nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
     nc->checkpointInterval = cfg->checkpointInterval;

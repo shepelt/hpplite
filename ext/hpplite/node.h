@@ -43,6 +43,8 @@ typedef struct HppliteNodeConfig {
     /* Paths */
     char *dataDir;                  /* Data directory */
     char *dbPath;                   /* SQLite database path */
+    char *dbName;                   /* Its own rollup among the wallet's, by this name (#61);
+                                    ** "{file}": the database file's name */
 
     /* L1 Connection */
     char *rpcUrl;                   /* L1 RPC endpoint */

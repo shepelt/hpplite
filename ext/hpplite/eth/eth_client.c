@@ -11,6 +11,7 @@
 #include <secp256k1_recovery.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -617,6 +618,34 @@ int eth_client_get_receipt(EthClient *client,
     
     cJSON_Delete(response);
     return 1; /* mined */
+}
+
+int eth_client_receipt_topic(EthClient *client, const uint8_t tx_hash[32],
+                             const uint8_t topic0[32], int index, uint8_t out[32]) {
+    cJSON *params = cJSON_CreateArray();
+    char *hash_hex = eth_hex_encode(tx_hash, 32), *want = eth_hex_encode(topic0, 32);
+    cJSON *response, *result, *logs, *log;
+    int found = 0;
+    cJSON_AddItemToArray(params, cJSON_CreateString(hash_hex));
+    free(hash_hex);
+    response = rpc_call(client, "eth_getTransactionReceipt", params);
+    if (!response) { free(want); return -1; }
+    result = cJSON_GetObjectItem(response, "result");
+    if (!result || cJSON_IsNull(result)) { cJSON_Delete(response); free(want); return 0; }
+    logs = cJSON_GetObjectItem(result, "logs");
+    cJSON_ArrayForEach(log, logs) {
+        cJSON *topics = cJSON_GetObjectItem(log, "topics");
+        cJSON *t0 = topics ? cJSON_GetArrayItem(topics, 0) : NULL;
+        cJSON *ti = topics ? cJSON_GetArrayItem(topics, index) : NULL;
+        if (t0 && t0->valuestring && ti && ti->valuestring && strcasecmp(t0->valuestring, want) == 0
+            && eth_hex_decode(ti->valuestring, out, 32) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    cJSON_Delete(response);
+    free(want);
+    return found ? 1 : -1;
 }
 
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]) {

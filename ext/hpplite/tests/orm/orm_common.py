@@ -22,6 +22,9 @@ _c.load_extension(os.path.splitext(EXT)[0])
 _c.close()
 
 def uri(name, extra=""):
+    # HPPLITE_ORM_EXTRA: more parameters for every open (dbname=... for a
+    # database that has its own rollup among the wallet's, #61)
+    extra += os.environ.get("HPPLITE_ORM_EXTRA", "")
     return (f"file:{DIR}/{name}?hpplite=on&rpc={RPC}&factory={FACTORY}&chainid={CHAINID}"
             f"&privkey={KEY}&datadir={DIR}&interval=0{extra}")
 

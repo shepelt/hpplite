@@ -3,25 +3,27 @@
 A Rails 8 app in production mode, as `rails new` makes it: four SQLite
 databases (primary, Solid Cache, Solid Queue, Action Cable), Puma forking
 workers, Solid Queue running jobs in its own processes. HPPLite is loaded
-the Rails way, with `extensions:` in `config/database.yml`, and each database
-names its rollup in a `file:` URI. Nothing else in Rails is changed. The app
+the Rails way, with `extensions:` in `config/database.yml`; the environment
+does the rest: `HPPLITE_FILES` names the four files and one `HPPLITE_PARAMS`
+(one key) with `dbname={file}` gives each its own rollup (#61). Nothing else
+in Rails is changed. The app
 is two scaffolds (`Product`, `Order`) and a job (`order_job.rb`) that a
 Solid Queue worker runs for every order: it decrements the product's stock
 and marks the order fulfilled, in one transaction, and writes the cache.
 
 ```bash
-export HPPLITE_RPC=... HPPLITE_FACTORY=... HPPLITE_CHAINID=... \
-       HPPLITE_KEY_PRIMARY=0x... HPPLITE_KEY_CACHE=0x... HPPLITE_KEY_QUEUE=0x... HPPLITE_KEY_CABLE=0x...
 tests/real_apps/rails/setup.sh /tmp/rails && cd /tmp/rails/shop
-export HPPLITE_EXT=build_real/hpplite.dylib RAILS_ENV=production SECRET_KEY_BASE=...
+export HPPLITE_EXT=build_real/hpplite.dylib RAILS_ENV=production SECRET_KEY_BASE=... \
+       HPPLITE_FILES="*/storage/production*.sqlite3" \
+       HPPLITE_PARAMS="rpc=...&factory=...&chainid=...&privkey=0x...&datadir=$PWD/storage&interval=1s&dbname={file}"
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES        # macOS, forking servers: below
 bin/rails db:prepare
 WEB_CONCURRENCY=2 RAILS_MAX_THREADS=5 bin/rails server -p 3010 &
 bin/jobs &
 python3 tests/real_apps/rails/drive.py http://localhost:3010 16 50
 # stop both with SIGTERM (each connection posts what it captured as it closes), then per database:
-HPPLITE_ANVIL_KEY0=<that database's key> HPPLITE_ORM_DIR=/tmp/rails/shop/storage ... \
-  python tests/orm/orm_common.py production_queue.sqlite3
+HPPLITE_ANVIL_KEY0=0x... HPPLITE_ORM_EXTRA="&dbname=production_queue.sqlite3" \
+  HPPLITE_ORM_DIR=/tmp/rails/shop/storage ... python tests/orm/orm_common.py production_queue.sqlite3
 ```
 
 ## Results (2026-10-31, anvil, `capture=rows`; Rails 8.1.4, Ruby 4.0.9, sqlite3 gem 2.10.2 / SQLite 3.54.1)
@@ -44,9 +46,13 @@ HPPLITE_ANVIL_KEY0=<that database's key> HPPLITE_ORM_DIR=/tmp/rails/shop/storage
   there and failed ("hpplite is already loaded in this connection"). A load
   into a connection this copy of HPPLite is already on is now a no-op; two
   different copies are still refused (`test_loadable`).
-- One rollup per wallet: one key cannot serve several database files. Each
-  database here has its own key in its URI; `HPPLITE_FILES` with one
-  `HPPLITE_PARAMS` key cannot cover a multi-database app yet.
+- One rollup per wallet: one key could not serve several database files
+  (#61). Now a database can be named (`dbname=`, `{file}` for its file
+  name): it gets its own rollup among the wallet's, and a replica finds it by
+  the name in its first batch. The run again that way (one key for all four,
+  plain paths in `database.yml`): every request through, 226 of 226 orders
+  fulfilled, replicas rebuilt by name equal (primary 380 rows, cache 6,
+  queue 327 in 16 batches).
 - macOS: a Puma worker forked from the master then loading the module (it
   links libcurl, which brings in Objective-C frameworks) is killed by macOS's
   fork-safety check. `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`, the usual

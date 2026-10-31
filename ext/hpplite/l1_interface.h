@@ -268,6 +268,34 @@ char *hpplite_l1_factory_get_or_create_rollup(
 );
 
 /*
+** Several rollups per wallet (#61: one per named database). List the
+** owner's rollups, oldest first: returns how many were written (at most
+** max), -1 on error. Create one more: waits for it, 1 with its address in
+** rollup_out, 0 on failure.
+*/
+int hpplite_l1_factory_list_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20],
+    uint8_t (*out)[20],
+    int max
+);
+int hpplite_l1_factory_create_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint64_t checkpointInterval,
+    uint8_t rollup_out[20]
+);
+int hpplite_l1_factory_list_my_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t (*out)[20],
+    int max
+);
+
+/*
 ** Get rollup address for the wallet associated with privkey.
 ** Returns: 1 if rollup exists, 0 if no rollup, -1 on error
 */

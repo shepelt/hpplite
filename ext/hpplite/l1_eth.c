@@ -61,6 +61,8 @@ static uint8_t SEL_HAS_ROLLUP[4];
 static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
 static uint8_t SEL_RELEASE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
+static uint8_t SEL_GET_ROLLUPS_BY_OWNER[4];
+static uint8_t SEL_CREATE_ROLLUP[4];
 static uint8_t SEL_CREATE_SIMPLE_ROLLUP[4];
 
 static int selectors_initialized = 0;
@@ -98,6 +100,8 @@ static void init_selectors(void) {
     abi_function_selector("getRollup(address)", SEL_GET_ROLLUP);
     abi_function_selector("hasRollup(address)", SEL_HAS_ROLLUP);
     abi_function_selector("getOrCreateRollup()", SEL_GET_OR_CREATE_ROLLUP);
+    abi_function_selector("getRollupsByOwner(address)", SEL_GET_ROLLUPS_BY_OWNER);
+    abi_function_selector("createRollup(uint256)", SEL_CREATE_ROLLUP);
     abi_function_selector("createSimpleRollup(address)", SEL_CREATE_SIMPLE_ROLLUP);
 
     selectors_initialized = 1;
@@ -642,6 +646,90 @@ char *hpplite_l1_factory_get_or_create_rollup(
 
     /* Caller should wait for tx and then call get_rollup to get the address */
     return hash_hex;
+}
+
+/* Every rollup the owner created, oldest first (#61). Returns how many were
+** written to out (at most max), or -1 */
+int hpplite_l1_factory_list_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t owner_address[20],
+    uint8_t (*out)[20],
+    int max
+) {
+    uint8_t factory[20], calldata[4 + 32];
+    const char *factory_addr = factory_address ? factory_address : DEFAULT_FACTORY_ADDRESS;
+    size_t len = 0;
+    uint8_t *result;
+    uint64_t n = 0;
+    int i, got = 0;
+    EthClient *eth;
+    init_selectors();
+    if (eth_hex_decode(factory_addr, factory, 20) != 0) return -1;
+    eth = eth_client_create(rpc_url, g_defaultChainId);
+    if (!eth) return -1;
+    memcpy(calldata, SEL_GET_ROLLUPS_BY_OWNER, 4);
+    abi_encode_address(owner_address, calldata + 4);
+    result = eth_client_call(eth, factory, calldata, sizeof(calldata), &len);
+    eth_client_destroy(eth);
+    /* address[]: offset, length, then one word per address */
+    if (!result || len < 64) { free(result); return -1; }
+    for (i = 56; i < 64; i++) n = n << 8 | result[i];
+    if (len < 64 + n * 32) { free(result); return -1; }
+    for (i = 0; i < (int)n && got < max; i++) abi_decode_address(result + 64 + 32 * i, out[got++]);
+    free(result);
+    return got;
+}
+
+/* A new rollup for the wallet, whatever it has already (#61): waits for the
+** transaction and takes the address from its RollupCreated event - not the
+** last one listed, which another process of the wallet may have created at
+** the same moment. 1 created (rollup_out set), 0 failed */
+int hpplite_l1_factory_create_rollup(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint64_t checkpointInterval,
+    uint8_t rollup_out[20]
+) {
+    uint8_t factory[20], calldata[4 + 32], topic0[32], word[32], *tx_hash;
+    const char *factory_addr = factory_address ? factory_address : DEFAULT_FACTORY_ADDRESS;
+    const char *sig = "RollupCreated(address,address,address,uint256)";
+    EthClient *eth;
+    int i, rc = 0;
+    init_selectors();
+    if (eth_hex_decode(factory_addr, factory, 20) != 0) return 0;
+    eth = eth_client_create(rpc_url, g_defaultChainId);
+    if (!eth) return 0;
+    if (eth_client_set_privkey(eth, privkey) != 0) { eth_client_destroy(eth); return 0; }
+    memcpy(calldata, SEL_CREATE_ROLLUP, 4);
+    abi_encode_uint64(checkpointInterval, calldata + 4);
+    /* deploys the rollup and its DA contract: the gas getOrCreateRollup() takes */
+    tx_hash = eth_client_send_tx(eth, factory, calldata, sizeof(calldata), 15000000, 0);
+    if (!tx_hash) { eth_client_destroy(eth); return 0; }
+    keccak256((const uint8_t *)sig, strlen(sig), topic0);
+    for (i = 0; i < 240 && rc == 0; i++) {          /* up to a minute */
+        rc = eth_client_receipt_topic(eth, tx_hash, topic0, 1, word);
+        if (rc == 0) usleep(250000);
+    }
+    free(tx_hash);
+    eth_client_destroy(eth);
+    if (rc != 1) return 0;
+    memcpy(rollup_out, word + 12, 20);              /* an indexed address: the topic's low 20 bytes */
+    return 1;
+}
+
+/* The same lists, for the wallet of a private key */
+int hpplite_l1_factory_list_my_rollups(
+    const char *rpc_url,
+    const char *factory_address,
+    const uint8_t privkey[32],
+    uint8_t (*out)[20],
+    int max
+) {
+    uint8_t me[20];
+    if (eth_address_from_privkey(privkey, me) != 0) return -1;
+    return hpplite_l1_factory_list_rollups(rpc_url, factory_address, me, out, max);
 }
 
 /* Helper: Get rollup address from private key (derive address, then lookup) */
