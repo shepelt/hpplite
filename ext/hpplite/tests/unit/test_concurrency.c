@@ -474,6 +474,33 @@ static void test_rerun_after_foreign_schema_change(void) {
     PASS();
 }
 
+/* The same inside a transaction the application opened: only the failed
+** run's own statement rolls back there, but its end (no rows changed)
+** unlogged the statement, and the rerun went to the database alone */
+static void test_rerun_in_transaction(void) {
+    TEST("the same inside the application's transaction: the rerun is still captured");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/stale_tx.db", l1);
+    HppliteNode *b = open_node(DIR "/stale_tx.db", l1);
+    if (!a || !b) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    sqlite3_stmt *ins;
+    if (sqlite3_prepare_v2(b->db, "INSERT INTO t(v) VALUES('prepared before the ALTER')", -1, &ins, NULL) != SQLITE_OK) FAIL("prepare");
+    hpplite_node_exec(a, "ALTER TABLE t ADD COLUMN w DEFAULT 'x'", NULL);   /* b's schema is now stale */
+    int rc0 = sqlite3_exec(b->db, "BEGIN", NULL, NULL, NULL);
+    int rc1 = sqlite3_step(ins); sqlite3_finalize(ins);
+    int rc2 = sqlite3_exec(b->db, "INSERT INTO t(v) VALUES('after it'); COMMIT", NULL, NULL, NULL);
+    hpplite_node_destroy(b);
+    while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
+    const char *why = replica_differs(a, l1, DIR "/stale_tx_replica.db");
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    if (rc0 != SQLITE_OK || rc1 != SQLITE_DONE || rc2 != SQLITE_OK) FAIL("writes failed");
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     self_path = argv[0];
     if (argc == 5 && strcmp(argv[1], "--hold") == 0) return holder_main(argv);
@@ -485,6 +512,7 @@ int main(int argc, char **argv) {
     test_sequencer_across_processes();
     test_lease_on_close();
     test_rerun_after_foreign_schema_change();
+    test_rerun_in_transaction();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

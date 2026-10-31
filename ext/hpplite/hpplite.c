@@ -1179,21 +1179,35 @@ static void noteNoClock(HppliteCtx *pCtx, sqlite3_int64 id, sqlite3_int64 now) {
 ** itself; our row stays; the rerun runs in the same transaction, which
 ** HPPLite commits at its end.
 */
+/* Track pS as a statement SQLite may rerun stale: in autocommit inside a
+** transaction of HPPLite's (the failed first run would take our row with
+** it), in the application's transaction as it is (only the failed run's own
+** statement rolls back there - but its PROFILE must not unlog the row) */
+static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  if (pCtx->pRerunStmt) return 0;
+  if (sqlite3_get_autocommit(pCtx->db)) {
+    if (internalExec(pCtx, pCtx->db, "BEGIN") != SQLITE_OK) return 0;
+    pCtx->rerunOwnTxn = 1;
+  } else {
+    pCtx->rerunOwnTxn = 0;
+  }
+  pCtx->pRerunStmt = pS;
+  pCtx->rerunStage = 1;
+  return 1;
+}
 static void rerunBegin(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   int v;
-  if (pCtx->pRerunStmt || !sqlite3_get_autocommit(pCtx->db)) return;
+  if (pCtx->pRerunStmt) return;
   v = schemaVersion(pCtx);
-  if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema
-      && internalExec(pCtx, pCtx->db, "BEGIN") == SQLITE_OK) {
-    pCtx->pRerunStmt = pS;
-    pCtx->rerunStage = 1;
-  }
+  if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema) rerunTrack(pCtx, pS);
   pCtx->seenSchema = v;
 }
 static void rerunCommit(HppliteCtx *pCtx) {
+  int own = pCtx->rerunOwnTxn;
   pCtx->pRerunStmt = NULL;
   pCtx->rerunStage = 0;
-  if (!sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
+  pCtx->rerunOwnTxn = 0;
+  if (own && !sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
     /* what the commit hook does for an application commit (ours it skips) */
     pCtx->curTxn = 0;
     pCtx->bRootDirty = 1;
