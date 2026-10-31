@@ -1299,6 +1299,33 @@ static void test_idle_reader_flush_replays(void) {
 }
 
 /* 34. Unsupported SQL is refused by default; determinism=warn lets it through with a count */
+/* A claim mined but reverted (#34, the shape of issue #40 on the real
+** chain): the node asks the chain who holds the lease and does not believe
+** the hash; nothing is posted, nothing is lost, the next claim works */
+static void test_claim_reverted_on_chain(void) {
+    TEST("a claim that reverts after its hash leaves the node without the lease; it posts once a claim lands");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    hpplite_l1_mock_set_claim_reverts(l1, 1);
+    HppliteNode *n = open_node(DIR "/claimrev.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    if (hpplite_node_flush_batch(n) != 0) FAIL("posted without the lease");
+    if (n->hasLease) FAIL("the node believed a reverted claim");
+    if (hpplite_node_pending_count(n) != 1) FAIL("pending must be kept");
+    {
+        uint64_t last = 0, total = 0;
+        hpplite_l1_get_da_state(l1, &last, &total, NULL);
+        if (last != 0) FAIL("a batch reached L1 without the lease");
+    }
+    hpplite_l1_mock_set_claim_reverts(l1, 0);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("the next claim should land and post");
+    if (!n->hasLease || hpplite_node_pending_count(n) != 0) FAIL("lease held, pending posted");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 static void test_unsupported_sql_refused(void) {
     TEST("non-deterministic SQL and ATTACH are refused (strict); warn mode counts");
     SKIP_IF_ROWS("non-deterministic SQL is accepted; ATTACH (test_rows_e2e)");
@@ -1387,6 +1414,7 @@ int main(void) {
     test_capture_matching();
     test_idle_reader_flush_replays();
     test_unsupported_sql_refused();
+    test_claim_reverted_on_chain();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

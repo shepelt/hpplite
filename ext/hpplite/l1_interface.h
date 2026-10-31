@@ -437,6 +437,10 @@ void hpplite_l1_mock_claim_foreign(HppliteL1 *l1, const unsigned char *wallet,
 /* Append raw bytes as the next batch, bypassing the lease (a foreign poster) */
 void hpplite_l1_mock_inject_batch(HppliteL1 *l1, const uint8_t *data, size_t len);
 
+/* A claim that is mined and reverts (another instance got there first): the
+** caller gets a transaction hash, hpplite_l1_wait_for_tx() says 0, the lease
+** is not taken */
+void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert);
 /* Make hpplite_l1_wait_for_tx() take this long (a flush that is in flight) */
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms);
 

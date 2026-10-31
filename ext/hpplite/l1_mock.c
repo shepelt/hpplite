@@ -23,6 +23,7 @@
 struct HppliteL1 {
     /* Owner */
     unsigned char owner[20];
+    unsigned char sequencer[20];     /* The one wallet allowed to claim (the owner by default) */
 
     /* Sequencer with lease */
     int hasSequencer;
@@ -62,6 +63,7 @@ struct HppliteL1 {
     int failAfterPlus1;          /* Test hook: 0 = off; else accept this many - 1 more, then reject */
     int loseConfirmation;        /* Test hook: store but report failure */
     int txPending;               /* Test hook: wait_for_tx never confirms */
+    int claimReverts;            /* Test hook: a claim is mined and reverts (hash returned, no lease) */
     int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
     size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
     size_t maxTxBytes;           /* Test hook: the RPC's transaction size limit (0 = none) */
@@ -269,6 +271,7 @@ int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
         /* the factory hands the rollup to the wallet that created it */
         unsigned char zero[20] = {0};
         if (memcmp(l1->owner, zero, 20) == 0) memcpy(l1->owner, kp.address, 20);
+        if (memcmp(l1->sequencer, zero, 20) == 0) memcpy(l1->sequencer, kp.address, 20);
     }
 
     return 0;
@@ -443,8 +446,16 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
 ** Release the lease (owner expires it)
 */
 char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
-    (void)instanceId;
     if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
+    if (!instanceId) {
+        /* forceExpireLease(): onlyOwner */
+        if (memcmp(l1->owner, l1->myAddress, 20) != 0) return NULL;
+    } else {
+        /* releaseLease(instanceId): the holder's wallet and instance, while active */
+        if (memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) return NULL;   /* "Not sequencer wallet" */
+        if (memcmp(l1->sequencerInstance, instanceId, 32) != 0) return NULL;   /* "Wrong instance" */
+        if (!hpplite_l1_is_lease_active(l1)) return NULL;                       /* "Lease expired" */
+    }
     l1->leaseExpiry = l1->currentTimestamp;
     mockSaveState(l1);
     return sqlite3_mprintf("0x%08x%08x",
@@ -471,10 +482,15 @@ char *hpplite_l1_claim_sequencer(
 ) {
     if (!l1 || !instanceId) return NULL;
     if (!l1->hasPrivkey) return NULL;
+    if (memcmp(l1->sequencer, l1->myAddress, 20) != 0) return NULL;   /* "Not the sequencer" */
 
     /* Check if lease is available */
     if (l1->hasSequencer && hpplite_l1_is_lease_active(l1)) {
         return NULL;  /* Lease still active */
+    }
+    if (l1->claimReverts) {
+        /* mined, then reverted: the caller gets a hash, the chain no lease */
+        return sqlite3_mprintf("0xreverted%08x", (unsigned int)(l1->currentTimestamp));
     }
 
     /* Claim the lease */
@@ -539,7 +555,10 @@ char *hpplite_l1_submit_checkpoint(
 ) {
     if (!l1 || !checkpoint || !instanceId) return NULL;
 
-    /* Verify instanceId matches active lease */
+    /* onlyActiveSequencer(instanceId): the holder's wallet and instance, while active */
+    if (!l1->hasPrivkey || memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) {
+        return NULL;  /* "Not sequencer wallet" */
+    }
     if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {
         return NULL;  /* Wrong instance */
     }
@@ -609,9 +628,9 @@ int hpplite_l1_poll(HppliteL1 *l1) {
 }
 
 int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
-    (void)tx_hash;
     (void)timeout_secs;
     if (l1 && l1->txPending) return -1;   /* still pending after the timeout */
+    if (tx_hash && strncmp(tx_hash, "0xreverted", 10) == 0) return 0;   /* mined, status 0 */
     if (l1 && l1->submitDelayMs > 0) usleep((useconds_t)l1->submitDelayMs * 1000);
     return 1;
 }
@@ -620,6 +639,10 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
 
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
     if (l1) l1->submitDelayMs = ms;
+}
+
+void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert) {
+    if (l1) l1->claimReverts = revert;
 }
 
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
@@ -833,7 +856,10 @@ char *hpplite_l1_submit_batch(
         return NULL;  /* "Non-sequential batch" */
     }
 
-    /* Verify instanceId matches active lease */
+    /* onlyActiveSequencer(instanceId): the holder's wallet and instance, while active */
+    if (!l1->hasPrivkey || memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) {
+        return NULL;  /* "Not sequencer wallet" */
+    }
     if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {
         return NULL;  /* Wrong instance */
     }
@@ -909,10 +935,7 @@ int hpplite_l1_get_batch_hash(
         return 0;
     }
 
-    memset(hash_out, 0, 32);
-    for (size_t i = 0; i < l1->batchLen[idx] && i < 32; i++) {
-        hash_out[i] = l1->batchData[idx][i];
-    }
+    hpplite_keccak256(l1->batchData[idx], l1->batchLen[idx], hash_out);   /* as HPPLiteDA.submitBatch does */
     return 1;
 }
 

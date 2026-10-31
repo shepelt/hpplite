@@ -273,8 +273,18 @@ static void test_lease_expiry(void) {
         return;
     }
 
-    /* Another wallet should now be able to claim */
+    /* Another wallet still cannot claim: claimSequencer is for the one
+    ** sequencer wallet (the owner by default), expired lease or not (#34) */
     hpplite_l1_set_privkey(l1, OTHER_PRIVKEY);
+    txHash = hpplite_l1_claim_sequencer(l1, INSTANCE2);
+    if (txHash) {
+        FAIL("another wallet claimed the expired lease; the contract says 'Not the sequencer'");
+        sqlite3_free(txHash);
+        hpplite_l1_disconnect(l1);
+        return;
+    }
+    /* The sequencer wallet claims it again, with a new instance */
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
     txHash = hpplite_l1_claim_sequencer(l1, INSTANCE2);
     if (!txHash) {
         FAIL("Claim should succeed after expiry");
@@ -438,6 +448,111 @@ static void test_checkpoint_submit(void) {
     PASS();
 }
 
+/* The contract's access rules, as the mock must apply them (#34) */
+#define FAILX(msg) do { FAIL(msg); hpplite_l1_disconnect(l1); return; } while (0)
+static void test_release_rules(void) {
+    HppliteL1 *l1;
+    char *tx;
+    TEST("releaseLease needs the holder's wallet and instance; forceExpireLease the owner");
+    l1 = hpplite_l1_create_mock();
+    if (!l1) { FAIL("create"); return; }
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);                  /* owner and sequencer */
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("claim");
+    sqlite3_free(tx);
+    hpplite_l1_set_privkey(l1, OTHER_PRIVKEY);
+    tx = hpplite_l1_release_lease(l1, INSTANCE1);
+    if (tx) { sqlite3_free(tx); FAILX("another wallet released the holder's lease ('Not sequencer wallet')"); }
+    tx = hpplite_l1_release_lease(l1, NULL);
+    if (tx) { sqlite3_free(tx); FAILX("another wallet force-expired the lease (onlyOwner)"); }
+    if (!hpplite_l1_is_lease_active(l1)) FAILX("the lease went away");
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
+    tx = hpplite_l1_release_lease(l1, INSTANCE2);
+    if (tx) { sqlite3_free(tx); FAILX("released with another instance id ('Wrong instance')"); }
+    tx = hpplite_l1_release_lease(l1, INSTANCE1);
+    if (!tx) FAILX("the holder could not release its own lease");
+    sqlite3_free(tx);
+    if (hpplite_l1_is_lease_active(l1)) FAILX("released, still active");
+    tx = hpplite_l1_release_lease(l1, INSTANCE1);
+    if (tx) { sqlite3_free(tx); FAILX("released an expired lease ('Lease expired')"); }
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("claim again");
+    sqlite3_free(tx);
+    tx = hpplite_l1_release_lease(l1, NULL);                  /* forceExpireLease: the owner */
+    if (!tx) FAILX("the owner could not force-expire");
+    sqlite3_free(tx);
+    if (hpplite_l1_is_lease_active(l1)) FAILX("force-expired, still active");
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+static void test_submit_needs_holder_wallet(void) {
+    HppliteL1 *l1;
+    char *tx;
+    TEST("submitBatch needs the lease holder's wallet, not only its instance id");
+    l1 = hpplite_l1_create_mock();
+    if (!l1) { FAIL("create"); return; }
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("claim");
+    sqlite3_free(tx);
+    hpplite_l1_set_privkey(l1, OTHER_PRIVKEY);
+    tx = hpplite_l1_submit_batch(l1, INSTANCE1, 1, (const uint8_t *)"batch", 5);
+    if (tx) { sqlite3_free(tx); FAILX("another wallet posted under the holder's instance id ('Not sequencer wallet')"); }
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
+    tx = hpplite_l1_submit_batch(l1, INSTANCE1, 1, (const uint8_t *)"batch", 5);
+    if (!tx) FAILX("the holder could not post");
+    sqlite3_free(tx);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+static void test_claim_reverts(void) {
+    HppliteL1 *l1;
+    char *tx;
+    TEST("a claim that is mined and reverts: a hash, wait_for_tx says 0, no lease");
+    l1 = hpplite_l1_create_mock();
+    if (!l1) { FAIL("create"); return; }
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
+    hpplite_l1_mock_set_claim_reverts(l1, 1);
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("a reverting claim still returns its hash");
+    if (hpplite_l1_wait_for_tx(l1, tx, 30) != 0) { sqlite3_free(tx); FAILX("wait_for_tx should say 0 (reverted)"); }
+    sqlite3_free(tx);
+    if (hpplite_l1_is_lease_active(l1)) FAILX("the lease was taken");
+    hpplite_l1_mock_set_claim_reverts(l1, 0);
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("claim after the knob is off");
+    if (hpplite_l1_wait_for_tx(l1, tx, 30) != 1) { sqlite3_free(tx); FAILX("a real claim confirms"); }
+    sqlite3_free(tx);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+static void test_batch_hash_is_keccak(void) {
+    HppliteL1 *l1;
+    char *tx;
+    uint8_t want[32], got[32], latest[32];
+    uint64_t last = 0, total = 0;
+    const uint8_t data[] = "a sealed batch, longer than thirty-two bytes, hashed as the contract hashes it";
+    TEST("getBatchHash and the DA state's latest hash are keccak256 of the batch bytes");
+    l1 = hpplite_l1_create_mock();
+    if (!l1) { FAIL("create"); return; }
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);
+    tx = hpplite_l1_claim_sequencer(l1, INSTANCE1);
+    if (!tx) FAILX("claim");
+    sqlite3_free(tx);
+    tx = hpplite_l1_submit_batch(l1, INSTANCE1, 1, data, sizeof(data) - 1);
+    if (!tx) FAILX("submit");
+    sqlite3_free(tx);
+    hpplite_keccak256(data, sizeof(data) - 1, want);
+    if (hpplite_l1_get_batch_hash(l1, 1, got) != 1) FAILX("no hash");
+    if (memcmp(got, want, 32) != 0) FAILX("getBatchHash is not keccak256(data)");
+    if (hpplite_l1_get_da_state(l1, &last, &total, latest) != 0 || memcmp(latest, want, 32) != 0) FAILX("the DA state's latest hash is not keccak256(data)");
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("\n=== L1 Mock Tests (Lease-Based Model) ===\n\n");
 
@@ -448,6 +563,10 @@ int main(void) {
     test_lease_expiry();
     test_batch_da();
     test_checkpoint_submit();
+    test_release_rules();
+    test_submit_needs_holder_wallet();
+    test_batch_hash_is_keccak();
+    test_claim_reverts();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 
