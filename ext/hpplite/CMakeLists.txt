@@ -185,6 +185,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_checkpoint_flow hpplite)
         add_executable(test_durability tests/unit/test_durability.c)
         target_link_libraries(test_durability hpplite)
+        add_executable(test_faults tests/unit/test_faults.c)
+        target_link_libraries(test_faults hpplite)
         add_executable(test_keys tests/unit/test_keys.c)
         target_link_libraries(test_keys hpplite)
         add_executable(test_abuse tests/unit/test_abuse.c)
@@ -292,6 +294,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
         add_test(NAME test_durability COMMAND test_durability)
+        add_test(NAME test_faults COMMAND test_faults)
         add_test(NAME test_keys COMMAND test_keys)
         add_test(NAME test_abuse COMMAND test_abuse)
         add_test(NAME test_foreign_keys COMMAND test_foreign_keys)
@@ -307,7 +310,7 @@ if(HPPLITE_BUILD_TESTS)
 
         # Every suite above again with statement capture (capture=text, v0.1's;
         # rows are the default, #19): the cases about statement text run there
-        foreach(t test_checkpoint_flow test_durability test_keys test_abuse test_foreign_keys
+        foreach(t test_checkpoint_flow test_durability test_faults test_keys test_abuse test_foreign_keys
                   test_big_txn test_clock test_reorg test_big_stmt test_concurrency)
             add_test(NAME ${t}_text COMMAND ${t})
             # the same scratch directory: never at once (ctest -j)
