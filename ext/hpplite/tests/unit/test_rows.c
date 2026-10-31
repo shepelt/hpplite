@@ -696,6 +696,53 @@ static void test_refused_stale_statement(void) {
     PASS();
 }
 
+/* A refused statement is remembered until its end so that a stale rerun of
+** it (no trace, interrupt cleared) is denied at its reprepare (#89). One
+** expired for another reason - its own rollback undid a schema change of
+** the transaction, which expires every statement - never reruns, and must
+** not leave the connection's next prepare denied */
+static void test_refused_then_expired(void) {
+    TEST("a refused statement expired by its rollback (a schema change in the transaction) leaves the next statement allowed");
+    reset_dir();
+    W a;
+    char err[200];
+    if (!open_writer(DIR "/expired.db", &a)) FAIL("open");
+    exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
+    exec(a.db, "BEGIN");
+    exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
+    int rc = exec(a.db, "INSERT INTO ft(body) VALUES(random())");   /* text (a virtual table), random(): refused */
+    int autoc = sqlite3_get_autocommit(a.db);                       /* SQLITE_INTERRUPT rolled the transaction back */
+    int again = exec(a.db, "CREATE TABLE d(x)");
+    snprintf(err, sizeof(err), "%s", sqlite3_errmsg(a.db));
+    close_writer(&a);
+    if (rc) FAIL("premise: the write was not refused");
+    if (!autoc) FAIL("premise: the transaction was not rolled back");
+    if (!again) FAILF("the next statement on the connection failed: %s", err);
+    PASS();
+}
+/* The same in autocommit: refused as text because another connection moved
+** the schema (this connection's triggers are stale), on a statement prepared
+** on the new schema - no rerun follows either */
+static void test_refused_after_foreign_alter(void) {
+    TEST("a statement refused after another connection's ALTER (stale triggers, text rules) leaves the next statement allowed");
+    reset_dir();
+    W a, b;
+    char err[200];
+    if (!open_writer(DIR "/expired2.db", &a) || !open_writer(DIR "/expired2.db", &b)) FAIL("open");
+    exec(a.db, "CREATE TABLE t(v)");
+    exec(b.db, "ALTER TABLE t ADD COLUMN c DEFAULT 'x'");
+    int rc = exec(a.db, "INSERT INTO t(v) VALUES(random())");        /* a's triggers are stale: text, random(): refused */
+    int autoc = sqlite3_get_autocommit(a.db);
+    int again = exec(a.db, "CREATE TABLE e(x)");
+    snprintf(err, sizeof(err), "%s", sqlite3_errmsg(a.db));
+    close_writer(&b);
+    close_writer(&a);
+    if (rc) FAIL("premise: the write after the other connection's ALTER was not refused");
+    if (!autoc) FAIL("premise: a transaction is open");
+    if (!again) FAILF("the next statement failed: %s", err);
+    PASS();
+}
+
 /* A statement HPPLite tracks for a rerun (prepared on a schema another
 ** connection changed) runs in a transaction of HPPLite's. One that changes
 ** the schema itself (a CREATE VIRTUAL TABLE: FTS5's nested DDL expires it)
@@ -762,6 +809,8 @@ int main(void) {
     test_rebuild_rolled_back();
     test_long_virtual_table_name();
     test_refused_stale_statement();
+    test_refused_then_expired();
+    test_refused_after_foreign_alter();
     test_tracked_schema_change_commits();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);

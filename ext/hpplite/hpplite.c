@@ -1077,9 +1077,16 @@ static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2,
   if (pCtx->pRefusedStmt) {
     /* the reprepare of a refused statement whose first run failed stale:
     ** SQLite reruns it with the interrupt cleared and no trace, so it is
-    ** stopped here, once (the next prepare on the connection is it) (#89) */
+    ** stopped here, once (the next prepare on the connection is it) (#89).
+    ** That reprepare runs inside the same sqlite3_step(), with the
+    ** connection's error code still SQLITE_SCHEMA from the failed run; a
+    ** prepare of the application's never is. The refused statement can be
+    ** expired for other reasons too - its interrupt rolled back a
+    ** transaction with a schema change in it, which expires every
+    ** statement - and no rerun follows then (#101) */
+    int bReprepare = sqlite3_errcode(pCtx->db) == SQLITE_SCHEMA;
     pCtx->pRefusedStmt = NULL;
-    return SQLITE_DENY;
+    if (bReprepare) return SQLITE_DENY;
   }
   /* VACUUM copies the database through one it attaches itself (its own
   ** statements, tables named as ours included); it is logged as text */
