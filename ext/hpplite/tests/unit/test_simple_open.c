@@ -380,6 +380,32 @@ int main(void) {
     }
 
     /* Summary */
+    /* #36: hpplite_open() reads parameters as sqlite3_uri_parameter() does:
+    ** %HH decoded, nothing cut */
+    tests++;
+    TEST("hpplite_open: parameters URL-decoded, long ones whole");
+    {
+        char longRpc[400], uri[1200];
+        memset(longRpc, 0, sizeof(longRpc));
+        strcpy(longRpc, "http://example.invalid:8545/");
+        for (size_t i = strlen(longRpc); i < 300; i++) longRpc[i] = 'p';
+        unlink("/tmp/test_simple_open.db");
+        snprintf(uri, sizeof(uri), "file:/tmp/test_simple_open.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple"
+                 "&dbname=%%7Bfile%%7D&nodeid=a%%20node&rpc=%s", longRpc);
+        sqlite3 *db = hpplite_open(uri);
+        if (!db) FAIL("hpplite_open failed");
+        HppliteConfig *cfg = hpplite_get_config(db);
+        int okName = cfg && cfg->dbName && strcmp(cfg->dbName, "{file}") == 0;
+        int okNode = cfg && cfg->nodeId && strcmp(cfg->nodeId, "a node") == 0;
+        int okRpc = cfg && cfg->rpcUrl && strcmp(cfg->rpcUrl, longRpc) == 0;
+        hpplite_close(db);
+        if (!okName) FAIL("%7Bfile%7D not decoded");
+        if (!okNode) FAIL("%20 not decoded");
+        if (!okRpc) FAIL("a 300-byte value was cut");
+        PASS();
+        passed++;
+    }
+
     printf("\n=== Results: %d/%d tests passed ===\n", passed, tests);
 
     /* Cleanup */

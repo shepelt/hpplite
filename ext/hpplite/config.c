@@ -240,17 +240,25 @@ static const char *get_uri_param(const char *uri, const char *key, char *buf, si
     while (*p) {
         /* Check if this is our key */
         if (strncmp(p, key, keyLen) == 0 && p[keyLen] == '=') {
-            const char *valStart = p + keyLen + 1;
-            const char *valEnd = valStart;
-
-            /* Find end of value */
-            while (*valEnd && *valEnd != '&') valEnd++;
-
-            size_t valLen = valEnd - valStart;
-            if (valLen >= buflen) valLen = buflen - 1;
-
-            memcpy(buf, valStart, valLen);
-            buf[valLen] = '\0';
+            /* %HH decoded, as sqlite3_uri_parameter() does (#36); a value
+            ** longer than the buffer is refused, not cut (a key file path
+            ** or an RPC URL cut short would be another one) */
+            const char *v = p + keyLen + 1;
+            size_t n = 0;
+            while (*v && *v != '&' && *v != '#') {
+                int c = (unsigned char)*v++;
+                if (c == '%' && isxdigit((unsigned char)v[0]) && isxdigit((unsigned char)v[1])) {
+                    char hex[3] = { v[0], v[1], 0 };
+                    c = (int)strtol(hex, NULL, 16);
+                    v += 2;
+                }
+                if (n + 1 >= buflen) {
+                    fprintf(stderr, "hpplite: URI parameter %s is longer than %zu bytes; ignored\n", key, buflen - 1);
+                    return NULL;
+                }
+                buf[n++] = (char)c;
+            }
+            buf[n] = '\0';
             return buf;
         }
 
@@ -296,7 +304,7 @@ static char *extract_db_path(const char *uri) {
 int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (!cfg || !uri) return -1;
 
-    char buf[256];
+    char buf[4096];
 
     /* Extract database path */
     cfg->dbPath = extract_db_path(uri);
