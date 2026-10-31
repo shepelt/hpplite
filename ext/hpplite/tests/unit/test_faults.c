@@ -24,7 +24,10 @@
 #include <strings.h>
 #include <unistd.h>
 
-#define DIR "/tmp/hpplite_test_faults"
+/* a scratch directory of this process's own: two harness runs at once
+** (a long seed sweep beside ctest) must not share one */
+static char g_dir[64];
+static char g_wdb[96], g_rdb[96];
 
 static const unsigned char PRIVKEY[32] = {
     0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
@@ -41,7 +44,7 @@ static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1, int interval) {
     config.nodeId = "faults";
     memcpy(config.privkey, PRIVKEY, 32);
     config.hasPrivkey = 1;
-    config.dataDir = DIR;
+    config.dataDir = g_dir;
     config.dbPath = (char *)dbPath;
     config.checkpointInterval = interval;
     HppliteNode *n = hpplite_node_create(&config);
@@ -142,16 +145,20 @@ static const char *run_seed(unsigned seed, int two) {
     int nFaults[F_COUNT] = {0};
     int altered = 0, step, nextId = 1, nRows = 0;
     g_rng = seed * 2654435761u + 12345;
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
+    {
+        char cmd[200];
+        snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s", g_dir, g_dir);
+        (void)!system(cmd);
+    }
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    HppliteNode *w = open_node(DIR "/w.db", l1, 1 + (int)(rnd() % 4));
+    HppliteNode *w = open_node(g_wdb, l1, 1 + (int)(rnd() % 4));
     if (!w) return "open writer";
     exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)");
     exec(w, "CREATE INDEX tk ON t(k)");
     exec(w, "CREATE TABLE s(name TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID");
     HppliteNode *f = NULL;
     if (two) {
-        f = open_node(DIR "/w.db", l1, 1);
+        f = open_node(g_wdb, l1, 1);
         if (!f || !f->follower) { if (f) hpplite_node_destroy(f); hpplite_node_destroy(w); hpplite_l1_disconnect(l1); return "second connection should be a follower"; }
     }
 
@@ -237,7 +244,7 @@ static const char *run_seed(unsigned seed, int two) {
     hpplite_state_root(w->db, rootW);
     hpplite_node_destroy(w);
 
-    HppliteNode *r = open_node(DIR "/r.db", l1, 1);
+    HppliteNode *r = open_node(g_rdb, l1, 1);
     if (!r) { sqlite3_free(a); hpplite_l1_disconnect(l1); return "open replica"; }
     char *b = dump(r->db);
     hpplite_state_root(r->db, rootR);
@@ -273,6 +280,9 @@ static const char *run_seed(unsigned seed, int two) {
 
 int main(void) {
     const char *one = getenv("HPPLITE_FAULT_SEED"), *many = getenv("HPPLITE_FAULT_SEEDS");
+    snprintf(g_dir, sizeof g_dir, "/tmp/hpplite_test_faults.%d", (int)getpid());
+    snprintf(g_wdb, sizeof g_wdb, "%s/w.db", g_dir);
+    snprintf(g_rdb, sizeof g_rdb, "%s/r.db", g_dir);
     unsigned nSeeds = many ? (unsigned)atoi(many) : 60, failed = 0;
     printf("=== HPPLite under injected faults (#98), %s capture ===\n",
            getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
@@ -282,7 +292,7 @@ int main(void) {
         printf("one connection: %s\n", why ? why : "ok");
         const char *why2 = run_seed((unsigned)atoi(one), 1);
         printf("two connections: %s\n", why2 ? why2 : "ok");
-        (void)!system("rm -rf " DIR);
+        { char cmd[120]; snprintf(cmd, sizeof cmd, "rm -rf %s", g_dir); (void)!system(cmd); }
         return why || why2 ? 1 : 0;
     }
     for (unsigned s = 1; s <= nSeeds; s++) {
@@ -291,7 +301,7 @@ int main(void) {
         why = run_seed(s, 1);
         if (why) { printf("  FAIL (two connections): %s\n", why); failed++; }
     }
-    (void)!system("rm -rf " DIR);
+    { char cmd[120]; snprintf(cmd, sizeof cmd, "rm -rf %s", g_dir); (void)!system(cmd); }
     printf("\n%u/%u seeds passed\n", nSeeds - failed, nSeeds);
     return failed ? 1 : 0;
 }
