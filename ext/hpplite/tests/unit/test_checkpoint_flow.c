@@ -13,6 +13,7 @@
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 static const unsigned char SEQ_PRIVKEY[32] = {
@@ -150,12 +151,53 @@ static void test_checkpoint_without_l1(void) {
     PASS();
 }
 
+/* The contract's checkpointInterval is the configuration of record (#44):
+** a node that sets none takes it; one that sets its own writes it back */
+static void test_interval_from_contract(void) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    char *tx;
+    TEST("no checkpoint= given: the contract's interval is used");
+    hpplite_l1_set_privkey(l1, SEQ_PRIVKEY);                 /* the owner */
+    tx = hpplite_l1_set_checkpoint_interval(l1, 3);
+    if (!tx) FAIL("premise: the owner sets the contract's interval");
+    sqlite3_free(tx);
+    HppliteNode *node = open_node(l1, 0);                    /* 0: none given */
+    if (!node) FAIL("open");
+    if (node->config.checkpointInterval != 3) FAILF("node uses %d, the contract says 3", node->config.checkpointInterval);
+    for (int i = 0; i < 3; i++) {
+        char sql[64];
+        snprintf(sql, sizeof(sql), "CREATE TABLE t%d (x INTEGER)", i);
+        hpplite_node_exec(node, sql, NULL);
+        if (hpplite_node_flush_batch(node) != (uint64_t)(i + 1)) FAIL("flush");
+    }
+    if (hpplite_l1_mock_get_checkpoint_count(l1) != 1) FAIL("a checkpoint after 3 batches, as the contract says");
+    hpplite_node_destroy(node);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+static void test_interval_written_back(void) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TEST("checkpoint=2 given: written to the contract by its owner, so on-chain config and reality agree");
+    HppliteNode *node = open_node(l1, 2);
+    if (!node) FAIL("open");
+    HppliteL1State *st = hpplite_l1_get_state(l1);
+    uint64_t onChain = st ? st->checkpointInterval : 0;
+    hpplite_l1_state_free(st);
+    if (onChain != 2) { hpplite_node_destroy(node); FAILF("the contract says %llu, the node uses 2", (unsigned long long)onChain); }
+    hpplite_node_destroy(node);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== Checkpoint Flow Tests ===\n");
     test_checkpoint_auto();
     test_checkpoint_chain();
     test_checkpoint_every_batch();
     test_checkpoint_without_l1();
+    test_interval_from_contract();
+    test_interval_written_back();
     (void)!system("rm -rf " DIR);
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

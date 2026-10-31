@@ -641,6 +641,14 @@ void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
     if (l1) l1->submitDelayMs = ms;
 }
 
+char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
+    if (!l1 || !l1->hasPrivkey || interval == 0) return NULL;
+    if (memcmp(l1->owner, l1->myAddress, 20) != 0) return NULL;   /* onlyOwner */
+    l1->checkpointInterval = interval;
+    mockSaveState(l1);
+    return sqlite3_mprintf("0x%08xckpt%08x", (unsigned int)l1->currentBlock, (unsigned int)interval);
+}
+
 void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert) {
     if (l1) l1->claimReverts = revert;
 }

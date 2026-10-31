@@ -111,6 +111,8 @@ HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config);
 ** Caller must free with hpplite_l1_system_config_free().
 */
 HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1);
+/* setCheckpointInterval(uint256): the owner's transaction, its hash (sqlite3_free) or NULL (#44) */
+char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval);
 
 /*
 ** Free system config

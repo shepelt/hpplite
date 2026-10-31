@@ -106,6 +106,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     memcpy(node->config.contract, config->contract, 20);
     node->config.hasContract = config->hasContract;
     node->config.checkpointInterval = config->checkpointInterval > 0 ? config->checkpointInterval : 100;
+    node->checkpointGiven = config->checkpointInterval > 0;
     node->config.batchIntervalMs = config->batchIntervalMs;
     node->config.maxBatchBytes = config->maxBatchBytes ? config->maxBatchBytes : 128 * 1024;
     node->config.chainId = config->chainId;
@@ -739,6 +740,28 @@ static void node_learn_batch_limit(HppliteNode *node) {
     if (cfg) {
         if (cfg->batchSizeLimit > 0) node->config.maxBatchBytes = (size_t)cfg->batchSizeLimit;
         if (cfg->leaseDuration > 0) node->leaseDuration = cfg->leaseDuration;
+        /* The contract's checkpointInterval is the configuration of record
+        ** (#44): a node given none takes it; one given its own writes it
+        ** back (the owner's transaction, once per node), so that what the
+        ** chain says and what the node does agree. */
+        if (cfg->checkpointInterval > 0 && !node->checkpointSynced) {
+            node->checkpointSynced = 1;
+            if (!node->checkpointGiven) {
+                node->config.checkpointInterval = (int)cfg->checkpointInterval;
+            } else if ((uint64_t)node->config.checkpointInterval != cfg->checkpointInterval) {
+                char *tx = hpplite_l1_set_checkpoint_interval(node->l1, (uint64_t)node->config.checkpointInterval);
+                if (tx) {
+                    hpplite_l1_wait_for_tx(node->l1, tx, 30);
+                    sqlite3_free(tx);
+                    fprintf(stderr, "hpplite: checkpoint interval on the contract set to %d (was %llu)\n",
+                            node->config.checkpointInterval, (unsigned long long)cfg->checkpointInterval);
+                } else {
+                    fprintf(stderr, "hpplite: the contract's checkpoint interval is %llu, this node's %d; could not set it "
+                                    "(the owner's transaction) - the node's value is used\n",
+                            (unsigned long long)cfg->checkpointInterval, node->config.checkpointInterval);
+                }
+            }
+        }
         hpplite_l1_system_config_free(cfg);
     }
     node_cap_batch_limit(node);

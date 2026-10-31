@@ -43,6 +43,7 @@ struct HppliteL1 {
 
 /* Function selectors - HPPLite contract (coordination) */
 static uint8_t SEL_GET_STATE[4];
+static uint8_t SEL_SET_CHECKPOINT_INTERVAL[4];
 static uint8_t SEL_CLAIM_SEQUENCER[4];
 static uint8_t SEL_RENEW_LEASE[4];
 static uint8_t SEL_SUBMIT_CHECKPOINT[4];
@@ -82,6 +83,7 @@ static void init_selectors(void) {
 
     /* HPPLite selectors (coordination) */
     abi_function_selector("getState()", SEL_GET_STATE);
+    abi_function_selector("setCheckpointInterval(uint256)", SEL_SET_CHECKPOINT_INTERVAL);
     abi_function_selector("claimSequencer(bytes32)", SEL_CLAIM_SEQUENCER);
     abi_function_selector("renewLease(bytes32)", SEL_RENEW_LEASE);
     abi_function_selector("submitCheckpoint(bytes32,uint256,uint256,bytes32)", SEL_SUBMIT_CHECKPOINT);
@@ -187,6 +189,19 @@ static char *txHashString(uint8_t *tx_hash) {
     free(tx_hash);
     return out;
 }
+
+char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
+    uint8_t calldata[4 + 32];
+    uint8_t *tx_hash;
+    if (!l1 || interval == 0) return NULL;
+    init_selectors();
+    memcpy(calldata, SEL_SET_CHECKPOINT_INTERVAL, 4);
+    abi_encode_uint64(interval, calldata + 4);
+    tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+    if (!tx_hash) return NULL;
+    return txHashString(tx_hash);
+}
+
 
 /* Set private key for signing transactions */
 int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {

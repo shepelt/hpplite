@@ -111,6 +111,8 @@ typedef struct HppliteNode {
     char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
     int warnedNoL1;                 /* "L1 requested but not connected" said once */
     int warnedNoChain;              /* "no chain configured, the log is kept" said once (#38) */
+    int checkpointGiven;            /* The configuration named an interval (else the contract's is used, #44) */
+    int checkpointSynced;           /* ... and it was compared with the contract's once */
 
     /* Checkpoint tracking */
     uint64_t lastCheckpointHeight;
