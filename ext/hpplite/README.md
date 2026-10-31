@@ -110,6 +110,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `contract` | No | Connect to an existing rollup instead of using the factory |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
+| `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
@@ -402,7 +403,7 @@ changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
-`unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
+`verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
 finalized here, no history kept), `disconnected` (a chain was configured but
 is not reachable), `error` (sync stopped: the history and the file do not
 agree), `stopped`. `last_error` is the last failure said on stderr - a post
@@ -426,10 +427,26 @@ sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
 sqlite3> SELECT height, state_root, roots_compared, root_mismatches, replay_skipped FROM hpplite_status;
 ```
 
-A `hpplite verify` command that does this without writing a file, reports
-per-table differences, and works with a viewing key instead of the wallet key
-is v0.2 (#5, #15). There is no fraud proof or challenge period: the chain
-holds the log and the roots, the key holder is the one who checks them.
+**`hpplite-verify`** (#5) packages this as a command:
+
+```sh
+HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/to/app.db
+```
+
+It opens an empty file with `role=verify` and the application's own
+parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`),
+rebuilds from the chain alone, compares every posted root with the rebuilt
+content, and compares the root the contract anchors at its last checkpoint
+with the rebuilt content at that height. With `--db` it also compares the
+live database (the same content hash as the state root) and, when they
+differ and nothing is pending, names the tables that differ. Exit 0 verified,
+1 not (a root mismatch, a sync that stopped short, a live file that
+differs), 2 could not run. The rebuilt file is deleted unless `--keep <dir>`.
+A verifier never posts, never claims the lease and never creates a rollup;
+`role=verify` is also usable from any connection that only wants to audit.
+It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).
+There is no fraud proof or challenge period: the chain holds the log and
+the roots, the key holder is the one who checks them.
 
 ## Versions
 

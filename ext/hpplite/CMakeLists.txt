@@ -150,6 +150,8 @@ endif()
 # The sidecar sequencer for apps with short-lived connections (PHP, CGI)
 add_executable(hpplite-sequencer tools/hpplite_sequencer.c)
 target_link_libraries(hpplite-sequencer hpplite)
+add_executable(hpplite-verify tools/hpplite_verify.c)
+target_link_libraries(hpplite-verify hpplite)
 
 if(HPPLITE_BUILD_TESTS)
     # Include tests directory for test_env.h

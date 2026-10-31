@@ -36,4 +36,4 @@ rm -f "$log.forge"
 # forge script prints the simulated address even when the broadcast reverted (e.g. over the 24 KB size limit)
 [ "$(cast code "$factory" --rpc-url "$rpc" 2>/dev/null | wc -c)" -gt 10 ] || { echo "factory at $factory has no code: deployment reverted (forge build --sizes)"; exit 1; }
 echo "anvil on $rpc, factory $factory"
-HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_PID=$pid "$bin"
+HPPLITE_VERIFY_BIN="$(dirname "$bin")/hpplite-verify" HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_PID=$pid "$bin"

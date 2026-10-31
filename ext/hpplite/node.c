@@ -117,6 +117,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
     node->config.localOnly = config->localOnly;
+    node->config.verifyOnly = config->verifyOnly;
     /* the environment chooses for any node whose configuration did not say
     ** (every suite runs in both modes); a URI's capture= stands (#80) */
     if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
@@ -386,6 +387,12 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         }
         if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) return 0;
     }
+    if (node->config.verifyOnly) {
+        fprintf(stderr, "hpplite: role=verify: no rollup of this wallet is database \"%s\" (its databases: %s); nothing to verify\n",
+                zName, zOthers ? zOthers : "none named");
+        sqlite3_free(zOthers);
+        return 0;
+    }
     /* a misspelt name would be a new database: say which exist (#79) */
     fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s); creating one\n",
             zName, zOthers ? zOthers : "none named");
@@ -426,6 +433,10 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                                " and uses the wallet's primary rollup\n", n);
         }
 
+        if (result == 0 && config->verifyOnly) {
+            fprintf(stderr, "hpplite: role=verify: this wallet has no rollup on this factory; nothing to verify\n");
+            return;
+        }
         if (result == 0 && !named) {
             /* No rollup exists - create one */
             char *txHash = hpplite_l1_factory_get_or_create_rollup(
@@ -748,7 +759,7 @@ static void node_learn_batch_limit(HppliteNode *node) {
             node->checkpointSynced = 1;
             if (!node->checkpointGiven) {
                 node->config.checkpointInterval = (int)cfg->checkpointInterval;
-            } else if ((uint64_t)node->config.checkpointInterval != cfg->checkpointInterval) {
+            } else if ((uint64_t)node->config.checkpointInterval != cfg->checkpointInterval && !node->config.verifyOnly) {
                 char *tx = hpplite_l1_set_checkpoint_interval(node->l1, (uint64_t)node->config.checkpointInterval);
                 if (tx) {
                     hpplite_l1_wait_for_tx(node->l1, tx, 30);
@@ -1260,6 +1271,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     int more;
 
     if (!node->ctx) return 0;
+    if (node->config.verifyOnly) return 0;      /* a verifier rebuilds and compares; it posts nothing (#5) */
     /* the sequencer connection posts - unless it is gone: then this one does */
     if (node->follower && !node_try_promote(node)) return 0;
     if (node->l1 && node_check_rollup(node) < 0) return 0;
@@ -1615,7 +1627,7 @@ int hpplite_node_start(HppliteNode *node) {
     /* Take the lease if it is free or ours; a foreign holder (another
     ** instance of this wallet, or a stranger) is left alone - we capture
     ** and keep pending until it expires. Starting is not a failure then. */
-    if (node->l1 && !node->follower) {
+    if (node->l1 && !node->follower && !node->config.verifyOnly) {
         node->leaseRecheckAt = 0;
         node_ensure_lease(node);
     }

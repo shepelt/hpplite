@@ -86,6 +86,7 @@ HppliteConfigRole hpplite_config_parse_role(const char *str) {
     if (!str) return HPPLITE_CFG_ROLE_UNKNOWN;
     if (strcmp(str, "sequencer") == 0) return HPPLITE_CFG_ROLE_SEQUENCER;
     if (strcmp(str, "observer") == 0) return HPPLITE_CFG_ROLE_OBSERVER;
+    if (strcmp(str, "verify") == 0) return HPPLITE_CFG_ROLE_VERIFY;
     return HPPLITE_CFG_ROLE_UNKNOWN;
 }
 
@@ -93,6 +94,7 @@ const char *hpplite_config_role_str(HppliteConfigRole role) {
     switch (role) {
         case HPPLITE_CFG_ROLE_SEQUENCER: return "sequencer";
         case HPPLITE_CFG_ROLE_OBSERVER: return "observer";
+        case HPPLITE_CFG_ROLE_VERIFY: return "verify";
         default: return "unknown";
     }
 }

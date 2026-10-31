@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
@@ -26,6 +27,7 @@
 static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); fflush(stdout); tests_run++; } while (0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while (0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
 static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *ANVIL_PID;
@@ -94,6 +96,47 @@ static void test_open_write_post_checkpoint(void) {
     HppliteL1 *peek = hpplite_l1_connect(RPC, c);
     if (lease_is(peek, inst) != 0) { dump_state(peek, inst, "after close"); hpplite_l1_disconnect(peek); FAIL("close must release the lease"); }
     hpplite_l1_disconnect(peek);
+    PASS();
+}
+
+/* 1b. The verifier (#5): the tool rebuilds KEY0's rollup from the chain
+** alone, matches the checkpoint the contract anchors, and says whether the
+** live file equals it - before and after a write past the log */
+static int run_verify(const char *extra, char *out, size_t n) {
+    const char *bin = getenv("HPPLITE_VERIFY_BIN");
+    char cmd[1600];
+    FILE *p;
+    size_t got = 0;
+    int status;
+    if (!bin) return -2;
+    snprintf(cmd, sizeof cmd, "HPPLITE_PARAMS='rpc=%s&factory=%s&chainid=31337&privkey=%s' '%s' %s 2>&1",
+             RPC, FACTORY, KEY0, bin, extra ? extra : "");
+    p = popen(cmd, "r");
+    if (!p) return -2;
+    while (got + 1 < n && fgets(out + got, (int)(n - got), p)) got = strlen(out);
+    status = pclose(p);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+static void test_verify_tool(void) {
+    char out[4096] = "", cmd[600];
+    int rc;
+    TEST("hpplite-verify: rebuilds from the chain, matches the anchored checkpoint; --db sees a write past the log");
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    snprintf(cmd, sizeof cmd, "--db " DIR "/t1.db");
+    rc = run_verify(cmd, out, sizeof out);
+    if (rc != 0 || !strstr(out, "matches the rebuilt content") || !strstr(out, "equals the chain") || !strstr(out, "\nverified"))
+        FAILF("exit %d, output:\n%s", rc, out);
+    /* a write by a plain connection: the live file no longer equals the chain */
+    {
+        sqlite3 *plain = NULL;
+        if (sqlite3_open(DIR "/t1.db", &plain) != SQLITE_OK) FAIL("plain open");
+        if (sqlite3_exec(plain, "INSERT INTO t VALUES(2)", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(plain); FAIL("plain write"); }
+        sqlite3_close(plain);
+    }
+    out[0] = 0;
+    rc = run_verify(cmd, out, sizeof out);
+    if (rc != 1 || !strstr(out, "DIFFERS from the chain") || !strstr(out, "table t: differs (2 rows live, 1 rebuilt)") || !strstr(out, "NOT verified"))
+        FAILF("after a write past the log: exit %d, output:\n%s", rc, out);
     PASS();
 }
 
@@ -588,6 +631,7 @@ int main(void) {
     (void)!system("rm -rf " DIR " && mkdir -p " DIR);
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
+    test_verify_tool();
     test_second_instance_same_wallet();
     test_concurrent_rpc();
     test_sleep_and_wake();

@@ -91,7 +91,8 @@ extern "C" {
 typedef enum {
     HPPLITE_CFG_ROLE_UNKNOWN = 0,
     HPPLITE_CFG_ROLE_SEQUENCER,
-    HPPLITE_CFG_ROLE_OBSERVER
+    HPPLITE_CFG_ROLE_OBSERVER,
+    HPPLITE_CFG_ROLE_VERIFY          /* rebuild and compare only: never post, claim or create (#5) */
 } HppliteConfigRole;
 
 /*

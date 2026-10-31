@@ -63,6 +63,7 @@ typedef struct HppliteNodeConfig {
     int captureText;                /* Capture statements, as v0.1 (default 0: rows, #19) */
     int captureSource;              /* ...2 when a URI said so: HPPLITE_CAPTURE does not override it (#80) */
     int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
+    int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;

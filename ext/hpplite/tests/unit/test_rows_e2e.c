@@ -898,6 +898,65 @@ static void test_no_chain_keeps_the_log(void) {
     PASS();
 }
 
+/* role=verify (#5): rebuild from the chain, compare every posted root and
+** the on-chain checkpoint, and never post, claim the lease or create */
+static void test_verify_role(void) {
+    TEST("role=verify rebuilds, compares roots and the on-chain checkpoint, and never posts or takes the lease");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "rows";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = DIR "/vw.db";
+    config.checkpointInterval = 2;
+    config.noEncrypt = g_plain;
+    HppliteNode *w = hpplite_node_create(&config);
+    if (!w) FAIL("open writer");
+    hpplite_node_set_l1(w, l1);
+    hpplite_node_start(w);
+    hpplite_node_exec(w, "CREATE TABLE t(a)", NULL);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("batch 1");
+    hpplite_node_exec(w, "INSERT INTO t VALUES(1), (2)", NULL);
+    if (hpplite_node_flush_batch(w) != 2) FAIL("batch 2 (carries the root, checkpoint)");
+    hpplite_node_exec(w, "INSERT INTO t VALUES(3)", NULL);
+    if (hpplite_node_flush_batch(w) != 3) FAIL("batch 3");
+    hpplite_node_destroy(w);                                  /* releases the lease */
+
+    config.dbPath = DIR "/vr.db";
+    config.checkpointInterval = 0;                            /* the contract's */
+    config.verifyOnly = 1;
+    HppliteNode *v = hpplite_node_create(&config);
+    if (!v) FAIL("open verifier");
+    hpplite_node_set_l1(v, l1);
+    if (hpplite_node_sync_from_l1(v, 1) < 0) { hpplite_node_destroy(v); FAIL("sync"); }
+    hpplite_node_start(v);
+    if (scalar(v->db, "SELECT count(*) FROM t") != 3) { hpplite_node_destroy(v); FAIL("rebuilt content"); }
+    if (v->ctx->nRootsCompared < 1 || v->ctx->nRootMismatches != 0) { hpplite_node_destroy(v); FAILF("roots compared %llu, mismatches %llu", (unsigned long long)v->ctx->nRootsCompared, (unsigned long long)v->ctx->nRootMismatches); }
+    {
+        HppliteL1State *st = hpplite_l1_get_state(l1);
+        int ok = st && st->lastCheckpointHeight == 2 && v->ctx->rootCmpHeight == 2
+                 && memcmp(st->lastStateRoot, v->ctx->rootCmp, 32) == 0;
+        hpplite_l1_state_free(st);
+        if (!ok) { hpplite_node_destroy(v); FAIL("the on-chain checkpoint root at height 2 should equal the rebuilt root there"); }
+    }
+    WANT_STATUS(v->db, "state", "verify", "as a verifier");
+    if (v->hasLease) { hpplite_node_destroy(v); FAIL("a verifier took the lease"); }
+    hpplite_node_exec(v, "INSERT INTO t VALUES(99)", NULL);  /* a verifier's own write: never posted */
+    uint64_t h = hpplite_node_flush_batch(v);
+    uint64_t last = 0, total = 0;
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    int lease = v->hasLease, pending = hpplite_node_pending_count(v);
+    hpplite_node_destroy(v);
+    hpplite_l1_disconnect(l1);
+    if (h != 0 || last != 3) FAILF("a verifier posted: flush %llu, chain height %llu", (unsigned long long)h, (unsigned long long)last);
+    if (lease) FAIL("a verifier claimed the lease to post");
+    if (pending != 1) FAIL("the verifier's own row should stay pending (and unposted)");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -921,6 +980,7 @@ int main(void) {
     test_foreign_writes_detected();
     test_state_and_last_error();
     test_no_chain_keeps_the_log();
+    test_verify_role();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

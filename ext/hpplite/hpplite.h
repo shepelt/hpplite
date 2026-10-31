@@ -170,6 +170,8 @@ struct HppliteCtx {
   sqlite3_int64 aBkFinger[3]; /* HPPLite's own state then: pending min(id), max(id), a hash of _hpplite_meta */
   uint64_t nRootsCompared;    /* Posted roots compared with our content hash during replay */
   uint64_t nRootMismatches;   /* ... of which differed */
+  uint64_t rootCmpHeight;     /* The last batch whose posted root was compared, and the rebuilt root there (#5) */
+  unsigned char rootCmp[32];
   uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */
 
   /* Callbacks for external integration */

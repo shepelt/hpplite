@@ -87,8 +87,9 @@ sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
 sqlite3> SELECT height, state_root, replay_skipped FROM hpplite_status;
 ```
 
-`hpplite verify` (v0.2, #5) packages this without writing a file and with
-per-table reporting.
+`hpplite-verify` (#5) packages this: a `role=verify` open into a temporary
+file, the on-chain checkpoint root compared as well, and with `--db` the
+live database compared, with per-table reporting.
 
 ---
 
@@ -372,8 +373,9 @@ A key holder checks the whole history by rebuilding it:
 ```
 
 Opening an empty file with `hpplite=on` and the key does all four and
-reports on stderr and in `hpplite_status.roots_compared` / `root_mismatches`; `hpplite verify` (v0.2) packages it as a command with
-per-table reporting. It is an on-demand audit, not a running node.
+reports on stderr and in `hpplite_status.roots_compared` / `root_mismatches`; `hpplite-verify` (#5) packages it as a command with
+the on-chain checkpoint compared and per-table reporting. It is an on-demand audit, not a running node: `role=verify` never
+posts, claims or creates.
 
 ---
 

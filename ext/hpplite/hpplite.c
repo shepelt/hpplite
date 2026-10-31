@@ -3115,6 +3115,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (!pBatch->hasRoot) return SQLITE_OK;
   hpplite_get_state_root(pCtx, root);
   pCtx->nRootsCompared++;
+  pCtx->rootCmpHeight = pBatch->height;        /* for the verifier: compared with the on-chain checkpoint (#5) */
+  memcpy(pCtx->rootCmp, root, HPPLITE_HASH_SIZE);
   if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
     pCtx->nRootMismatches++;
     hpplite_error(pCtx, "state root mismatch after replaying batch %llu",
@@ -3587,6 +3589,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_STATE: {              /* what this node is doing about posting (#32) */
             const char *z;
             if (node->state == HPPLITE_STATE_ERROR) z = "error";
+            else if (node->config.verifyOnly) z = "verify";
             else if (node->state == HPPLITE_STATE_STOPPED) z = "stopped";
             else if (node->state == HPPLITE_STATE_INIT) z = "init";
             else if (!node->l1) z = node->wantsL1 ? "disconnected" : node->config.localOnly ? "local" : "unposted";
@@ -3756,6 +3759,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->captureText = cfg->captureText;
     nc->captureSource = cfg->captureSource;
     nc->localOnly = cfg->localOnly;
+    nc->verifyOnly = cfg->role == HPPLITE_CFG_ROLE_VERIFY;
     nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
