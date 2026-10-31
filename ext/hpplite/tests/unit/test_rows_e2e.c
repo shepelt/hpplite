@@ -430,6 +430,75 @@ static void test_reopen(void) {
     PASS();
 }
 
+/* 10. VACUUM may renumber the rowids of tables without an INTEGER PRIMARY
+** KEY, and records address their rows by rowid: the replica's VACUUM must
+** renumber the same way for the records after it to hit the same rows */
+static void test_vacuum(void) {
+    TEST("VACUUM on tables without INTEGER PRIMARY KEY (gaps, a WITHOUT ROWID table), then updates and deletes by rowid: replica equal");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/vac.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = {
+        "CREATE TABLE plain(name TEXT, v)",
+        "CREATE TABLE keyed(k TEXT PRIMARY KEY, v)",
+        "CREATE TABLE wr(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) "
+        "INSERT INTO plain SELECT 'p' || i, i FROM n",
+        "INSERT INTO keyed SELECT name, v FROM plain",
+        "INSERT INTO wr SELECT name, v FROM plain",
+        "DELETE FROM plain WHERE v % 3 = 0",
+        "DELETE FROM keyed WHERE v % 4 = 0",
+        "DELETE FROM wr WHERE v % 5 = 0",
+        "VACUUM",
+        "UPDATE plain SET v = -v WHERE rowid IN (1, 2, 50, 150)",
+        "DELETE FROM plain WHERE rowid = 10",
+        "UPDATE keyed SET v = random() WHERE rowid < 20",
+        "INSERT INTO plain VALUES('after', 0)",
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT max(rowid) FROM plain") != 201) FAILF("writer premise: VACUUM renumbered plain to %lld rows", scalar(w->db, "SELECT max(rowid) FROM plain"));
+    const char *why = replica_matches(w, l1, "vac_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 11. The capture triggers are HPPLite's: the application cannot drop or
+** shadow them; a table's own drop takes its triggers, and they come back
+** with the table */
+static void test_trigger_guard(void) {
+    TEST("the application cannot drop or create hpplite_cap_ triggers; DROP TABLE still works and capture resumes on a new table");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/guard.db", l1);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x)", NULL);
+    char name[64] = "";
+    sqlite3_stmt *q;
+    if (sqlite3_prepare_v2(w->db, "SELECT name FROM temp.sqlite_schema WHERE type = 'trigger' AND name LIKE 'hpplite_cap_i%'", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW) snprintf(name, sizeof(name), "%s", sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+    }
+    if (!name[0]) FAIL("no capture trigger to test with");
+    char sql[160];
+    snprintf(sql, sizeof(sql), "DROP TRIGGER temp.\"%s\"", name);
+    int dropRc = sqlite3_exec(w->db, sql, NULL, NULL, NULL);
+    int createRc = sqlite3_exec(w->db, "CREATE TEMP TRIGGER hpplite_cap_x AFTER INSERT ON main.t BEGIN SELECT 1; END", NULL, NULL, NULL);
+    hpplite_node_exec(w, "INSERT INTO t VALUES(random())", NULL);
+    int dropTableRc = sqlite3_exec(w->db, "DROP TABLE t", NULL, NULL, NULL);
+    hpplite_node_exec(w, "CREATE TABLE t(y); INSERT INTO t VALUES(randomblob(4))", NULL);
+    sqlite3_int64 recs = scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE op > 0");
+    const char *why = replica_matches(w, l1, "guard_r.db");
+    hpplite_l1_disconnect(l1);
+    if (dropRc == SQLITE_OK) FAIL("DROP TRIGGER of a capture trigger accepted");
+    if (createRc == SQLITE_OK) FAIL("CREATE TRIGGER with the capture prefix accepted");
+    if (dropTableRc != SQLITE_OK) FAIL("DROP TABLE refused");
+    if (recs != 2) FAILF("%lld records, want 2 (before and after the drop)", (long long)recs);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -442,6 +511,8 @@ int main(void) {
     test_attach_refused();
     test_hooks_replaced();
     test_reopen();
+    test_vacuum();
+    test_trigger_guard();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

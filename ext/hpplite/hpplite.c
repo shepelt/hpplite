@@ -898,7 +898,23 @@ static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
 static int isHppliteTable(const char *zName) {
   return zName && sqlite3_strnicmp(zName, "_hpplite_", 9) == 0;
 }
+/* Row capture's triggers (#19): only HPPLite makes or drops them */
+static int isCaptureTrigger(const char *zName) {
+  return zName && sqlite3_strnicmp(zName, "hpplite_cap_", 12) == 0;
+}
 static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, const char *z2) {
+  if (op == SQLITE_DROP_TABLE || op == SQLITE_DROP_TEMP_TABLE) {
+    snprintf(pCtx->zDropTable, sizeof(pCtx->zDropTable), "%s", z1 ? z1 : "");
+  }
+  if ((op == SQLITE_CREATE_TRIGGER || op == SQLITE_CREATE_TEMP_TRIGGER
+       || ((op == SQLITE_DROP_TRIGGER || op == SQLITE_DROP_TEMP_TRIGGER)
+           /* a table's drop takes its triggers, ours too: rebuilt after */
+           && !(z2 && pCtx->zDropTable[0] && sqlite3_stricmp(z2, pCtx->zDropTable) == 0)))
+      && isCaptureTrigger(z1)) {
+    pCtx->zDenyWhy = "the hpplite_cap_ triggers record this connection's writes; only HPPLite changes them";
+    pCtx->nAuthDenied++;
+    return SQLITE_DENY;
+  }
   switch (op) {
     case SQLITE_INSERT: case SQLITE_UPDATE: case SQLITE_DELETE:
     case SQLITE_DROP_TABLE: case SQLITE_DROP_INDEX: case SQLITE_DROP_TRIGGER: case SQLITE_DROP_VIEW:
@@ -956,6 +972,9 @@ static int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2,
     return SQLITE_OK;
   }
   if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  /* VACUUM copies the database through one it attaches itself (its own
+  ** statements, tables named as ours included); it is logged as text */
+  if (pCtx->pVacuumStmt) return SQLITE_OK;
   /* the capture triggers' own writes into the log (z4: the trigger running) */
   if (pCtx->bRows && z4 && sqlite3_strnicmp(z4, "hpplite_cap_", 12) == 0
       && (op == SQLITE_INSERT || op == SQLITE_READ || op == SQLITE_FUNCTION || op == SQLITE_SELECT)) return SQLITE_OK;
@@ -1258,6 +1277,25 @@ static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   pCtx->seenSchema = schemaVersion(pCtx);
 }
 
+/* A VACUUM that ran, into the log as a group of its own; the application's
+** last_insert_rowid() is kept (VACUUM is not a statement whose changes()
+** anyone reads) */
+static void logVacuum(HppliteCtx *pCtx) {
+  sqlite3_stmt *q = NULL;
+  sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
+  int saved = pCtx->bInternal;
+  pCtx->bInternal = 1;
+  if (sqlite3_prepare_v2(pCtx->db, "INSERT INTO _hpplite_pending(txn, sql, mode, now) VALUES(0, 'VACUUM', 0, 0)",
+                         -1, &q, NULL) == SQLITE_OK) {
+    if (sqlite3_step(q) != SQLITE_DONE) pCtx->nLogErrors++;
+  } else {
+    pCtx->nLogErrors++;
+  }
+  sqlite3_finalize(q);
+  sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
+  pCtx->bInternal = saved;
+}
+
 static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
@@ -1322,6 +1360,15 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     int bWasLogged = pS == pCtx->pLastLogged;
+    if (pS == pCtx->pVacuumStmt) {
+      /* Done: rowids of tables without an INTEGER PRIMARY KEY may have been
+      ** renumbered, and statements and records after it address the new
+      ** ones - a replica must VACUUM at this point of the log too. Logged
+      ** now, not as it started (VACUUM cannot run in the transaction a log
+      ** row would open), and only when it ran (it bumps schema_version). */
+      pCtx->pVacuumStmt = NULL;
+      if (pCtx->vacuumSchema >= 0 && schemaVersion(pCtx) != pCtx->vacuumSchema) logVacuum(pCtx);
+    }
     if (pS == pCtx->pRerunStmt && pCtx->rerunStage == 1 && stmtExpired(pS)) {
       /* the failed first run of a stale statement: no effect to check - the
       ** rerun follows, and its end checks (and commits) */
@@ -1351,6 +1398,16 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* SQLite's own verdict: a statement that cannot write is never logged, so
   ** nothing in it needs to replay (WITH ... SELECT random() included) */
   if (pS && sqlite3_stmt_readonly(pS)) return 0;
+  {
+    const char *z = zSql;
+    while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
+    pCtx->zDropTable[0] = 0;              /* prepared already: the drop it allowed is over */
+    if (sqlite3_strnicmp(z, "VACUUM", 6) == 0 && !isalnum((unsigned char)z[6]) && z[6] != '_') {
+      /* VACUUM INTO writes a copy elsewhere: this database is unchanged */
+      pCtx->pVacuumStmt = pS;
+      pCtx->vacuumSchema = strcasestr(z, "INTO") ? -1 : schemaVersion(pCtx);
+    }
+  }
   /* Row capture (#19): the triggers record what a write changes - its text,
   ** its functions and the clock no longer matter. A write on a table they do
   ** not cover yet (created by another connection since the last rebuild) is
@@ -2647,6 +2704,12 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
         rc = SQLITE_MISMATCH;
         break;
       }
+      continue;
+    }
+    if (rc == SQLITE_OK && sqlite3_strnicmp(zSql, "VACUUM", 6) == 0 && zSql[6] == 0) {
+      /* not inside a transaction: the group before it ends here */
+      if (open) { rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL); open = 0; lastTxn = -1; }
+      if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "VACUUM", NULL, NULL, NULL);
       continue;
     }
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);

@@ -108,6 +108,9 @@ struct HppliteCtx {
   sqlite3_stmt *pRowsSchemaStmt; /* Cached PRAGMA main.schema_version */
   sqlite3_stmt *pRowsLockStmt; /* Cached no-op write: the write lock before that read */
   char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
+  sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */
+  int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */
+  char zDropTable[128];       /* The table the statement being prepared drops (its triggers go with it) */
   char *zRowsTextOnly;        /* Names a write must not mention to be captured as rows: virtual
                               ** tables and what reaches them through triggers ('\0'-separated,
                               ** ends with an empty name) */

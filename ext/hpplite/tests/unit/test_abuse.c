@@ -617,6 +617,44 @@ static void test_zero_row_insert_into_autoincrement(void) {
     PASS();
 }
 
+/* VACUUM was refused (its internal ATTACH) and, had it run, was not logged:
+** it may renumber the rowids of tables without an INTEGER PRIMARY KEY, and
+** a statement after it that names a rowid must hit the same row on a
+** replica. Logged once it has run; replayed outside a transaction. */
+static void test_vacuum_logged(void) {
+    TEST("VACUUM runs, is logged once it has run, and rowid-addressed writes after it replay onto the same rows");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/vac.db", l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE plain(name, v)", NULL);
+    hpplite_node_exec(n, "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 200) "
+                         "INSERT INTO plain SELECT 'p' || i, i FROM k", NULL);
+    hpplite_node_exec(n, "DELETE FROM plain WHERE v % 2 = 0", NULL);
+    if (sqlite3_exec(n->db, "VACUUM", NULL, NULL, NULL) != SQLITE_OK) FAILF("VACUUM: %s", sqlite3_errmsg(n->db));
+    if (sqlite3_exec(n->db, "VACUUM INTO '" DIR "/copy.db'", NULL, NULL, NULL) != SQLITE_OK) FAILF("VACUUM INTO: %s", sqlite3_errmsg(n->db));
+    hpplite_node_exec(n, "UPDATE plain SET v = -1 WHERE rowid = 7", NULL);
+    hpplite_node_exec(n, "DELETE FROM plain WHERE rowid = 8", NULL);
+    int logged = -1;
+    sqlite3_stmt *q;
+    if (sqlite3_prepare_v2(n->db, "SELECT count(*) FROM _hpplite_pending WHERE sql = 'VACUUM'", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW) logged = sqlite3_column_int(q, 0);
+        sqlite3_finalize(q);
+    }
+    while (hpplite_node_pending_count(n) > 0 && hpplite_node_flush_batch(n) > 0) { }
+    unsigned char ra[32], rb[32];
+    hpplite_node_get_state_root(n, ra);
+    hpplite_node_destroy(n);
+    HppliteNode *r = open_node(DIR "/vac_replica.db", l1);
+    if (!r) FAIL("replica");
+    hpplite_node_get_state_root(r, rb);
+    hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    if (logged != 1) FAILF("%d VACUUM entries logged, want 1 (VACUUM INTO changes nothing here)", logged);
+    if (memcmp(ra, rb, 32) != 0) FAIL("replica state root differs");
+    PASS();
+}
+
 /* The timer's bookkeeping commit can land between an application
 ** transaction's read and its write however the flags are checked at its
 ** start: stress it with the timer thread flushing continuously */
@@ -1186,6 +1224,7 @@ int main(void) {
     test_last_insert_rowid_is_the_applications();
     test_bookkeeping_waits_for_app_transaction();
     test_zero_row_insert_into_autoincrement();
+    test_vacuum_logged();
     test_read_then_write_under_timer();
     test_no_op_rows_vs_adoption();
     test_wrong_height_batch();

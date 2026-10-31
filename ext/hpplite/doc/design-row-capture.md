@@ -113,8 +113,10 @@ detected.
 ## Limits and risks
 
 - **VACUUM** renumbers the rowids of tables without an `INTEGER PRIMARY
-  KEY`, and no trigger sees it. Recorded as a statement; that the
-  renumbering replays identically must be shown (Home Assistant runs it).
+  KEY`, and no trigger sees it. Logged as a statement once it has run; a
+  replica's VACUUM renumbers the same rows the same way (shown in
+  `test_rows_e2e` and `test_abuse`: updates and deletes by rowid after it
+  land on the same rows; without the logged VACUUM they do not).
 - **Size.** Inserts cost about what their SQL did; updates carry changed
   columns only; bulk statements (`UPDATE` of every row, `INSERT ... SELECT`)
   cost far more than their text. Reducing it is v0.3 (compression, DA,
@@ -152,7 +154,11 @@ detected.
    targets, closed over triggers and foreign key actions),
    `sqlite_sequence` (sequence records the flusher logs from the
    bookkeeping connection: a zero-row INSERT creates an entry no row
-   record carries). Open: VACUUM, the trigger guard.
+   record carries), VACUUM (logged once it has run, replayed outside a
+   transaction: a replica renumbers rowids the same way; it was refused
+   before, its internal ATTACH taken for the application's), the guard (the
+   application cannot create or drop `hpplite_cap_` triggers; a table's own
+   drop takes them, rebuilt after).
 3. Batch format v2; v1 history still replayed. Done: a record is a batch
    entry whose text is base64 of (op, table, record), marked by mode bit 4,
    so pieces (#59) and open transactions (#57) work unchanged and v0.1
