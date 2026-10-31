@@ -722,14 +722,27 @@ int hpplite_rows_drop_triggers_for(HppliteCtx *pCtx, const char *zTab) {
   return rc;
 }
 
+/* SQLite's own tables carry no triggers (sqlite_schema under
+** writable_schema, sqlite_stat1): a write to one is text (#74) */
+static int isSqliteTable(const char *zName) { return sqlite3_strnicmp(zName, "sqlite_", 7) == 0; }
+static int mentionsSqliteTable(const char *zSql) {
+  const char *z;
+  for (z = zSql; *z; z++) {
+    if (!isSqliteTable(z)) continue;
+    if (z > zSql && isIdChar((unsigned char)z[-1])) continue;
+    return 1;
+  }
+  return 0;
+}
+
 /* A write reaches a virtual table when the table it writes is one, or has
 ** triggers or foreign key actions that reach one. Text that does not say
 ** plainly what it writes is judged by every name it mentions. */
 int hpplite_rows_text_only(HppliteCtx *pCtx, const char *zSql) {
   char zTarget[256];
-  if (!pCtx->zRowsTextOnly) return 0;
-  if (writeTarget(zSql, zTarget, (int)sizeof(zTarget))) return textOnlyHas(pCtx->zRowsTextOnly, zTarget);
-  return textOnlyMentioned(pCtx->zRowsTextOnly, zSql);
+  if (writeTarget(zSql, zTarget, (int)sizeof(zTarget)))
+    return isSqliteTable(zTarget) || (pCtx->zRowsTextOnly && textOnlyHas(pCtx->zRowsTextOnly, zTarget));
+  return mentionsSqliteTable(zSql) || (pCtx->zRowsTextOnly && textOnlyMentioned(pCtx->zRowsTextOnly, zSql));
 }
 
 void hpplite_rows_after_statement(HppliteCtx *pCtx) {

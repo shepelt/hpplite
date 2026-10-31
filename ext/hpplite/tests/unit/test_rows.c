@@ -540,6 +540,28 @@ static void test_rowid_named_columns(void) {
     PASS();
 }
 
+/* Writes to SQLite's own tables (writable_schema, sqlite_stat1) have no
+** triggers to record them: they are text, never silence (#74) */
+static void test_sqlite_tables_are_text(void) {
+    TEST("a write to sqlite_schema or sqlite_stat1 is logged as text");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/sys.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(a)");
+    exec(w.db, "CREATE INDEX ti ON t(a)");
+    exec(w.db, "ANALYZE");                                                 /* makes sqlite_stat1; not tracked */
+    if (!exec(w.db, "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES('t', 'ti', '100 1')")) FAIL("sqlite_stat1 write");
+    exec(w.db, "PRAGMA writable_schema=ON");
+    if (!exec(w.db, "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a, b)' WHERE name = 't'")) FAIL("schema write");
+    exec(w.db, "PRAGMA writable_schema=OFF");
+    sqlite3_int64 texts = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND (sql LIKE '%sqlite_stat1%' OR sql LIKE '%sqlite_schema%')");
+    sqlite3_int64 recs = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op > 0");
+    close_writer(&w);
+    if (texts != 2) FAILF("%lld text statements on SQLite's tables, want 2", (long long)texts);
+    if (recs != 0) FAILF("%lld records, want 0", (long long)recs);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -572,6 +594,7 @@ int main(void) {
     test_integer_primary_key_desc();
     test_wide_table();
     test_rowid_named_columns();
+    test_sqlite_tables_are_text();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
