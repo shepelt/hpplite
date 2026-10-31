@@ -268,6 +268,11 @@ static const char *get_uri_param(const char *uri, const char *key, char *buf, si
                     fprintf(stderr, "hpplite: URI parameter %s is longer than %zu bytes; ignored\n", key, buflen - 1);
                     return NULL;
                 }
+                if (c == 0) {
+                    /* a %00 would end the value there, as a path or name: not one it reads as (#78) */
+                    fprintf(stderr, "hpplite: URI parameter %s contains %%00; ignored\n", key);
+                    return NULL;
+                }
                 buf[n++] = (char)c;
             }
             buf[n] = '\0';

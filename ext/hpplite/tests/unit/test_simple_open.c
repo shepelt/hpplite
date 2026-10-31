@@ -406,6 +406,22 @@ int main(void) {
         passed++;
     }
 
+    /* #78: a %00 would end the value where it stands; such a parameter is ignored, not cut */
+    tests++;
+    TEST("hpplite_open: a parameter with %00 is ignored, not cut");
+    {
+        unlink("/tmp/test_simple_open.db");
+        sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&interval=0&datadir=/tmp/hpplite_test_simple"
+                                   "&nodeid=cut%00here");
+        if (!db) FAIL("hpplite_open failed");
+        HppliteConfig *cfg = hpplite_get_config(db);
+        int cut = cfg && cfg->nodeId && strcmp(cfg->nodeId, "cut") == 0;
+        hpplite_close(db);
+        if (cut) FAIL("the value was cut at the %00");
+        PASS();
+        passed++;
+    }
+
     printf("\n=== Results: %d/%d tests passed ===\n", passed, tests);
 
     /* Cleanup */

@@ -641,6 +641,27 @@ static void test_rebuild_rolled_back(void) {
     PASS();
 }
 
+/* A virtual table whose name is longer than the target parser's buffer:
+** compared cut it would pass for a plain table, and its write would record
+** nothing (#78) */
+static void test_long_virtual_table_name(void) {
+    TEST("a write to a virtual table with a 300-byte name is logged as text");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/longname.db", &w)) FAIL("open");
+    char name[301];
+    memset(name, 'v', 300); name[300] = 0;
+    char *sql = sqlite3_mprintf("CREATE VIRTUAL TABLE \"%w\" USING fts5(b)", name);
+    exec(w.db, sql); sqlite3_free(sql);
+    sql = sqlite3_mprintf("INSERT INTO \"%w\"(b) VALUES('x')", name);
+    if (!exec(w.db, sql)) { sqlite3_free(sql); FAIL("the write failed"); }
+    sqlite3_free(sql);
+    sqlite3_int64 texts = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND sql LIKE 'INSERT INTO%'");
+    close_writer(&w);
+    if (texts != 1) FAILF("%lld text statements for the write, want 1", (long long)texts);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -677,6 +698,7 @@ int main(void) {
     test_shutdown_leaves_connection_usable();
     test_malformed_records();
     test_rebuild_rolled_back();
+    test_long_virtual_table_name();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

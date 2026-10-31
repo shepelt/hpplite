@@ -674,17 +674,22 @@ static const char *skipToken(const char *z) {
   if (isIdChar((unsigned char)*z)) { while (isIdChar((unsigned char)*z)) z++; return z; }
   return *z ? z + 1 : z;
 }
-/* a name (quoted or not) into zOut, unquoted; the position after it */
+/* a name (quoted or not) into zOut, unquoted; the position after it. One
+** too long for zOut is no name (empty): compared cut, a virtual table's
+** could pass for another's (#78) */
 static const char *readName(const char *z, char *zOut, int nOut) {
   const char *e = skipToken(z);
-  int n = 0;
+  int n = 0, cut = 0;
   if (*z == '"' || *z == '`' || *z == '[') {
     char close = *z == '[' ? ']' : *z;
-    for (z++; z < e - 1 && n < nOut - 1; z++) { if (*z == close && close != ']' && z[1] == close) z++; zOut[n++] = *z; }
+    for (z++; z < e - 1; z++) {
+      if (*z == close && close != ']' && z[1] == close) z++;
+      if (n < nOut - 1) zOut[n++] = *z; else cut = 1;
+    }
   } else if (isIdChar((unsigned char)*z)) {
-    for (; z < e && n < nOut - 1; z++) zOut[n++] = *z;
+    for (; z < e; z++) { if (n < nOut - 1) zOut[n++] = *z; else cut = 1; }
   }
-  zOut[n] = 0;
+  zOut[cut ? 0 : n] = 0;
   return e;
 }
 
