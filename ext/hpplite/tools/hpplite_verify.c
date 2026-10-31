@@ -186,10 +186,17 @@ int main(int argc, char **argv) {
         goto close;
     }
 
-    uint64_t onChain = 0, total = 0;
-    hpplite_l1_get_da_state(node->l1, &onChain, &total, NULL);
-    sqlite3_int64 height = scalar(db, "SELECT height FROM hpplite_status");   /* next batch number */
-    uint64_t rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
+    /* A long rebuild races the sequencer: batches posted meanwhile are
+    ** replayed too, until the chain and the rebuild agree or a sync stops */
+    uint64_t onChain = 0, total = 0, rebuilt = 0;
+    for (i = 0; i < 100; i++) {
+        sqlite3_int64 height;
+        hpplite_l1_get_da_state(node->l1, &onChain, &total, NULL);
+        height = scalar(db, "SELECT height FROM hpplite_status");   /* next batch number */
+        rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
+        if (rebuilt >= onChain || node->state == HPPLITE_STATE_ERROR) break;
+        if (hpplite_node_sync_from_l1(node, 1) <= 0) break;
+    }
     const char *zState = status_text(db, "state");
     const char *zErr = status_text(db, "last_error");
     sqlite3_int64 compared = scalar(db, "SELECT roots_compared FROM hpplite_status");

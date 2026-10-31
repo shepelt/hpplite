@@ -493,8 +493,8 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
-        } else if (!node->follower && (node->cipher || node->config.noEncrypt)) {
-            node_ensure_lease(node);
+        } else if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) {
+            node_ensure_lease(node);          /* an audit never takes it (#5) */
         }
     }
 }

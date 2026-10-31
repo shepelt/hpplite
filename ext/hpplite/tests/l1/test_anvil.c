@@ -128,12 +128,19 @@ static int run_verify(const char *extra, char *out, size_t n) {
 static void test_verify_tool(void) {
     char out[4096] = "", cmd[600];
     int rc;
-    TEST("hpplite-verify: rebuilds from the chain, matches the anchored checkpoint; --db sees a write past the log");
+    TEST("hpplite-verify: rebuilds from the chain, matches the anchored checkpoint, leaves the live sequencer's lease alone; --db sees a write past the log");
     if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    /* the live sequencer holds the lease while the audit runs */
+    sqlite3 *w = open_db("t1.db", KEY0, "&checkpoint=1");
+    if (!w) FAIL("open writer");
+    if (scalar(w, "SELECT lease FROM hpplite_status") != 1) { sqlite3_close(w); FAIL("writer should hold the lease"); }
     snprintf(cmd, sizeof cmd, "--db " DIR "/t1.db");
     rc = run_verify(cmd, out, sizeof out);
     if (rc != 0 || !strstr(out, "matches the rebuilt content") || !strstr(out, "equals the chain") || !strstr(out, "\nverified"))
-        FAILF("exit %d, output:\n%s", rc, out);
+        { sqlite3_close(w); FAILF("exit %d, output:\n%s", rc, out); }
+    if (strstr(out, "holds the lease")) { sqlite3_close(w); FAILF("a verifier went for the lease:\n%s", out); }
+    if (scalar(w, "SELECT lease FROM hpplite_status") != 1) { sqlite3_close(w); FAIL("the writer's lease was disturbed by the audit"); }
+    sqlite3_close(w);
     /* a write by a plain connection: the live file no longer equals the chain */
     {
         sqlite3 *plain = NULL;
