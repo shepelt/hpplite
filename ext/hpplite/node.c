@@ -765,8 +765,8 @@ static int node_check_rollup(HppliteNode *node) {
     snprintf(z, sizeof(z), "%llu:%s", (unsigned long long)node->config.chainId, c);
     rc = hpplite_bind_rollup(node->ctx, z);
     if (rc == -1) {
-        fprintf(stderr, "hpplite: this database's history is on rollup %s, not %s (another wallet, chain or "
-                "copy?); not posting or replaying - open it with its own rollup, or start a new database\n",
+        hpplite_error(node->ctx, "this database's history is on rollup %s, not %s (another wallet, chain or "
+                "copy?); not posting or replaying - open it with its own rollup, or start a new database",
                 node->ctx->zRollup, z);
         node->wrongRollup = 1;
         node->state = HPPLITE_STATE_ERROR;
@@ -787,7 +787,7 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         const HppliteCipher *scheme = NULL;
         uint8_t *plain;
         if (!node->hasEncKey) {
-            fprintf(stderr, "hpplite: batch %llu is encrypted and this node has no key\n",
+            hpplite_error(node->ctx, "batch %llu is encrypted and this node has no key",
                     (unsigned long long)height);
             return NULL;
         }
@@ -796,7 +796,7 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
             /* A known scheme that fails our tag was sealed with another key:
             ** posted under a lease we did not hold. Provably not ours. */
             node->lastFetchForeign = (scheme != NULL);
-            fprintf(stderr, "hpplite: batch %llu: %s\n", (unsigned long long)height,
+            hpplite_error(node->ctx, "batch %llu: %s", (unsigned long long)height,
                     scheme ? "not sealed with our key (posted by another sequencer)" : "unknown encryption scheme");
             return NULL;
         }
@@ -808,20 +808,20 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         ** every replica would run. Foreign, like a batch with a wrong tag.
         ** (encrypt=off nodes still read plaintext history.) */
         node->lastFetchForeign = 1;
-        fprintf(stderr, "hpplite: batch %llu is plaintext on an encrypting rollup: not ours\n", (unsigned long long)height);
+        hpplite_error(node->ctx, "batch %llu is plaintext on an encrypting rollup: not ours", (unsigned long long)height);
         return NULL;
     } else {
         batch = hpplite_batch_from_json((const char *)data);
     }
     if (batch && batch->height != height) {
         /* the slot is the truth; a batch claiming another height is corrupt */
-        fprintf(stderr, "hpplite: batch at height %llu claims height %llu; corrupt\n",
+        hpplite_error(node->ctx, "batch at height %llu claims height %llu; corrupt",
                 (unsigned long long)height, (unsigned long long)batch->height);
         hpplite_batch_free(batch);
         return NULL;
     }
     if (!batch) {
-        fprintf(stderr, "hpplite: batch %llu on L1 is not a batch this version can decode (%zu bytes)\n",
+        hpplite_error(node->ctx, "batch %llu on L1 is not a batch this version can decode (%zu bytes)",
                 (unsigned long long)height, dataLen);
     }
     return batch;
@@ -842,7 +842,7 @@ static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
     /* Every batch failing our tag from height 1 on is not an intruder, it is
     ** the wrong key on our side (or someone else's rollup): never skip that. */
     if (height <= 1) {
-        fprintf(stderr, "hpplite: batch 1 is not sealed with our key: wrong key or wrong rollup\n");
+        hpplite_error(node->ctx, "batch 1 is not sealed with our key: wrong key or wrong rollup");
         return -1;
     }
     raw = hpplite_l1_get_batch(node->l1, height, &len);
@@ -895,9 +895,9 @@ static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
         char *txHash;
         int ok;
         if (!bytes) {
-            fprintf(stderr, "hpplite: L1 has %llu batches but this database finalized %llu (a chain "
+            hpplite_error(node->ctx, "L1 has %llu batches but this database finalized %llu (a chain "
                     "reorganisation?), and batch %llu is no longer kept to post again; stopping rather "
-                    "than post past the gap\n", (unsigned long long)lastBatch,
+                    "than post past the gap", (unsigned long long)lastBatch,
                     (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)h);
             node->state = HPPLITE_STATE_ERROR;
             return -1;
@@ -945,7 +945,7 @@ static int node_adopt_existing(HppliteNode *node) {
     ** Told apart from "nothing at our height": the batch is on L1, and
     ** posting another at this height would only be refused (#90) */
     if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) return 2;
-    fprintf(stderr, "hpplite: L1 batch %llu does not match local pending SQL\n",
+    hpplite_error(node->ctx, "L1 batch %llu does not match local pending SQL",
             (unsigned long long)node->ctx->blockHeight);
     return -1;
 }
@@ -974,7 +974,7 @@ static int node_ensure_lease(HppliteNode *node) {
 
     st = hpplite_l1_get_state(node->l1);
     if (!st) {
-        fprintf(stderr, "hpplite: cannot read the sequencer lease from L1; not posting\n");
+        hpplite_error(node->ctx, "cannot read the sequencer lease from L1; not posting");
         node->leaseRecheckAt = now + 5000;
         return 0;
     }
@@ -993,7 +993,7 @@ static int node_ensure_lease(HppliteNode *node) {
         hpplite_l1_state_free(st);
         if (stranger && weOwn) {
             char *tx = hpplite_l1_release_lease(node->l1, NULL);   /* forceExpireLease: owner only */
-            fprintf(stderr, "hpplite: another wallet holds the lease of our rollup; %s\n",
+            hpplite_error(node->ctx, "another wallet holds the lease of our rollup; %s",
                     tx ? "expiring it as owner" : "could not expire it");
             if (tx) {
                 hpplite_l1_wait_for_tx(node->l1, tx, 30);
@@ -1001,17 +1001,18 @@ static int node_ensure_lease(HppliteNode *node) {
                 remaining = 0;                                     /* free now: claim below */
             }
         } else if (stranger) {
-            fprintf(stderr, "hpplite: another wallet holds the lease and we are not the owner\n");
+            hpplite_error(node->ctx, "another wallet holds the lease and we are not the owner");
         }
     }
 
     if (remaining > 0 && !ours) {
         if (!node->warnedForeignLease) {
-            fprintf(stderr, "hpplite: another sequencer instance holds the lease (%llu s left); "
-                            "batches are kept pending until it expires\n", (unsigned long long)remaining);
+            hpplite_error(node->ctx, "another sequencer instance holds the lease (%llu s left); "
+                            "batches are kept pending until it expires", (unsigned long long)remaining);
             node->warnedForeignLease = 1;
         }
         node->hasLease = 0;
+        node->leaseHeldElsewhere = 1;
         node->leaseRecheckAt = now + (int64_t)(remaining < 30 ? remaining : 30) * 1000;
         return 0;
     }
@@ -1027,6 +1028,7 @@ static int node_ensure_lease(HppliteNode *node) {
         remaining = node->leaseDuration;
     }
     node->hasLease = 1;
+    node->leaseHeldElsewhere = 0;
     /* Look again well before the renewal point, never later than a minute */
     {
         uint64_t s = remaining / 4;
@@ -1074,8 +1076,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         ** (no key, bad RPC, ...): finalizing locally would advance the
         ** height past batches L1 never saw. Keep everything pending. */
         if (!node->warnedNoL1) {
-            fprintf(stderr, "hpplite: L1 was configured but is not connected; batches are kept pending "
-                            "(check the key and the RPC endpoint)\n");
+            hpplite_error(node->ctx, "L1 was configured but is not connected; batches are kept pending "
+                            "(check the key and the RPC endpoint)");
             node->warnedNoL1 = 1;
         }
         return 0;
@@ -1091,8 +1093,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         ** encrypt=off is the only way to post in the clear, and it is explicit. */
         if (!node->cipher && !node->config.noEncrypt) {
             if (!node->warnedNoKey) {
-                fprintf(stderr, "hpplite: no private key: batches are kept pending and not posted "
-                                "(set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)\n");
+                hpplite_error(node->ctx, "no private key: batches are kept pending and not posted "
+                                "(set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)");
                 node->warnedNoKey = 1;
             }
             hpplite_batch_free(batch);
@@ -1178,7 +1180,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 wait <<= node->failStreak;                 /* 2x per failure */
                 if (wait > 300000) wait = 300000;          /* ... up to the lease length */
                 node->retryAt = node_current_time_ms() + wait;
-                fprintf(stderr, "hpplite: batch %llu not confirmed on L1, kept pending (retry in %llds)\n",
+                hpplite_error(node->ctx, "batch %llu not confirmed on L1, kept pending (retry in %llds)",
                         (unsigned long long)height, (long long)(wait / 1000));
                 *pMore = 0;
             }
@@ -1195,7 +1197,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         if (ctx->nAppStmtActive == 0 && !ctx->bAppTxnOpen && ctx->txnGate != 1) {
             /* not a deferral for an application statement or transaction
             ** (the gate): something is actually wrong */
-            fprintf(stderr, "hpplite: could not finalize batch %llu locally\n",
+            hpplite_error(node->ctx, "could not finalize batch %llu locally",
                     (unsigned long long)height);
         }
         height = 0;
@@ -1205,6 +1207,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         node->batchesSinceCheckpoint++;
         node->failStreak = 0;
         node->retryAt = 0;
+        hpplite_error_clear(ctx);          /* posted and finalized: whatever was wrong is not now (#32) */
         test_crash_point(*pMore ? "mid_series" : "after_finalize");
     }
 
@@ -1260,7 +1263,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
         if (txHash) {
             sqlite3_free(txHash);
         } else {
-            fprintf(stderr, "hpplite: checkpoint after batch %llu not submitted; will retry\n",
+            hpplite_error(node->ctx, "checkpoint after batch %llu not submitted; will retry",
                     (unsigned long long)height);
         }
     }
@@ -1305,8 +1308,13 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
                 synced++;
                 continue;
             }
-            fprintf(stderr, "hpplite: sync stopped at height %llu of %llu on L1\n",
-                    (unsigned long long)node->ctx->blockHeight, (unsigned long long)lastBatch);
+            if (node->ctx->zLastError[0]) {   /* the fetch said what is wrong with the batch; keep that */
+                fprintf(stderr, "hpplite: sync stopped at height %llu of %llu on L1\n",
+                        (unsigned long long)node->ctx->blockHeight, (unsigned long long)lastBatch);
+            } else {
+                hpplite_error(node->ctx, "sync stopped at height %llu of %llu on L1",
+                        (unsigned long long)node->ctx->blockHeight, (unsigned long long)lastBatch);
+            }
             node->state = HPPLITE_STATE_ERROR;
             return synced ? synced : -1;
         }
@@ -1318,7 +1326,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
                 return synced;
             }
             if (rc != SQLITE_OK) {
-                fprintf(stderr, "hpplite: local pending SQL diverges from L1 batch %llu\n",
+                hpplite_error(node->ctx, "local pending SQL diverges from L1 batch %llu",
                         (unsigned long long)batch->height);
                 hpplite_batch_free(batch);
                 return -1;
@@ -1334,6 +1342,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         hpplite_batch_free(batch);
         synced++;
     }
+    if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
     return synced;
 }
 

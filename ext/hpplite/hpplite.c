@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <sys/time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -453,6 +454,19 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
 /* PRAGMA [schema.]user_version / application_id = N (or (N)): the two header
 ** fields an application writes - migration tools keep their version there.
 ** Deterministic, so captured and replayed like any write; their reads are not. */
+void hpplite_error(HppliteCtx *pCtx, const char *zFmt, ...) {
+  char z[512];
+  va_list ap;
+  va_start(ap, zFmt);
+  vsnprintf(z, sizeof z, zFmt, ap);
+  va_end(ap);
+  fprintf(stderr, "hpplite: %s\n", z);
+  if (pCtx) snprintf(pCtx->zLastError, sizeof(pCtx->zLastError), "%s", z);
+}
+void hpplite_error_clear(HppliteCtx *pCtx) {
+  if (pCtx) pCtx->zLastError[0] = 0;
+}
+
 /*
 ** Connection pragmas that change what a statement does without showing in
 ** its text (#28): legacy_alter_table, writable_schema,
@@ -1358,7 +1372,7 @@ static void rerunCommitRetry(HppliteCtx *pCtx) {
     pCtx->bAppTxnOpen = 0;
     gateLeaveAppIfIdle(pCtx);
   } else {
-    fprintf(stderr, "hpplite: could not commit the transaction opened for a stale statement's rerun (%s)\n",
+    hpplite_error(pCtx, "could not commit the transaction opened for a stale statement's rerun (%s)",
             sqlite3_errmsg(pCtx->db));
     pCtx->nLogErrors++;
   }
@@ -2432,7 +2446,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
         hpplite_batch_set_post_state(pBatch, root);
       } else {
         pCtx->nLogErrors++;
-        fprintf(stderr, "hpplite: cannot hash the database for the state root (%s); batch %llu not built\n",
+        hpplite_error(pCtx, "cannot hash the database for the state root (%s); batch %llu not built",
                 sqlite3_errmsg(pCtx->bkDb), (unsigned long long)pBatch->height);
         hpplite_batch_free(pBatch);
         pBatch = NULL;
@@ -2464,7 +2478,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
       }
       if (pBatch->nTxns <= 1) {
         pCtx->nLogErrors++;
-        fprintf(stderr, "hpplite: statement of %zu bytes exceeds the batch size limit (%zu); left pending\n",
+        hpplite_error(pCtx, "statement of %zu bytes exceeds the batch size limit (%zu); left pending",
                 n, maxBytes);
         hpplite_batch_free(pBatch);
         pBatch = NULL;
@@ -2876,7 +2890,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ** than replay into a different state */
   for (i = 0; i < pBatch->nTxns; i++) {
     if (pBatch->aTxns[i].mode & ~HPPLITE_MODE_KNOWN) {
-      fprintf(stderr, "hpplite: batch %llu statement %d ran under connection state this version cannot apply (mode %d)\n",
+      hpplite_error(pCtx, "batch %llu statement %d ran under connection state this version cannot apply (mode %d)",
               (unsigned long long)pBatch->height, i, pBatch->aTxns[i].mode);
       return SQLITE_MISMATCH;
     }
@@ -2903,8 +2917,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   carryChanged = (nCarry > 0);
   if (nCarry > 0 && !pBatch->contTxn) {
     pCtx->nTxnsDropped++;
-    fprintf(stderr, "hpplite: batch %llu does not continue the transaction batch %llu left open "
-            "(%d statements held); dropped whole - its writer never posted the rest\n",
+    hpplite_error(pCtx, "batch %llu does not continue the transaction batch %llu left open "
+            "(%d statements held); dropped whole - its writer never posted the rest",
             (unsigned long long)pBatch->height, (unsigned long long)(pBatch->height - 1), nCarry);
   }
   if (nCarry > 0 && pBatch->contTxn) {
@@ -2925,8 +2939,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   }
   if (pBatch->contTxn && nCarry == 0 && firstEnd > 0) {
     pCtx->nTxnsDropped++;
-    fprintf(stderr, "hpplite: batch %llu continues a transaction this replica does not hold; "
-            "its %d statements here are dropped with it\n", (unsigned long long)pBatch->height, firstEnd);
+    hpplite_error(pCtx, "batch %llu continues a transaction this replica does not hold; "
+            "its %d statements here are dropped with it", (unsigned long long)pBatch->height, firstEnd);
   }
   /* Pieces of a statement (#59) become the statement once its last piece is
   ** here; pieces whose statement continues in the next batch stay pieces,
@@ -2975,8 +2989,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   ** unexpected read is at least the same on every replica (#56) */
   for (i = 0; i < holdFrom; i++) {
     if (aRun[i].now && !hpplite_clock_on(rdb)) {
-      fprintf(stderr, "hpplite: batch %llu has statements that read the clock, and the replay connection "
-              "is not on the clock VFS; cannot reproduce them\n", (unsigned long long)pBatch->height);
+      hpplite_error(pCtx, "batch %llu has statements that read the clock, and the replay connection "
+              "is not on the clock VFS; cannot reproduce them", (unsigned long long)pBatch->height);
       for (i = 0; i < nCarry; i++) sqlite3_free(azCarry[i]);
       sqlite3_free(azCarry); sqlite3_free(aCarryMode); sqlite3_free(aCarryNow); sqlite3_free(aCarryFrag);
     for (i = 0; i < nJoined; i++) sqlite3_free(azJoined[i]);
@@ -3032,7 +3046,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       if (rc != SQLITE_OK) {
         /* a record is what a write that succeeded did: one that cannot be
         ** applied means the replica is not where the writer was */
-        fprintf(stderr, "hpplite: batch %llu row record %d cannot be applied: %s\n",
+        hpplite_error(pCtx, "batch %llu row record %d cannot be applied: %s",
                 (unsigned long long)pBatch->height, i, zErr ? zErr : sqlite3_errmsg(rdb));
         sqlite3_free(zErr);
         rc = SQLITE_MISMATCH;
@@ -3057,7 +3071,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       ** transaction usable; anything that rolled it back is fatal. */
       if (open && sqlite3_get_autocommit(rdb)) break;
       pCtx->nReplaySkipped++;
-      fprintf(stderr, "hpplite: batch %llu statement %d failed on replay (%s); skipped\n",
+      hpplite_error(pCtx, "batch %llu statement %d failed on replay (%s); skipped",
               (unsigned long long)pBatch->height, i, sqlite3_errmsg(rdb));
       rc = SQLITE_OK;
     }
@@ -3070,12 +3084,12 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   hpplite_clock_restore(savedPin, savedSeen);
   /* back to the connection's own state (the application's, on :memory:) */
   if (replayMode(rdb, savedMode, &curMode) != SQLITE_OK) {
-    fprintf(stderr, "hpplite: could not restore the connection's foreign_keys/recursive_triggers after replay\n");
+    hpplite_error(pCtx, "could not restore the connection's foreign_keys/recursive_triggers after replay");
   }
   if (rdb == pCtx->db) { pCtx->bInternal = 0; pCtx->bEnabled = savedEnabled; }
   pCtx->bRootDirty = 1;
   if (rc != SQLITE_OK) {
-    fprintf(stderr, "hpplite: replay of batch %llu failed at statement %d (rc=%d): %s\n",
+    hpplite_error(pCtx, "replay of batch %llu failed at statement %d (rc=%d): %s",
             (unsigned long long)pBatch->height, i, rc, sqlite3_errmsg(rdb));
   } else {
     rc = bkBegin(pCtx, 1);
@@ -3103,7 +3117,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   pCtx->nRootsCompared++;
   if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
     pCtx->nRootMismatches++;
-    fprintf(stderr, "hpplite: state root mismatch after replaying batch %llu\n",
+    hpplite_error(pCtx, "state root mismatch after replaying batch %llu",
             (unsigned long long)pBatch->height);
   }
   return SQLITE_OK;
@@ -3387,6 +3401,8 @@ typedef struct StatusCursor {
 #define STATUS_COL_SEQUENCER        20
 #define STATUS_COL_CAPTURE          21
 #define STATUS_COL_FOREIGN_WRITES   22
+#define STATUS_COL_STATE            23
+#define STATUS_COL_LAST_ERROR       24
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -3399,7 +3415,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER)");
+        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
+        " state TEXT, last_error TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -3566,6 +3583,22 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_FOREIGN_WRITES:       /* the file changed with no HPPLite write to show for it (#37) */
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignWrites);
+            break;
+        case STATUS_COL_STATE: {              /* what this node is doing about posting (#32) */
+            const char *z;
+            if (node->state == HPPLITE_STATE_ERROR) z = "error";
+            else if (node->state == HPPLITE_STATE_STOPPED) z = "stopped";
+            else if (node->state == HPPLITE_STATE_INIT) z = "init";
+            else if (!node->l1) z = node->wantsL1 ? "disconnected" : "local";
+            else if (node->follower) z = "follower";
+            else if (node->leaseHeldElsewhere) z = "waiting";
+            else if (node->retryAt) z = "retrying";
+            else z = "sequencing";
+            sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);
+            break;
+        }
+        case STATUS_COL_LAST_ERROR:           /* the last failure, until the next success (#32) */
+            if (node->ctx->zLastError[0]) sqlite3_result_text(ctx, node->ctx->zLastError, -1, SQLITE_TRANSIENT);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);

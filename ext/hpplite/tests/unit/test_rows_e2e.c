@@ -783,6 +783,81 @@ static void test_foreign_writes_detected(void) {
     PASS();
 }
 
+/* Why height stopped advancing, from SQL (#32): hpplite_status.state and
+** last_error, the latter cleared by the next success */
+static char *status_text(sqlite3 *db, const char *col) {
+    static char buf[2][512];
+    static int which;
+    char *out = buf[which ^= 1];
+    char sql[128];
+    sqlite3_stmt *st;
+    snprintf(sql, sizeof sql, "SELECT %s FROM hpplite_status", col);
+    out[0] = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return out;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+        snprintf(out, 512, "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    return out;
+}
+#define WANT_STATUS(db, col, want, when) do { \
+    const char *got_ = status_text(db, col); \
+    if (strcmp(got_, want) != 0) { if (l1) hpplite_l1_disconnect(l1); FAILF("%s: %s is '%s', want '%s'", when, col, got_, want); } } while (0)
+#define WANT_STATUS_PREFIX(db, col, want, when) do { \
+    const char *got_ = status_text(db, col); \
+    if (strncmp(got_, want, strlen(want)) != 0) { if (l1) hpplite_l1_disconnect(l1); FAILF("%s: %s is '%s', want '%s...'", when, col, got_, want); } } while (0)
+static void test_state_and_last_error(void) {
+    TEST("hpplite_status.state and last_error: a failed post is named and cleared by the next success; a lease held elsewhere; an undecodable batch puts the replica in error");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/st.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = { "CREATE TABLE t(a)", "INSERT INTO t VALUES(1)", NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    WANT_STATUS(w->db, "state", "sequencing", "at open");
+    WANT_STATUS(w->db, "last_error", "", "at open");
+    hpplite_l1_mock_set_fail_submit(l1, 1);
+    if (hpplite_node_flush_batch(w) != 0) FAIL("premise: the post should fail");
+    WANT_STATUS(w->db, "state", "retrying", "after a failed post");
+    WANT_STATUS_PREFIX(w->db, "last_error", "batch 1 not confirmed on L1", "after a failed post");
+    hpplite_l1_mock_set_fail_submit(l1, 0);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("premise: the post should succeed now");
+    WANT_STATUS(w->db, "state", "sequencing", "after the next success");
+    WANT_STATUS(w->db, "last_error", "", "after the next success");
+
+    /* a second node on another file, with its own rows to post, while the first holds the lease */
+    HppliteNode *r = open_node(DIR "/st_r.db", l1);
+    if (!r) FAIL("replica open");
+    if (scalar(r->db, "SELECT count(*) FROM t") != 1) FAIL("premise: replica synced");
+    hpplite_node_exec(r, "INSERT INTO t VALUES(2)", NULL);
+    hpplite_node_flush_batch(r);
+    WANT_STATUS(r->db, "state", "waiting", "with the lease held elsewhere");
+    WANT_STATUS_PREFIX(r->db, "last_error", "another sequencer instance holds the lease", "with the lease held elsewhere");
+    hpplite_node_exec(r, "DELETE FROM t WHERE a = 2", NULL);   /* its rows are not going anywhere */
+    hpplite_node_destroy(r);
+
+    /* a sealed batch at height 2 that claims height 9: corrupt, a fresh replica stops there, in error */
+    {
+        HppliteBatch *b = hpplite_batch_new(9);
+        size_t len = 0;
+        hpplite_batch_add_stmt(b, "INSERT INTO t VALUES(9)", -1, 0);
+        char *json = hpplite_batch_to_json(b);
+        uint8_t *sealed = hpplite_envelope_seal(w->cipher, w->encKey, 2, HPPLITE_ENCODING_NONE,
+                                                (const uint8_t *)json, strlen(json), &len);
+        char *tx = sealed ? hpplite_l1_submit_batch(l1, w->instanceId, 2, sealed, len) : NULL;
+        sqlite3_free(json); hpplite_batch_free(b); free(sealed);
+        if (!tx) FAIL("premise: corrupt batch submitted");
+        sqlite3_free(tx);
+    }
+    hpplite_node_destroy(w);
+    HppliteNode *r2 = open_node(DIR "/st_r2.db", l1);
+    if (!r2) FAIL("second replica open");
+    WANT_STATUS(r2->db, "state", "error", "with a corrupt batch on L1");
+    WANT_STATUS_PREFIX(r2->db, "last_error", "batch at height 2 claims height 9; corrupt", "with a corrupt batch on L1");
+    hpplite_node_destroy(r2);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -804,6 +879,7 @@ int main(void) {
     test_temp_triggers();
     test_connection_pragmas();
     test_foreign_writes_detected();
+    test_state_and_last_error();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

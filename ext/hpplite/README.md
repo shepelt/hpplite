@@ -398,7 +398,17 @@ records or statements - not yet posted), `state_root`, `prev_block_hash`,
 `sequencer` (1 = this connection posts the file's batches; 0 = another
 connection, in this process or another, does), `capture` (`rows` or `text`:
 what this connection logs), `foreign_writes` (looks that found the file
-changed by something that is not HPPLite, #37).
+changed by something that is not HPPLite, #37), `state` and `last_error`
+(#32). `state` says what this node is doing about posting: `sequencing`,
+`retrying` (the last post failed, backing off), `waiting` (another instance
+holds the lease), `follower` (another connection on this file posts),
+`local` (no chain configured), `disconnected` (a chain was configured but
+is not reachable), `error` (sync stopped: the history and the file do not
+agree), `stopped`. `last_error` is the last failure said on stderr - a post
+not confirmed, a batch that cannot be decoded or replayed, a root mismatch,
+the lease held elsewhere - and is NULL again once a batch is posted and
+finalized or a sync completes. A program polling `height` can tell why it
+stopped from these two columns alone.
 
 
 What exists in v0.1 is **rebuild and compare**: open an empty file with the

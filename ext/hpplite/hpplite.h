@@ -153,6 +153,7 @@ struct HppliteCtx {
   uint64_t nAuthDenied;       /* Statements the authorizer refused at prepare (our tables, ATTACH, pragmas) */
   const char *zDenyWhy;       /* Why the statement being prepared was denied (for the error message) */
   char zLastRefusal[400];     /* Reason and statement of the last refusal (hpplite_status.last_refusal) */
+  char zLastError[512];       /* The last failure said on stderr, until the next success (hpplite_status.last_error, #32) */
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
@@ -387,6 +388,11 @@ int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *
 ** application thread (status reads, hpplite_flush(), hpplite_sync(), close).
 */
 void hpplite_rearm_hooks(HppliteCtx *pCtx);
+
+/* A failure: one line on stderr ("hpplite: ..."), kept as
+** hpplite_status.last_error until hpplite_error_clear() at the next success (#32) */
+void hpplite_error(HppliteCtx *pCtx, const char *zFmt, ...);
+void hpplite_error_clear(HppliteCtx *pCtx);
 
 /*
 ** Register HPPLite as a loadable extension.
