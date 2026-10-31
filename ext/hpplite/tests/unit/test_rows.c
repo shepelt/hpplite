@@ -669,13 +669,17 @@ static void test_refused_stale_statement(void) {
     reset_dir();
     W a, b;
     if (!open_writer(DIR "/stale.db", &a) || !open_writer(DIR "/stale.db", &b)) FAIL("open");
-    exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
-    exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
-    exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
-    exec(b.db, "SELECT count(*) FROM c");                              /* b sees the schema */
+    int ok1 = exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
+    int ok2 = exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
+    int ok3 = exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
+    int aAuto = sqlite3_get_autocommit(a.db), aStage = a.ctx->rerunStage, aOwn = a.ctx->rerunOwnTxn;
+    int ok4 = exec(b.db, "SELECT count(*) FROM c");                   /* b sees the schema */
+    const char *e4 = sqlite3_errmsg(b.db);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(b.db, "INSERT INTO c(v) VALUES(random())", -1, &st, NULL) != SQLITE_OK)
-        FAILF("prepare: %s (%d)", sqlite3_errmsg(b.db), sqlite3_extended_errcode(b.db));
+        FAILF("prepare: %s (%d); a: ddl %d %d %d autocommit %d rerunStage %d own %d; b's select %d (%s) txn %d",
+              sqlite3_errmsg(b.db), sqlite3_extended_errcode(b.db), ok1, ok2, ok3, aAuto, aStage, aOwn, ok4, e4,
+              sqlite3_txn_state(b.db, "main"));
     exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
     int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
     sqlite3_finalize(st);
