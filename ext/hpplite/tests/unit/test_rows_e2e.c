@@ -498,6 +498,51 @@ static void test_trigger_guard(void) {
     PASS();
 }
 
+/* 12. A v0.1 database (statement history, posted and pending) opened by
+** v0.2: the rest of its life is records, and a replica rebuilt from the
+** whole history - statements, then records - equals it */
+static void test_text_history_then_rows(void) {
+    TEST("a database with statement history (posted and pending) continues with records: replica equal");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "rows";
+    memcpy(config.privkey, PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = DIR;
+    config.dbPath = DIR "/hist.db";
+    config.checkpointInterval = 1000;
+    config.captureText = 1;
+    HppliteNode *w = hpplite_node_create(&config);
+    if (!w) FAIL("open text");
+    hpplite_node_set_l1(w, l1);
+    hpplite_node_sync_from_l1(w, 1);
+    hpplite_node_start(w);
+    hpplite_node_exec(w, "CREATE TABLE e(id INTEGER PRIMARY KEY, body, at)", NULL);
+    hpplite_node_exec(w, "INSERT INTO e(body, at) VALUES('one', '2026-01-01'), ('two', '2026-01-02')", NULL);
+    hpplite_node_flush_batch(w);
+    hpplite_node_exec(w, "UPDATE e SET body = 'two!' WHERE id = 2", NULL);    /* pending at close */
+    hpplite_l1_mock_set_fail_submit(l1, 1);
+    hpplite_node_destroy(w);
+    hpplite_l1_mock_set_fail_submit(l1, 0);
+    w = open_node(DIR "/hist.db", l1);                                     /* the default: rows */
+    if (!w) FAIL("reopen with rows");
+    const char *sql[] = {
+        "INSERT INTO e(body, at) VALUES('three', datetime('now'))",
+        "UPDATE e SET at = datetime('now', 'localtime') WHERE id = 1",
+        "DELETE FROM e WHERE id = 2",
+        "ALTER TABLE e ADD COLUMN n INTEGER DEFAULT 7",
+        "UPDATE e SET n = abs(random()) % 100",
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE op > 0") < 3) FAIL("the reopened writer must record rows");
+    const char *why = replica_matches(w, l1, "hist_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -512,6 +557,7 @@ int main(void) {
     test_reopen();
     test_vacuum();
     test_trigger_guard();
+    test_text_history_then_rows();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
