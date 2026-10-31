@@ -116,7 +116,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
 | `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
-| `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. `{file}` = the file's name, so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. Also `HPPLITE_DBNAME` |
+| `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. Also `HPPLITE_DBNAME` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
