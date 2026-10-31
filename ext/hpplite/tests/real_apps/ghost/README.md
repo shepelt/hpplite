@@ -5,8 +5,11 @@ Ghost's code is untouched. Two changes are made around it:
 
 - Ghost's better-sqlite3 is rebuilt against a stock SQLite amalgamation
   (`setup.sh`). Its bundled SQLite is compiled with
-  `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in expanded SQL, so
-  HPPLite refuses it at open.
+  `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in expanded SQL;
+  HPPLite refused it at open when this run was made (statement capture).
+  With row capture (the default now) the bundled SQLite serves as it is
+  (#62, `tests/orm/test_better_sqlite3.js`), and the rebuild is no longer
+  needed; this setup keeps it so the run stays reproducible.
 - A `NODE_OPTIONS=--require` preload loads HPPLite into that SQLite, and
   `HPPLITE_FILES` names Ghost's database (`run.sh`).
 

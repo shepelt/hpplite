@@ -47,7 +47,7 @@ from any language whose SQLite binding can load extensions.
 ┌──────────────────────────────────────────────────────────────────────┐
 │  your process                                                        │
 │                                                                      │
-│  app ──► SQLite ──► _hpplite_pending (SQL text, inside your txn)     │
+│  app ──► SQLite ──► _hpplite_pending (row records, inside your txn)  │
 │                           │                                          │
 │            timer / close  ▼                                          │
 │                     batch = JSON ──► ChaCha20-Poly1305 ──► L1 DA     │
@@ -64,7 +64,8 @@ from any language whose SQLite binding can load extensions.
   be logged is refused (`SQLITE_INTERRUPT`) rather than applied unlogged
 - **Encrypted by default** - batches are sealed before they leave the
   process with a key derived from your wallet key; the chain sees ciphertext
-- **Factory deploy** - one wallet, one rollup, created on first open
+- **Factory deploy** - one wallet, one rollup, created on first open; a
+  named database (`dbname=`) gets its own rollup under the same wallet
 - **Rebuild and check** - an empty file with the same key reconstructs from
   the chain and compares every posted state root along the way
 
@@ -92,9 +93,9 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d` | Creates rollups (one per wallet); built into the `hpp-sepolia` alias. Contract VERSION 6 (sequencer-only lease claim; rotating the sequencer ends its lease); rollups from earlier factories keep working with the rules they were created with (`0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
-| HPPLite | *(per wallet)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
-| HPPLiteDA | *(per wallet)* | Your rollup's data-availability contract: batch data |
+| HPPLiteFactory | `0xd1aaa8d10d53b9ea103fbb22d866cac3849c3b2d` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 6 (sequencer-only lease claim; rotating the sequencer ends its lease); rollups from earlier factories keep working with the rules they were created with (`0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
+| HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
+| HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
 The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`); `ctest` fails if this README disagrees with it.
 
@@ -109,7 +110,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `contract` | No | Connect to an existing rollup instead of using the factory |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
-| `datadir` | No | Reserved; v0.1 keeps all its state in the database file itself (`_hpplite_*` tables) |
+| `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
@@ -161,7 +162,7 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 | Python `sqlite3`: SQLAlchemy, Alembic, Django | `sqlite3.connect(uri, uri=True)`; Django `NAME` = the URI | works |
 | Node `node:sqlite`: Drizzle (`sqlite-proxy`) | URI, or a plain path with `HPPLITE_FILES` | works |
 | npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
-| better-sqlite3 (Drizzle's and Knex's default) | - | **refused at open**: its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()` - writes would replay truncated |
+| better-sqlite3 (Drizzle's and Knex's default) | a plain path with `HPPLITE_FILES` (`tests/orm/test_better_sqlite3.js`) | works with row capture (the default). Its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()`: `capture=text` is refused at open, and a statement still logged as text (a schema change, a write reaching a virtual table) is refused when it binds values |
 | Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
 | Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `extensions: [<module>]` in `database.yml`, `HPPLITE_FILES` for the files and `dbname={file}` in `HPPLITE_PARAMS` (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
 
@@ -216,9 +217,9 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   `DROP`, the table rebuilds migration tools do, `PRAGMA user_version` and
   `application_id`. `changes()`, `last_insert_rowid()` and `RETURNING`
   report the application's statements as in plain SQLite.
-- **One wallet is one database on chain.** A new, empty file opened with the
-  same key rebuilds that database from L1 (that is how you verify, or move
-  to another machine). In the same process as the live writer it says
+- **One wallet is one database on chain**, plus one per `dbname=`. A new,
+  empty file opened with the same key (and the same name) rebuilds that
+  database from L1 (that is how you verify, or move to another machine). In the same process as the live writer it says
   `another sequencer instance holds the lease`: expected - it is a reader.
 
 **Every connection that writes must open with `hpplite=on`** (or be named
@@ -306,7 +307,7 @@ gas, `submitCheckpoint` 3%, lease claim/renew/release 3%.
 | Operation | Gas | Cost (ETH @ 0.01 gwei) |
 |-----------|-----|------------------------|
 | Factory deploy (VERSION 6, optimizer on) | 2.8M | 0.000028 |
-| Rollup creation (`getOrCreateRollup`) | ~2.5M | 0.000025 |
+| Rollup creation (`getOrCreateRollup`, `createRollup` for a named database) | ~2.5M | 0.000025 |
 | Batch submit (~250 B sealed; ~0.7k gas per further byte) | 323k | 0.0000032 |
 | Batch submit (29 KB sealed, as cut on HPP Sepolia) | 20.7M | 0.00023 |
 | Checkpoint | 50k | 0.0000005 |
@@ -342,7 +343,8 @@ database costs nothing.
 
 | File | Description |
 |------|-------------|
-| `hpplite.c` | Statement capture into `_hpplite_pending`, content-hash state root, batch build/finalize/replay, `hpplite_status` table, transparent API, extension entry point |
+| `hpplite.c` | Capture into `_hpplite_pending` (statements, and the text-logged part of row capture), content-hash state root, batch build/finalize/replay, `hpplite_status` table, transparent API, extension entry point |
+| `capture_rows.c` | Row capture (#19): the TEMP triggers, the record format, what stays text, `sqlite_sequence`, applying records on a replica |
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
 | `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
 | `batch.c` | Batch creation and serialization |
@@ -357,8 +359,10 @@ database costs nothing.
 
 ```solidity
 // HPPLiteFactory
-function getOrCreateRollup() external returns (address);
+function getOrCreateRollup() external returns (address);          // the wallet's primary
 function getRollup(address owner) external view returns (address);
+function createRollup(uint256 checkpointInterval) external returns (address);   // one more, for a named database (#61)
+function getRollupsByOwner(address owner) external view returns (address[] memory);
 
 // HPPLiteDA (per-rollup)
 function claimSequencer(bytes32 instanceId) external;
@@ -476,9 +480,13 @@ application functions such as WordPress's `REGEXP`, and `CURRENT_TIMESTAMP`
 defaults all replay exactly and are no longer refused. Schema changes, and
 writes that reach a virtual table (FTS5, R*Tree - directly, or through the
 sync triggers of the table written), are still logged as statements, under
-the rules above. Batches with records cannot be read by v0.1 (they say so
-and stop); a v0.2 replica reads v0.1 history. `capture=text` keeps v0.1's
-capture. Design and measurements: `doc/design-row-capture.md`.
+the rules above. Batches with records cannot be read by v0.1: it stops at
+the first with "statement N ran under connection state this version cannot
+apply (mode 4)" - upgrade the replica. A v0.2 replica reads v0.1 history.
+`capture=text` keeps v0.1's capture. Do not run a v0.1 binary on a file
+that has records pending (flush first, or close every connection): v0.1
+would post them as empty statements, and that history cannot be read by
+either version (#81). Design and measurements: `doc/design-row-capture.md`.
 
 **The clock is supported.** `CURRENT_TIMESTAMP`, `datetime('now')`,
 `unixepoch()`, `strftime('%f', 'now')` and columns with `DEFAULT
@@ -521,8 +529,9 @@ Not detectable, so not refused - know these:
 - **`INSERT ... SELECT` without `ORDER BY`** into a rowid table takes its row
   order from the query planner.
 
-All of this is lifted in v0.2 by capturing row changes instead of statement
-text (#19), which is why it is "unsupported", not "won't fix".
+Row capture (the default since v0.2, #19) lifts all of this for the writes
+it records; it still applies to `capture=text`, and to the statements row
+capture logs as text (schema changes, writes reaching a virtual table).
 
 ## Keys
 
@@ -564,8 +573,8 @@ access without the wallet key is the public-key scheme planned for v0.2.
 
 ## Durability
 
-HPPLite keeps no state outside your database file. Captured SQL goes into
-`_hpplite_pending` from inside your own transaction (rolled back with it,
+HPPLite keeps no state outside your database file. Captured records and
+SQL go into `_hpplite_pending` from inside your own transaction (rolled back with it,
 committed with it); height and roots go into `_hpplite_meta` once a batch is
 confirmed on L1. Kill the process at any point and reopen: pending SQL
 flushes, height continues, nothing is replayed twice. A batch that L1 does

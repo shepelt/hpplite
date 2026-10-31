@@ -1,6 +1,6 @@
 # Capture engine v2: row-based capture
 
-**Status: design, v0.2 (#19). Record what a write did, not what it said.**
+**Status: shipped in v0.2 (#19), the default (`capture=rows`). Record what a write did, not what it said.**
 
 ## Why
 
@@ -80,17 +80,23 @@ small fix-up record, as today.
 ## Replay
 
 Records are applied with triggers disabled
-(`SQLITE_DBCONFIG_ENABLE_TRIGGER`) and foreign keys off - their effects are
-already in the log; firing them again would double them. Insert is `INSERT
-OR REPLACE` with the original key (which also reproduces conflict
-replacement); update and delete go by key. Statement text (schema) is
-replayed as in v0.1.
+(`SQLITE_DBCONFIG_ENABLE_TRIGGER`; the application's TEMP triggers, which
+that leaves on, are set aside for them, #76) - their effects are already in
+the log; firing them again would double them. Foreign keys are the
+writer's for each record (its mode bit), checked at the end of the group
+(`defer_foreign_keys`), so a cascade's records, which come before their
+cause, pass. Insert is `INSERT OR REPLACE` with the original key (which
+also reproduces conflict replacement), update is `UPDATE OR REPLACE` for
+the same reason (#64); update and delete go by key. Statement text (schema)
+is replayed as in v0.1.
 
 ## Format and compatibility
 
-Batches get a format version. A replica keeps replaying v1 (statement)
-batches, so existing histories continue; a v0.1 database upgrades in place,
-its next batch being v2.
+Each entry carries its kind in its mode bits (`HPPLITE_MODE_ROW`, 4): a
+batch mixes records and statements. A replica keeps replaying v0.1
+(statement) entries, so existing histories continue; a v0.1 database
+upgrades in place, its next entries being records. v0.1 refuses a mode
+bit it does not know and stops.
 
 ## Tampering
 
@@ -136,8 +142,9 @@ detected.
   enough to fill SQLite's lookaside memory (default about 124 slots), and the
   connection's small allocations fall through to malloc: a sort-heavy read
   (`SELECT DISTINCT ... ORDER BY`) went from 29 to 41 µs. With 300 slots
-  (`SQLITE_DBCONFIG_LOOKASIDE`) reads are equal to v1. Whether HPPLite sizes
-  the lookaside of the connections it attaches to is decided in phase 2.
+  (`SQLITE_DBCONFIG_LOOKASIDE`) reads are equal to v1. HPPLite does not
+  size the lookaside of the connections it attaches to; an application
+  that measures the difference can.
 - **Readable history**: v0.1 batches are SQL, an audit trail of what the
   application did; records are not. Rows only in v0.2; statement text kept
   alongside for audit (not replayed) is an option later.
