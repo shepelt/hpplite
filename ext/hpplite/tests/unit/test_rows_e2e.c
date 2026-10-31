@@ -644,6 +644,39 @@ static void test_deferred_finalize_not_reposted(void) {
     PASS();
 }
 
+/* 16. The application's TEMP triggers: replayed as text they live on the
+** replica's connection, where SQLITE_DBCONFIG_ENABLE_TRIGGER leaves them
+** on; they must not fire on records (their effects are records too), and
+** must fire for the text that needs them (one reaching a virtual table) (#76) */
+static void test_temp_triggers(void) {
+    TEST("an application TEMP trigger: silent under records, live for text; replica equal");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/temptrig.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = {
+        "CREATE TABLE t(x)", "CREATE TABLE u(y)",
+        "CREATE TEMP TRIGGER tt AFTER INSERT ON main.t BEGIN INSERT INTO u VALUES(new.x * 10); END",
+        "INSERT INTO t VALUES(1), (2)",                                  /* records for t and, through tt, for u */
+        "CREATE TABLE p(b)", "CREATE VIRTUAL TABLE pf USING fts5(b)",
+        "CREATE TEMP TRIGGER tp AFTER INSERT ON main.p BEGIN INSERT INTO pf(rowid, b) VALUES(new.rowid, new.b); END",
+        "INSERT INTO p VALUES('searchable')",                            /* text: reaches pf through tp */
+        "INSERT INTO t VALUES(3)",                                       /* records again, after text */
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT count(*) FROM u") != 3) FAIL("writer premise: the TEMP trigger wrote u");
+    const char *why = replica_matches(w, l1, "temptrig_r.db");
+    if (!why) {
+        HppliteNode *r = open_node(DIR "/temptrig_r.db", l1);
+        sqlite3_int64 hits = r ? scalar(r->db, "SELECT count(*) FROM pf WHERE pf MATCH 'searchable'") : -1;
+        if (r) hpplite_node_destroy(r);
+        if (hits != 1) { hpplite_l1_disconnect(l1); FAILF("replica search: %lld hits, want 1", (long long)hits); }
+    }
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -662,6 +695,7 @@ int main(void) {
     test_drop_column();
     test_drop_table_cascade();
     test_deferred_finalize_not_reposted();
+    test_temp_triggers();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

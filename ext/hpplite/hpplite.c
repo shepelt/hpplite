@@ -2615,6 +2615,36 @@ static int storeCarry(HppliteCtx *pCtx, const ReplayStmt *a, int n) {
   return rc;
 }
 
+/* The replica connection's own TEMP triggers (an application's, replayed as
+** text): SQLITE_DBCONFIG_ENABLE_TRIGGER leaves TEMP triggers on, so they
+** are set aside while records apply - their effects are records of their
+** own - and put back for the text that fires them (#76). sqlite_schema
+** stores a trigger's text without TEMP: put back as TEMP. */
+static char *tempTriggersStash(sqlite3 *rdb) {
+  sqlite3_stmt *q = NULL;
+  char *zSql = NULL, *zDrop = NULL;
+  if (sqlite3_prepare_v2(rdb, "SELECT name, sql FROM temp.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL"
+                         " AND name NOT LIKE 'hpplite\\_cap\\_%' ESCAPE '\\'", -1, &q, NULL) == SQLITE_OK) {
+    while (sqlite3_step(q) == SQLITE_ROW) {
+      const char *zName = (const char *)sqlite3_column_text(q, 0), *zCreate = (const char *)sqlite3_column_text(q, 1);
+      if (sqlite3_strnicmp(zCreate, "CREATE TRIGGER", 14) == 0) zCreate += 14;
+      else if (sqlite3_strnicmp(zCreate, "CREATE TEMP TRIGGER", 19) == 0) zCreate += 19;
+      else if (sqlite3_strnicmp(zCreate, "CREATE TEMPORARY TRIGGER", 24) == 0) zCreate += 24;
+      zSql = sqlite3_mprintf("%zCREATE TEMP TRIGGER%s;", zSql, zCreate);
+      zDrop = sqlite3_mprintf("%zDROP TRIGGER temp.\"%w\";", zDrop, zName);
+    }
+  }
+  sqlite3_finalize(q);
+  if (zDrop) sqlite3_exec(rdb, zDrop, NULL, NULL, NULL);
+  sqlite3_free(zDrop);
+  return zSql;
+}
+static void tempTriggersRestore(sqlite3 *rdb, char **pzStash) {
+  if (*pzStash) sqlite3_exec(rdb, *pzStash, NULL, NULL, NULL);
+  sqlite3_free(*pzStash);
+  *pzStash = NULL;
+}
+
 int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTxn) {
   int savedEnabled, rc = SQLITE_OK, i, open = 0;
   sqlite3_int64 lastTxn = -1;
@@ -2756,6 +2786,8 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   savedEnabled = pCtx->bEnabled;
   if (rdb == pCtx->db) { pCtx->bEnabled = 0; pCtx->bInternal = 1; }
   int savedMode = connectionMode(rdb), curMode = savedMode;
+  char *zTempStash = NULL;
+  int tempLooked = 0;                     /* the connection's TEMP triggers set aside for records (#76) */
   for (i = 0; i < holdFrom && rc == SQLITE_OK; i++) {
     const char *zSql = aRun[i].zSql;
     /* A row record (#19) runs under the writer's foreign keys (a cascade it
@@ -2788,6 +2820,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     if (isRow && rc == SQLITE_OK) {
       char *zErr = NULL;
       int trig = 1;
+      if (!tempLooked) { zTempStash = tempTriggersStash(rdb); tempLooked = 1; }
       sqlite3_db_config(rdb, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, &trig);
       rc = hpplite_rows_apply_entry(rdb, zSql, &zErr);
       sqlite3_db_config(rdb, SQLITE_DBCONFIG_ENABLE_TRIGGER, 1, &trig);
@@ -2802,6 +2835,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       }
       continue;
     }
+    if (zTempStash) { tempTriggersRestore(rdb, &zTempStash); tempLooked = 0; }   /* text fires them */
     if (rc == SQLITE_OK && sqlite3_strnicmp(zSql, "VACUUM", 6) == 0 && zSql[6] == 0) {
       /* not inside a transaction: the group before it ends here */
       if (open) { rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL); open = 0; lastTxn = -1; }
@@ -2809,6 +2843,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       continue;
     }
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, zSql, NULL, NULL, NULL);
+    if (sqlite3_strnicmp(zSql, "CREATE", 6) == 0 && strcasestr(zSql, "TRIGGER")) tempLooked = 0;   /* a new one, maybe TEMP */
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_ERROR) {
       /* The statement failed here as it did at the sequencer (a failed
       ** statement has no effect, so it is skipped there and skipped here;
@@ -2826,6 +2861,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
     if (rc == SQLITE_OK) rc = sqlite3_exec(rdb, "COMMIT", NULL, NULL, NULL);
     else sqlite3_exec(rdb, "ROLLBACK", NULL, NULL, NULL);
   }
+  tempTriggersRestore(rdb, &zTempStash);  /* after a ROLLBACK they are back already: "exists" is fine */
   hpplite_clock_restore(savedPin, savedSeen);
   /* back to the connection's own state (the application's, on :memory:) */
   if (replayMode(rdb, savedMode, &curMode) != SQLITE_OK) {

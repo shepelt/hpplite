@@ -386,7 +386,9 @@ static int loadTextOnly(HppliteCtx *pCtx, const char *zSeed) {
   if (rc == SQLITE_OK && zList) {
     sqlite3_stmt *fk = NULL;
     rc = sqlite3_prepare_v2(pCtx->db,
-      "SELECT tbl_name, sql FROM main.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL", -1, &q, NULL);
+      "SELECT tbl_name, sql FROM main.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL"
+      " UNION ALL SELECT tbl_name, sql FROM temp.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL"
+      " AND name NOT LIKE 'hpplite\\_cap\\_%' ESCAPE '\\'", -1, &q, NULL);     /* the application's TEMP triggers too (#76) */
     /* a foreign key action writes the child when the parent changes */
     if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->db,
       "SELECT f.\"table\", m.name FROM main.sqlite_schema m, pragma_foreign_key_list(m.name) f"
