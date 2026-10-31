@@ -105,9 +105,11 @@ struct HppliteCtx {
   /* Row capture (capture engine v2, #19; capture_rows.c) */
   int bRows;                  /* writes are captured as row records by the connection's TEMP triggers */
   int rowsBuiltFor;           /* schema_version the triggers were built for (-1: none) */
+  int rowsTempBuiltFor;       /* temp's schema_version once built: a ROLLBACK brings the old ones back (#88) */
   int bRowsCapOff;            /* the running statement is logged as text: its triggers record nothing */
   sqlite3_stmt *pRowsTextStmt; /* ...that statement */
   sqlite3_stmt *pRowsSchemaStmt; /* Cached PRAGMA main.schema_version */
+  sqlite3_stmt *pRowsTempSchemaStmt; /* Cached PRAGMA temp.schema_version */
   sqlite3_stmt *pRowsLockStmt; /* Cached no-op write: the write lock before that read */
   char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
   sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */

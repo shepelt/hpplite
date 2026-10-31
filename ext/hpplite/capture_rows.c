@@ -305,20 +305,26 @@ static int buildTriggers(HppliteCtx *pCtx, const Tab *t, int k) {
   return rc;
 }
 
-static int schemaVersionOf(HppliteCtx *pCtx) {
+static int schemaVersionCached(HppliteCtx *pCtx, sqlite3_stmt **ppStmt, const char *zPragma) {
   int v = -1, savedInternal = pCtx->bInternal;
   pCtx->bInternal = 1;                   /* ours: not traced as the application's */
-  if (!pCtx->pRowsSchemaStmt
-      && sqlite3_prepare_v3(pCtx->db, "PRAGMA main.schema_version", -1, SQLITE_PREPARE_PERSISTENT,
-                            &pCtx->pRowsSchemaStmt, NULL) != SQLITE_OK) {
-    pCtx->pRowsSchemaStmt = NULL;
+  if (!*ppStmt && sqlite3_prepare_v3(pCtx->db, zPragma, -1, SQLITE_PREPARE_PERSISTENT, ppStmt, NULL) != SQLITE_OK) {
+    *ppStmt = NULL;
     pCtx->bInternal = savedInternal;
     return -1;
   }
-  if (sqlite3_step(pCtx->pRowsSchemaStmt) == SQLITE_ROW) v = sqlite3_column_int(pCtx->pRowsSchemaStmt, 0);
-  sqlite3_reset(pCtx->pRowsSchemaStmt);
+  if (sqlite3_step(*ppStmt) == SQLITE_ROW) v = sqlite3_column_int(*ppStmt, 0);
+  sqlite3_reset(*ppStmt);
   pCtx->bInternal = savedInternal;
   return v;
+}
+static int schemaVersionOf(HppliteCtx *pCtx) {
+  return schemaVersionCached(pCtx, &pCtx->pRowsSchemaStmt, "PRAGMA main.schema_version");
+}
+/* temp's: the triggers live there, and a ROLLBACK of the transaction they
+** were rebuilt in brings the old ones back, temp's version with them (#88) */
+static int tempSchemaVersionOf(HppliteCtx *pCtx) {
+  return schemaVersionCached(pCtx, &pCtx->pRowsTempSchemaStmt, "PRAGMA temp.schema_version");
 }
 
 /* Does zSql mention zName as a whole identifier? (case-insensitive; a
@@ -484,6 +490,7 @@ static int rebuild(HppliteCtx *pCtx) {
   if (rc == SQLITE_OK) rc = loadTextOnly(pCtx, zSkip);
   sqlite3_free(zSkip);
   pCtx->rowsBuiltFor = rc == SQLITE_OK ? v : -1;
+  pCtx->rowsTempBuiltFor = tempSchemaVersionOf(pCtx);
   pCtx->bInternal = savedInternal;
   return rc;
 }
@@ -604,7 +611,8 @@ void hpplite_rows_disable(HppliteCtx *pCtx) {
 }
 
 int hpplite_rows_covered(HppliteCtx *pCtx) {
-  return pCtx->rowsBuiltFor >= 0 && schemaVersionOf(pCtx) == pCtx->rowsBuiltFor;
+  return pCtx->rowsBuiltFor >= 0 && schemaVersionOf(pCtx) == pCtx->rowsBuiltFor
+      && tempSchemaVersionOf(pCtx) == pCtx->rowsTempBuiltFor;
 }
 
 /* The same, as a write starts. Read first, the schema version would open a
@@ -629,7 +637,7 @@ int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
     pCtx->bInternal = savedInternal;
     if (rc != SQLITE_DONE) return 0;      /* no lock (busy past the timeout): text, as v1 - its own insert waits */
   }
-  return schemaVersionOf(pCtx) == pCtx->rowsBuiltFor;
+  return schemaVersionOf(pCtx) == pCtx->rowsBuiltFor && tempSchemaVersionOf(pCtx) == pCtx->rowsTempBuiltFor;
 }
 
 /* ------------------------------------------------- what a statement writes */

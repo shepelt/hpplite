@@ -613,6 +613,34 @@ static void test_malformed_records(void) {
     PASS();
 }
 
+/* The triggers rebuilt inside an application transaction go with its
+** ROLLBACK: the old ones are back, and must be known to be (#88) */
+static void test_rebuild_rolled_back(void) {
+    TEST("a trigger rebuild inside a transaction that rolls back is noticed: the next write rebuilds again");
+    reset_dir();
+    W a, b;
+    if (!open_writer(DIR "/rb.db", &a) || !open_writer(DIR "/rb.db", &b)) FAIL("open");
+    exec(a.db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)");
+    exec(b.db, "INSERT INTO t(v) VALUES('b0')");                      /* b's triggers know t(id, v) */
+    exec(a.db, "ALTER TABLE t ADD COLUMN w");
+    exec(b.db, "BEGIN");
+    exec(b.db, "INSERT INTO t(v) VALUES('text')");                    /* text (not covered), rebuilt after it, in the transaction */
+    exec(b.db, "ROLLBACK");                                           /* the old triggers are back */
+    if (!exec(b.db, "INSERT INTO t(v, w) VALUES('after', 1)")) FAIL("the write after the rollback failed");
+    exec(b.db, "SAVEPOINT s");
+    exec(a.db, "ALTER TABLE t ADD COLUMN x");
+    exec(b.db, "INSERT INTO t(v) VALUES('text2')");                   /* rebuilt inside the savepoint */
+    exec(b.db, "ROLLBACK TO s");
+    exec(b.db, "RELEASE s");
+    if (!exec(b.db, "INSERT INTO t(v, x) VALUES('after2', 2)")) FAIL("the write after ROLLBACK TO failed");
+    int nr, nt;
+    const char *why = replica_differs(&b, DIR "/rb_r.db", &nr, &nt);
+    close_writer(&b);
+    close_writer(&a);
+    if (why) FAIL(why);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -648,6 +676,7 @@ int main(void) {
     test_sqlite_tables_are_text();
     test_shutdown_leaves_connection_usable();
     test_malformed_records();
+    test_rebuild_rolled_back();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
