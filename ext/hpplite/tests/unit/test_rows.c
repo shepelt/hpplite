@@ -234,6 +234,7 @@ static void test_conflicts_upserts_bulk(void) {
     exec(w.db, "INSERT OR REPLACE INTO u(id, email) VALUES(9999, 'user7@x')");   /* replaces row 7 by its UNIQUE email */
     exec(w.db, "INSERT INTO u(email, n) VALUES('user8@x', 1) ON CONFLICT(email) DO UPDATE SET n = n + 1");
     exec(w.db, "INSERT INTO u(email) VALUES('user9@x') ON CONFLICT DO NOTHING");
+    exec(w.db, "UPDATE OR REPLACE u SET email = 'user3@x' WHERE id = 4");        /* row 3 goes, silently (#64) */
     exec(w.db, "UPDATE u SET n = n + id % 3");
     exec(w.db, "DELETE FROM u WHERE id % 5 = 0");
     exec(w.db, "UPDATE u SET n = n WHERE id < 0");                               /* no-op */

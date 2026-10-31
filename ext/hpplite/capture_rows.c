@@ -852,7 +852,10 @@ int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned cha
       for (i = 0; i < nCol; i++) if (bitmap[i / 8] & (1 << (i % 8))) zSet = sqlite3_mprintf("%z%s\"%w\" = ?%d", zSet, zSet ? ", " : "", t.azCol[i], p++);
       if (!zSet) { tabFree(&t); return SQLITE_OK; }   /* nothing changed */
       zWhere = whereKey(&t, 1);
-      zSql = sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s", zTab, zSet, zWhere);
+      /* OR REPLACE as the insert: a REPLACE conflict on the writer removed
+      ** the rows in the way without a delete trigger firing (recursive
+      ** triggers off), so no record says so; here it removes the same (#64) */
+      zSql = sqlite3_mprintf("UPDATE OR REPLACE \"%w\" SET %s WHERE %s", zTab, zSet, zWhere);
       sqlite3_free(zSet); sqlite3_free(zWhere);
       rc = sqlite3_prepare_v2(db, zSql, -1, &st, NULL);
       if (rc == SQLITE_OK) {
