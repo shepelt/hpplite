@@ -598,7 +598,11 @@ int hpplite_rows_enable(HppliteCtx *pCtx) {
   sqlite3_create_function(db, "hpplite_mode", 0, SQLITE_UTF8, pCtx, fnMode, NULL, NULL);
   pCtx->bRows = 1;
   hpplite_rows_seq_take(pCtx, db);
-  return rebuild(pCtx);
+  rc = rebuild(pCtx);
+  /* the columns added above are a schema change of HPPLite's own: not one
+  ** the connection's first statement is stale for */
+  pCtx->seenSchema = schemaVersionOf(pCtx);
+  return rc;
 }
 
 /* The connection as it was before hpplite_rows_enable(): no triggers, no

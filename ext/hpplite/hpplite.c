@@ -540,16 +540,19 @@ static sqlite3_int64 totalChanges(sqlite3 *db) {
 }
 
 static int schemaVersion(HppliteCtx *pCtx) {
-  int v = -1;
+  int v = -1, savedInternal = pCtx->bInternal;
+  pCtx->bInternal = 1;                   /* ours: its trace must not pass for the application's next statement */
   if (!pCtx->pSchemaStmt) {
     if (sqlite3_prepare_v3(pCtx->db, "PRAGMA schema_version", -1, SQLITE_PREPARE_PERSISTENT,
                            &pCtx->pSchemaStmt, NULL) != SQLITE_OK) {
       pCtx->pSchemaStmt = NULL;
+      pCtx->bInternal = savedInternal;
       return -1;
     }
   }
   if (sqlite3_step(pCtx->pSchemaStmt) == SQLITE_ROW) v = sqlite3_column_int(pCtx->pSchemaStmt, 0);
   sqlite3_reset(pCtx->pSchemaStmt);
+  pCtx->bInternal = savedInternal;
   return v;
 }
 
@@ -1266,6 +1269,7 @@ static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   }
   pCtx->pRerunStmt = pS;
   pCtx->rerunStage = 1;
+  pCtx->rerunSchema = schemaVersion(pCtx);
   return 1;
 }
 static void rerunBegin(HppliteCtx *pCtx, sqlite3_stmt *pS) {
@@ -1287,15 +1291,30 @@ static void rerunCommit(HppliteCtx *pCtx) {
       pCtx->bRootDirty = 1;
       if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
     } else {
-      /* ours, still open: the application's autocommit writes since are in
-      ** it, unseen by other connections until something commits */
-      fprintf(stderr, "hpplite: could not commit the transaction opened for a stale statement's rerun (%s)\n",
-              sqlite3_errmsg(pCtx->db));
-      pCtx->nLogErrors++;
+      /* a statement in progress (this is its trace): ours stays open with
+      ** the application's statement inside, and is committed at that
+      ** statement's end - never left open past it */
+      pCtx->rerunCommitPending = 1;
     }
   }
   pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   gateLeaveAppIfIdle(pCtx);
+}
+/* ...that end: the application's statement over, nothing is in progress */
+static void rerunCommitRetry(HppliteCtx *pCtx) {
+  if (sqlite3_get_autocommit(pCtx->db)) { pCtx->rerunCommitPending = 0; return; }   /* ended by the application */
+  if (internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
+    pCtx->rerunCommitPending = 0;
+    pCtx->curTxn = 0;
+    pCtx->bRootDirty = 1;
+    if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
+    pCtx->bAppTxnOpen = 0;
+    gateLeaveAppIfIdle(pCtx);
+  } else {
+    fprintf(stderr, "hpplite: could not commit the transaction opened for a stale statement's rerun (%s)\n",
+            sqlite3_errmsg(pCtx->db));
+    pCtx->nLogErrors++;
+  }
 }
 /* Expired (to be prepared again)? A SQLite built without its deprecated
 ** interfaces has no sqlite3_expired(): assume so (the rerun's end, or the
@@ -1310,7 +1329,9 @@ static int stmtExpired(sqlite3_stmt *pS) {
 ** follows (running again, as a STMT trace would have recorded it); or it is
 ** over (it ran, or failed for another reason): commit */
 static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
-  if (pCtx->rerunStage == 1 && stmtExpired(pS)) {
+  /* expired by a schema change of its own (a CREATE VIRTUAL TABLE's nested
+  ** DDL expires every statement, this one too): it ran, no rerun follows */
+  if (pCtx->rerunStage == 1 && stmtExpired(pS) && schemaVersion(pCtx) == pCtx->rerunSchema) {
     pCtx->rerunStage = 2;
     if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
       int slot = pCtx->nActiveStmt++;
@@ -1360,8 +1381,13 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
   ** connection itself (sqlite3_next_stmt takes the connection mutex, which
   ** sqlite3_close holds while it joins the timer thread - a deadlock). */
-  if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt) {
-    rerunCommit(pCtx);                    /* the rerun never came (its first run failed otherwise) */
+  if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt
+      && !(zSql && zSql[0] == '-' && zSql[1] == '-')) {
+    /* the rerun never came (its first run failed otherwise). Not on a
+    ** sub-program's trace: a CREATE VIRTUAL TABLE's nested DDL runs inside
+    ** the rerun, which is in progress - a COMMIT there fails, and the
+    ** transaction stayed open with every later statement in it (#95) */
+    rerunCommit(pCtx);
   }
   if (mask == SQLITE_TRACE_STMT) pCtx->pRefusedStmt = NULL;      /* a new statement: the refused one ran or failed */
   if (mask == SQLITE_TRACE_STMT) {
@@ -1413,6 +1439,7 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     int bWasLogged = pS == pCtx->pLastLogged;
+    if (pCtx->rerunCommitPending) rerunCommitRetry(pCtx);
     /* a refused statement done - unless this is its first run failing stale
     ** (expired: SQLite reprepares and reruns it inside this step): the rerun
     ** must be refused too (#89) */

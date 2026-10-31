@@ -669,7 +669,6 @@ static void test_refused_stale_statement(void) {
     reset_dir();
     W a, b;
     if (!open_writer(DIR "/stale.db", &a) || !open_writer(DIR "/stale.db", &b)) FAIL("open");
-    setenv("HPPLITE_TRACE_RERUN", "1", 1);
     int ok1 = exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
     int ok2 = exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
     int ok3 = exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
@@ -684,7 +683,6 @@ static void test_refused_stale_statement(void) {
     exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
     int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
     sqlite3_finalize(st);
-    unsetenv("HPPLITE_TRACE_RERUN");
     /* the refusal says why this write was text, not that a version lacks something (#85) */
     int saysText = strstr(b.ctx->zLastRefusal, "logged as text") != NULL, saysV01 = strstr(b.ctx->zLastRefusal, "v0.1") != NULL;
     sqlite3_int64 rows = scalar(b.db, "SELECT count(*) FROM c");
@@ -695,6 +693,34 @@ static void test_refused_stale_statement(void) {
     if (rows != 0) FAILF("%lld rows in c, want 0: the refused write happened", (long long)rows);
     if (!again) FAIL("the next statement on the connection failed");
     if (!saysText || saysV01) FAIL("the refusal does not say the statement is logged as text, or blames v0.1");
+    PASS();
+}
+
+/* A statement HPPLite tracks for a rerun (prepared on a schema another
+** connection changed) runs in a transaction of HPPLite's. One that changes
+** the schema itself (a CREATE VIRTUAL TABLE: FTS5's nested DDL expires it)
+** must still commit at its end, not stay open with the next statements
+** inside, unseen by other connections */
+static void test_tracked_schema_change_commits(void) {
+    TEST("a tracked statement that changes the schema itself commits at its end; nothing stays open");
+    reset_dir();
+    W a, b;
+    if (!open_writer(DIR "/tracked.db", &a) || !open_writer(DIR "/tracked.db", &b)) FAIL("open");
+    exec(a.db, "CREATE TABLE t(x)");
+    exec(b.db, "CREATE TABLE z(x)");                                  /* a's next statement is stale */
+    exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(b)");
+    int auto1 = sqlite3_get_autocommit(a.db);
+    exec(a.db, "INSERT INTO t VALUES(1)");
+    int auto2 = sqlite3_get_autocommit(a.db);
+    sqlite3_int64 seen = scalar(b.db, "SELECT count(*) FROM t");
+    int nr, nt;
+    const char *why = replica_differs(&a, DIR "/tracked_r.db", &nr, &nt);
+    close_writer(&b);
+    close_writer(&a);
+    if (!auto1) FAIL("a transaction of HPPLite's is open after the tracked CREATE VIRTUAL TABLE");
+    if (!auto2) FAIL("a transaction of HPPLite's is open after the next statement");
+    if (seen != 1) FAILF("the other connection sees %lld rows in t, want 1", (long long)seen);
+    if (why) FAIL(why);
     PASS();
 }
 
@@ -736,6 +762,7 @@ int main(void) {
     test_rebuild_rolled_back();
     test_long_virtual_table_name();
     test_refused_stale_statement();
+    test_tracked_schema_change_commits();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

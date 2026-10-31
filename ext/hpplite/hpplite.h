@@ -81,6 +81,9 @@ struct HppliteCtx {
   sqlite3_stmt *pRerunStmt;      /* a statement prepared on a stale schema, logged in a transaction
                                  ** HPPLite opened for it: SQLite reruns it without a STMT trace */
   int rerunStage;                /* 1 logged, 2 its first run failed (SQLITE_SCHEMA) and the rerun runs */
+  int rerunSchema;               /* schema_version when it was tracked: one it changed itself expired itself */
+  int rerunCommitPending;        /* HPPLite's transaction could not be committed where it ended (a statement in
+                                 ** progress): committed at the next statement's end */
   sqlite3_stmt *pRefusedStmt;    /* refused at its trace (sqlite3_interrupt); a first run failing stale
                                  ** (SQLITE_SCHEMA) reruns untraced with the interrupt cleared, so its
                                  ** reprepare is denied by the authorizer instead (#89) */
