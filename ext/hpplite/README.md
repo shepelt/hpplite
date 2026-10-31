@@ -260,9 +260,16 @@ cmake --build ext/hpplite/build_real
 
 ```bash
 # Unit tests (mock L1, fast, no network)
-ctest                    # 15 suites, ~5s: core, batch, node, open API, cipher, keys,
-                         # durability (26 cases), loadable extension, crash harness,
-                         # Python/CLI smoke, docs check
+ctest                    # 42 tests, ~1 min: core, batch, node, open API, cipher, keys,
+                         # durability, loadable extension, crash harness, row capture,
+                         # Python/CLI smoke, docs check; every suite again with capture=text
+
+# Fault injection (#98): a random workload under injected failures - a post refused,
+# a confirmation lost, a transaction pending past the timeout, a claim that reverts,
+# a bookkeeping commit that fails as SQLITE_FULL, a reorg, the lease expiring - with
+# the chain and a rebuilt replica as the oracle. In ctest with 60 seeds per mode.
+HPPLITE_FAULT_SEEDS=500 build_mock/test_faults          # more seeds
+HPPLITE_FAULT_SEED=17 build_mock/test_faults            # one seed, verbose
 
 # Real contracts on a local chain (foundry: anvil + forge + cast; no network, no funds).
 # Lease claim/renew/release transactions, a second instance of the same wallet, a
