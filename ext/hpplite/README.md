@@ -213,6 +213,15 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   It holds the file as its sequencer, so every request is a follower and
   never waits for the chain (WordPress, 8 PHP workers, 16 concurrent
   clients: ~4% over plain SQLite; `tests/real_apps/wordpress`).
+- **A connection opened without HPPLite writes past the log** (`sqlite3
+  app.db` from a shell, a tool that opens the file plainly). The roots the
+  sequencer posts still match - it hashes the live file - and the difference
+  shows only on a rebuild. It is detected, best effort: when a bookkeeping
+  look finds the file changed while no connection of this process committed
+  and HPPLite's own tables are as they were, `hpplite_status.foreign_writes`
+  goes up and one line says so on stderr (#37). Another HPPLite process's
+  writes leave log rows and are not counted. Open every writer with
+  `hpplite=on`.
 - **Everything that writes is replayed**, DDL included: `CREATE`, `ALTER`,
   `DROP`, the table rebuilds migration tools do, `PRAGMA user_version` and
   `application_id`. `changes()`, `last_insert_rowid()` and `RETURNING`
@@ -388,7 +397,8 @@ records or statements - not yet posted), `state_root`, `prev_block_hash`,
 `roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`,
 `sequencer` (1 = this connection posts the file's batches; 0 = another
 connection, in this process or another, does), `capture` (`rows` or `text`:
-what this connection logs).
+what this connection logs), `foreign_writes` (looks that found the file
+changed by something that is not HPPLite, #37).
 
 
 What exists in v0.1 is **rebuild and compare**: open an empty file with the

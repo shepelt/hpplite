@@ -1470,6 +1470,8 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   } else if (mask == SQLITE_TRACE_PROFILE) {
     int i;
+    /* a commit whose hook fired is visible once its statement ends (#37) */
+    __atomic_store_n(&pCtx->nCommitDone, __atomic_load_n(&pCtx->nCommitBegun, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
     for (i = 0; i < pCtx->nActiveStmt; i++) {
       if (pCtx->aActiveStmt[i] == pS) { done = endActiveRun(pCtx, i); break; }
     }
@@ -1758,6 +1760,7 @@ static int hppliteCommitHook(void *pArg) {
   if (pCtx->bInternal) return 0;
   pCtx->curTxn = 0;
   pCtx->bRootDirty = 1;
+  __atomic_add_fetch(&pCtx->nCommitBegun, 1, __ATOMIC_RELEASE);
   if (pCtx->xOnCommit) {
     pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
   }
@@ -2115,6 +2118,7 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   } else {
     pCtx->bBkGate = 0;
   }
+  pCtx->commitsDoneBefore = __atomic_load_n(&pCtx->nCommitDone, __ATOMIC_ACQUIRE);   /* before this look's snapshot (#37) */
   {
     int rc = internalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
     if (rc != SQLITE_OK && pCtx->bBkGate) {
@@ -2125,9 +2129,86 @@ static int bkBegin(HppliteCtx *pCtx, int bWrite) {
   }
 }
 
+/*
+** Writes past the log (#37): a connection opened without HPPLite (an ops
+** person's sqlite3 shell) changes the file and leaves no log row. The
+** sequencer's roots still match, it hashes the live file; only a rebuild
+** shows the difference. Best effort, from inside a bookkeeping transaction:
+** SQLite's data version moves when this connection commits or first sees
+** another connection's commit - not once per foreign commit, so nothing
+** can be counted; but if it moved while the application connection
+** committed nothing and HPPLite's own tables (the log, the meta row) are as
+** they were, something else wrote. Another HPPLite connection or process
+** leaves log rows or a new height and is not counted.
+**
+** "Committed nothing" between two snapshots, exactly: the application's
+** commits are counted at the commit hook, before they are visible, and
+** again when the statement ends, after they are. Commits visible in a
+** snapshot are at most the hook count read after it, and at least the
+** done count read before it; equal counts across the two looks mean the
+** same commits were visible in both.
+*/
+static sqlite3_int64 fnv(sqlite3_int64 h, const unsigned char *z, int n) {
+  int i;
+  for (i = 0; i < n; i++) h = (h ^ z[i]) * 1099511628211LL;
+  return h;
+}
+static int bkFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[3]) {
+  sqlite3_stmt *q = NULL;
+  int rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT min(id), max(id) FROM _hpplite_pending", -1, &q, NULL);
+  if (rc != SQLITE_OK) return rc;
+  out[0] = out[1] = out[2] = 0;
+  if (sqlite3_step(q) == SQLITE_ROW) { out[0] = sqlite3_column_int64(q, 0); out[1] = sqlite3_column_int64(q, 1); }
+  sqlite3_finalize(q);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT * FROM _hpplite_meta", -1, &q, NULL);
+  if (rc != SQLITE_OK) return rc;
+  if (sqlite3_step(q) == SQLITE_ROW) {
+    int i, n = sqlite3_column_count(q);
+    sqlite3_int64 h = 1469598103934665603LL;
+    for (i = 0; i < n; i++) {
+      const unsigned char *z = sqlite3_column_blob(q, i);
+      int len = sqlite3_column_bytes(q, i);
+      h = fnv(h, (const unsigned char *)"|", 1);
+      if (z) h = fnv(h, z, len);
+    }
+    out[2] = h;
+  }
+  sqlite3_finalize(q);
+  return SQLITE_OK;
+}
+/* On the bookkeeping connection only, which has no hooks: bInternal is the
+** application thread's and is left alone */
+static void bkForeignCheck(HppliteCtx *pCtx, int doneBefore) {
+  sqlite3_int64 f[3];
+  unsigned dv = 0;
+  if (bkFingerprint(pCtx, f) == SQLITE_OK) {
+    int begunAfter = __atomic_load_n(&pCtx->nCommitBegun, __ATOMIC_ACQUIRE);   /* after this look's snapshot */
+    sqlite3_file_control(pCtx->bkDb, "main", SQLITE_FCNTL_DATA_VERSION, &dv);
+    if (pCtx->bBkDataVersionValid && dv != pCtx->bkDataVersion && begunAfter == pCtx->commitsDoneAtLook
+        && memcmp(f, pCtx->aBkFinger, sizeof(f)) == 0) {
+      pCtx->nForeignWrites++;
+      if (pCtx->nForeignWrites == 1) {
+        fprintf(stderr, "hpplite: the database changed with no HPPLite connection writing it: "
+                        "something writes past the log (hpplite_status.foreign_writes); a rebuild from the chain will differ\n");
+      }
+    }
+    memcpy(pCtx->aBkFinger, f, sizeof(f));
+  }
+  pCtx->commitsDoneAtLook = doneBefore;
+}
+
 static int bkEnd(HppliteCtx *pCtx, int rc) {
+  int bLook = rc == SQLITE_OK && pCtx->bkDb != pCtx->db;
+  if (bLook) bkForeignCheck(pCtx, pCtx->commitsDoneBefore);
   if (rc == SQLITE_OK) {
     rc = internalExec(pCtx, pCtx->bkDb, "COMMIT");
+  }
+  if (bLook && rc == SQLITE_OK) {
+    /* the baseline: after our own commit (which moves the version), with
+    ** the application's commits since the last look consumed - one that
+    ** lands after our snapshot leaves log rows, and is attributed by them */
+    sqlite3_file_control(pCtx->bkDb, "main", SQLITE_FCNTL_DATA_VERSION, &pCtx->bkDataVersion);
+    pCtx->bBkDataVersionValid = 1;
   }
   if (rc != SQLITE_OK) {
     internalExec(pCtx, pCtx->bkDb, "ROLLBACK");
@@ -3305,6 +3386,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_LAST_REFUSAL     19
 #define STATUS_COL_SEQUENCER        20
 #define STATUS_COL_CAPTURE          21
+#define STATUS_COL_FOREIGN_WRITES   22
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -3317,7 +3399,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT)");
+        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -3481,6 +3563,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_CAPTURE:              /* what this connection logs: records or statements (#83) */
             sqlite3_result_text(ctx, node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
+            break;
+        case STATUS_COL_FOREIGN_WRITES:       /* the file changed with no HPPLite write to show for it (#37) */
+            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignWrites);
             break;
         case STATUS_COL_LAST_BATCH_TX:
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);

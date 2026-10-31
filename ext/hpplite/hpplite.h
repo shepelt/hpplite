@@ -157,6 +157,16 @@ struct HppliteCtx {
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
   uint64_t nHooksReplaced;    /* Times our trace/commit/rollback hook was found replaced and re-armed */
+  uint64_t nForeignWrites;    /* Bookkeeping looks that found the file changed with no HPPLite write to show for it (#37) */
+  unsigned bkDataVersion;     /* The bookkeeping connection's data version after its last transaction */
+  int bBkDataVersionValid;
+  int nCommitBegun;           /* The application connection's commits: counted at the commit hook
+                              ** (before the commit is visible to other connections) ... */
+  int nCommitDone;            /* ... and when a statement ends (after it is). Read from the
+                              ** bookkeeping thread, written on the application's */
+  int commitsDoneAtLook;      /* nCommitDone before the previous look's snapshot */
+  int commitsDoneBefore;      /* ... before this one's */
+  sqlite3_int64 aBkFinger[3]; /* HPPLite's own state then: pending min(id), max(id), a hash of _hpplite_meta */
   uint64_t nRootsCompared;    /* Posted roots compared with our content hash during replay */
   uint64_t nRootMismatches;   /* ... of which differed */
   uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */

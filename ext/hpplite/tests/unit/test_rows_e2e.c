@@ -746,6 +746,43 @@ static void test_connection_pragmas(void) {
     PASS();
 }
 
+/* A connection opened without HPPLite writes past the log; the sequencer's
+** roots still match (it hashes the live file), the divergence shows only on
+** a rebuild. Detected: the file changed while no HPPLite connection wrote
+** (#37) */
+static void test_foreign_writes_detected(void) {
+    TEST("a write by a connection without HPPLite is counted in hpplite_status.foreign_writes; HPPLite's own traffic is not");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/foreign.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = { "CREATE TABLE t(a)", "INSERT INTO t VALUES(1)", NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    hpplite_node_flush_batch(w);
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+    hpplite_node_flush_batch(w);
+    hpplite_node_flush_batch(w);                       /* nothing to post: a bookkeeping look, no change */
+    hpplite_node_exec(w, "BEGIN; UPDATE t SET a = a WHERE 0; COMMIT", NULL);   /* a no-op transaction of the writer's */
+    hpplite_node_flush_batch(w);
+    sqlite3_int64 before = scalar(w->db, "SELECT foreign_writes FROM hpplite_status");
+    if (before != 0) FAILF("foreign_writes %lld after the writer's own traffic, want 0", (long long)before);
+
+    sqlite3 *plain;
+    if (sqlite3_open(DIR "/foreign.db", &plain) != SQLITE_OK) FAIL("plain open");
+    if (sqlite3_exec(plain, "INSERT INTO t VALUES(99)", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(plain); FAIL("plain write"); }
+    sqlite3_close(plain);
+    hpplite_node_flush_batch(w);                       /* the next bookkeeping look sees the file changed */
+    sqlite3_int64 after = scalar(w->db, "SELECT foreign_writes FROM hpplite_status");
+    hpplite_node_exec(w, "INSERT INTO t VALUES(3)", NULL);
+    hpplite_node_flush_batch(w);
+    sqlite3_int64 later = scalar(w->db, "SELECT foreign_writes FROM hpplite_status");
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    if (after != 1) FAILF("foreign_writes %lld after a write past the log, want 1", (long long)after);
+    if (later != 1) FAILF("foreign_writes %lld after the writer's next own write, want still 1", (long long)later);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -766,6 +803,7 @@ int main(void) {
     test_deferred_finalize_not_reposted();
     test_temp_triggers();
     test_connection_pragmas();
+    test_foreign_writes_detected();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
