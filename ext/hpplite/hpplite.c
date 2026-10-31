@@ -951,7 +951,7 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
     case SQLITE_ATTACH:
       pCtx->nNondeterministic++;
       if (pCtx->bDeterminismWarn) return SQLITE_OK;
-      pCtx->zDenyWhy = "ATTACH: writes to another file are not captured (unsupported in v0.1)";
+      pCtx->zDenyWhy = "ATTACH: writes to another file are not captured";
       pCtx->nAuthDenied++;
       return SQLITE_DENY;
     case SQLITE_PRAGMA:
@@ -1495,11 +1495,19 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     pCtx->pRowsTextStmt = pS;
     pCtx->bRowsCapOff = 1;
   }
-  /* Statements replay cannot reproduce are unsupported in v0.1 (row-level
-  ** capture, #19, lifts this): connection state that changes what a later
-  ** statement does, and non-deterministic values. Refused by default so the
+  /* Statements replay cannot reproduce are refused when logged as text
+  ** (every write under capture=text; with row capture a schema change, a
+  ** write reaching a virtual table, or a table another connection just
+  ** created, #19): connection state that changes what a later statement
+  ** does, and non-deterministic values. Refused by default so the
   ** application learns at the write, not from a root mismatch 100 batches
-  ** later; determinism=warn keeps the old warn-and-count behaviour. */
+  ** later; determinism=warn keeps the old warn-and-count behaviour. The
+  ** refusal says why this statement is text, so the rule is not taken for
+  ** row capture's (#85). */
+  const char *zAsText = pCtx->bRows
+    ? " - this statement is logged as text (a schema change, a write reaching a virtual table, or a table another"
+      " connection just created) and replays as written"
+    : "";
   {
     char *lower = lowercaseDup(zSql);
     const char *zWhy = NULL;
@@ -1515,8 +1523,8 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     if (zWhy) {
       pCtx->nNondeterministic++;
       if (!pCtx->bDeterminismWarn) {
-        char why[200];
-        snprintf(why, sizeof(why), "%s; unsupported in v0.1, bind the value instead", zWhy);
+        char why[400];
+        snprintf(why, sizeof(why), "%s%s; bind the value instead", zWhy, zAsText);
         refuseStatement(pCtx, pS, why, zSql);
         return 0;
       }
@@ -1550,12 +1558,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     }
     if (zWhy) {
       int bAppFn = strstr(zWhy, "defined by the application") != NULL;
-      char why[240];
+      char why[400];
       pCtx->nNondeterministic++;
       /* determinism=warn lets non-deterministic values through (counted);
       ** a function the replica does not have never replays at all */
       if (!pCtx->bDeterminismWarn || bAppFn) {
-        snprintf(why, sizeof(why), "%s; unsupported in v0.1, compute the value in the application and bind it", zWhy);
+        snprintf(why, sizeof(why), "%s%s; compute the value in the application and bind it", zWhy, zAsText);
         refuseStatement(pCtx, pS, why, zSql);
         return 0;
       }

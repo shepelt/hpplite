@@ -678,6 +678,8 @@ static void test_refused_stale_statement(void) {
     exec(a.db, "CREATE TABLE z(x)");                                  /* b's statement is stale now */
     int rc = sqlite3_step(st);                                        /* text-logged (reaches ft), random(): refused */
     sqlite3_finalize(st);
+    /* the refusal says why this write was text, not that a version lacks something (#85) */
+    int saysText = strstr(b.ctx->zLastRefusal, "logged as text") != NULL, saysV01 = strstr(b.ctx->zLastRefusal, "v0.1") != NULL;
     sqlite3_int64 rows = scalar(b.db, "SELECT count(*) FROM c");
     int again = exec(b.db, "INSERT INTO c(v) VALUES('fine')");        /* the connection goes on */
     close_writer(&b);
@@ -685,6 +687,7 @@ static void test_refused_stale_statement(void) {
     if (rc == SQLITE_DONE) FAIL("the refused statement's rerun ran (SQLITE_DONE)");
     if (rows != 0) FAILF("%lld rows in c, want 0: the refused write happened", (long long)rows);
     if (!again) FAIL("the next statement on the connection failed");
+    if (!saysText || saysV01) FAIL("the refusal does not say the statement is logged as text, or blames v0.1");
     PASS();
 }
 
