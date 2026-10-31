@@ -484,6 +484,12 @@ static void test_trigger_guard(void) {
     snprintf(sql, sizeof(sql), "DROP TRIGGER temp.\"%s\"", name);
     int dropRc = sqlite3_exec(w->db, sql, NULL, NULL, NULL);
     int createRc = sqlite3_exec(w->db, "CREATE TEMP TRIGGER hpplite_cap_x AFTER INSERT ON main.t BEGIN SELECT 1; END", NULL, NULL, NULL);
+    /* a DROP TABLE prepared and never run must not open a window for a
+    ** DROP TRIGGER prepared after it (#71) */
+    sqlite3_stmt *unrun = NULL;
+    if (sqlite3_prepare_v2(w->db, "DROP TABLE t", -1, &unrun, NULL) != SQLITE_OK) FAIL("prepare DROP TABLE");
+    int windowRc = sqlite3_exec(w->db, sql, NULL, NULL, NULL);
+    sqlite3_finalize(unrun);
     hpplite_node_exec(w, "INSERT INTO t VALUES(random())", NULL);
     int dropTableRc = sqlite3_exec(w->db, "DROP TABLE t", NULL, NULL, NULL);
     hpplite_node_exec(w, "CREATE TABLE t(y); INSERT INTO t VALUES(randomblob(4))", NULL);
@@ -491,6 +497,7 @@ static void test_trigger_guard(void) {
     const char *why = replica_matches(w, l1, "guard_r.db");
     hpplite_l1_disconnect(l1);
     if (dropRc == SQLITE_OK) FAIL("DROP TRIGGER of a capture trigger accepted");
+    if (windowRc == SQLITE_OK) FAIL("DROP TRIGGER of a capture trigger accepted after an unrun DROP TABLE was prepared");
     if (createRc == SQLITE_OK) FAIL("CREATE TRIGGER with the capture prefix accepted");
     if (dropTableRc != SQLITE_OK) FAIL("DROP TABLE refused");
     if (recs != 2) FAILF("%lld records, want 2 (before and after the drop)", (long long)recs);

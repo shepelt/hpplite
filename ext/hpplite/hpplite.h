@@ -112,7 +112,8 @@ struct HppliteCtx {
   char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
   sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */
   int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */
-  char zDropTable[128];       /* The table the statement being prepared drops (its triggers go with it) */
+  char zDropTable[256];       /* The table the statement being prepared drops (its triggers go with it) */
+  int nDropAllowed;           /* ...how many of its capture triggers that one prepare may still drop (#71) */
   char *zDbName;              /* This database's name among its wallet's rollups (#61), or NULL */
   int bExpandTruncates;       /* sqlite3_expanded_sql() cuts bound values (better-sqlite3): row
                               ** capture only, statements logged as text may bind nothing (#62) */

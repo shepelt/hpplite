@@ -905,11 +905,19 @@ static int isCaptureTrigger(const char *zName) {
 static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, const char *z2) {
   if (op == SQLITE_DROP_TABLE || op == SQLITE_DROP_TEMP_TABLE) {
     snprintf(pCtx->zDropTable, sizeof(pCtx->zDropTable), "%s", z1 ? z1 : "");
+    pCtx->nDropAllowed = 3;
+  }
+  if ((op == SQLITE_DROP_TRIGGER || op == SQLITE_DROP_TEMP_TRIGGER) && isCaptureTrigger(z1)
+      && z2 && pCtx->zDropTable[0] && pCtx->nDropAllowed > 0 && sqlite3_stricmp(z2, pCtx->zDropTable) == 0) {
+    /* a table's drop takes its triggers, ours too (rebuilt after): the three
+    ** of that table, in the prepare of that DROP TABLE - a DROP TRIGGER
+    ** prepared after it, the DROP TABLE never run, finds nothing left to
+    ** allow (#71) */
+    if (--pCtx->nDropAllowed == 0) pCtx->zDropTable[0] = 0;
+    return SQLITE_OK;
   }
   if ((op == SQLITE_CREATE_TRIGGER || op == SQLITE_CREATE_TEMP_TRIGGER
-       || ((op == SQLITE_DROP_TRIGGER || op == SQLITE_DROP_TEMP_TRIGGER)
-           /* a table's drop takes its triggers, ours too: rebuilt after */
-           && !(z2 && pCtx->zDropTable[0] && sqlite3_stricmp(z2, pCtx->zDropTable) == 0)))
+       || op == SQLITE_DROP_TRIGGER || op == SQLITE_DROP_TEMP_TRIGGER)
       && isCaptureTrigger(z1)) {
     pCtx->zDenyWhy = "the hpplite_cap_ triggers record this connection's writes; only HPPLite changes them";
     pCtx->nAuthDenied++;
