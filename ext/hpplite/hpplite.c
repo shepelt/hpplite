@@ -245,6 +245,25 @@ static void columnHash(sqlite3_stmt *pStmt, int i, unsigned char *pOut) {
 /*
 ** Load the _hpplite_meta row and the transaction counter into the context.
 */
+static int loadMeta(HppliteCtx *pCtx);
+/*
+** A follower's copy of the meta row is from its open; the sequencer moves
+** the file. Before reporting (hpplite_status, the height API) a follower
+** looks at the file's height and reloads when it moved (#100). One row.
+*/
+void hpplite_refresh_meta(HppliteCtx *pCtx) {
+  sqlite3_stmt *pStmt;
+  int saved;
+  if (!pCtx || !pCtx->bkDb) return;
+  saved = bkEnter(pCtx);
+  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT next_height FROM _hpplite_meta WHERE id=1", -1, &pStmt, NULL) == SQLITE_OK) {
+    int moved = sqlite3_step(pStmt) == SQLITE_ROW && (uint64_t)sqlite3_column_int64(pStmt, 0) != pCtx->blockHeight;
+    sqlite3_finalize(pStmt);
+    if (moved) { bkLeave(pCtx, saved); loadMeta(pCtx); return; }
+  }
+  bkLeave(pCtx, saved);
+}
+
 static int loadMeta(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt;
   int rc;
@@ -3495,6 +3514,7 @@ static int statusFilter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxSt
     {   /* application thread: a cheap moment to check our hooks are still ours */
         HppliteNode *n = findNode(((StatusVtab *)pCur->pVtab)->db);
         if (n && n->ctx) hpplite_rearm_hooks(n->ctx);
+        if (n && n->ctx && n->follower) hpplite_refresh_meta(n->ctx);   /* the sequencer moved the file (#100) */
     }
     (void)idxNum; (void)idxStr; (void)argc; (void)argv;
     ((StatusCursor *)pCur)->eof = 0;

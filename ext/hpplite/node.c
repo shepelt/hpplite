@@ -1753,6 +1753,7 @@ char *hpplite_node_submit_checkpoint(HppliteNode *node) {
 */
 uint64_t hpplite_node_get_height(HppliteNode *node) {
     if (!node || !node->ctx) return 0;
+    if (node->follower) hpplite_refresh_meta(node->ctx);   /* the sequencer moved the file (#100) */
     return hpplite_get_block_height(node->ctx);
 }
 

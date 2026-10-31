@@ -460,6 +460,41 @@ static void test_lease_on_close(void) {
 ** first run's log row rolled back with it. The rerun must be logged: it was
 ** taken for a trigger's sub-program (same statement, same step count) and the
 ** write never reached the log. */
+static sqlite3_int64 status_int(sqlite3 *db, const char *col) {
+    char sql[96]; sqlite3_stmt *st; sqlite3_int64 v = -1;
+    snprintf(sql, sizeof sql, "SELECT %s FROM hpplite_status", col);
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+/* A follower's hpplite_status is what the application sees (php-fpm workers
+** are all followers of hpplite-sequencer): it must say what the file says,
+** not what the follower read at open (#100, found by the fault harness) */
+static void test_follower_status_follows_the_file(void) {
+    TEST("a follower's hpplite_status follows the file, not its copy at open");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/fstat.db", l1);
+    if (!a) FAIL("open a");
+    HppliteNode *b = open_node(DIR "/fstat.db", l1);
+    if (!b || !b->follower) FAIL("b should be a follower");
+    hpplite_node_exec(a, "CREATE TABLE t(x)", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("batch 1");
+    hpplite_node_exec(b, "INSERT INTO t VALUES(1)", NULL);     /* the follower's own write, posted by a */
+    if (hpplite_node_flush_batch(a) != 2) FAIL("batch 2");
+    sqlite3_int64 hb = status_int(b->db, "height"), ha = status_int(a->db, "height");
+    sqlite3_int64 pb = status_int(b->db, "pending");
+    uint64_t apiB = hpplite_node_get_height(b);
+    hpplite_node_destroy(b);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    if (ha != 3) FAILF("the sequencer says height %lld, want 3", (long long)ha);
+    if (hb != 3 || apiB != 3) FAILF("the follower says height %lld (API %llu) after the sequencer posted two batches; the file says 3", (long long)hb, (unsigned long long)apiB);
+    if (pb != 0) FAILF("the follower says %lld pending, want 0", (long long)pb);
+    PASS();
+}
+
 static void test_rerun_after_foreign_schema_change(void) {
     TEST("a statement SQLite reruns after another connection's schema change is still captured");
     reset_dir();
@@ -533,6 +568,7 @@ int main(int argc, char **argv) {
     test_lease_on_close();
     test_rerun_after_foreign_schema_change();
     test_rerun_in_transaction();
+    test_follower_status_follows_the_file();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
