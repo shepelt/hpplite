@@ -543,6 +543,68 @@ static void test_text_history_then_rows(void) {
     PASS();
 }
 
+/* 13. ALTER TABLE DROP COLUMN: SQLite checks every trigger on the table and
+** ours name every column - the ALTER failed (Django's migrations). They are
+** dropped first, in a transaction of HPPLite's in autocommit, and rebuilt */
+static void test_drop_column(void) {
+    TEST("ALTER TABLE DROP COLUMN in autocommit and in a transaction, writes before and after: replica equal");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/dropcol.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = {
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT, legacy TEXT, n INTEGER)",
+        "INSERT INTO p(name, legacy, n) VALUES('a', 'x', 1), ('b', 'y', 2)",
+        "ALTER TABLE p DROP COLUMN legacy",
+        "INSERT INTO p(name, n) VALUES('c', 3)",
+        "UPDATE p SET n = n * 10 WHERE id = 1",
+        "BEGIN",
+        "INSERT INTO p(name, n) VALUES('d', 4)",
+        "ALTER TABLE \"p\" DROP COLUMN \"name\"",
+        "UPDATE p SET n = -n WHERE id = 2",
+        "COMMIT",
+        "DELETE FROM p WHERE id = 3",
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    if (scalar(w->db, "SELECT count(*) FROM pragma_table_info('p')") != 2) FAIL("writer premise: two columns left");
+    if (scalar(w->db, "SELECT count(*) FROM temp.sqlite_schema WHERE type = 'trigger' AND tbl_name = 'p'") != 3)
+        FAIL("the table's capture triggers were not rebuilt");
+    const char *why = replica_matches(w, l1, "dropcol_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 14. Alembic's table rebuild, foreign keys on: DROP TABLE of a table that
+** another one references with ON DELETE CASCADE deletes there too (the
+** rebuilt copy of a self-referencing table). The DROP is text, and its
+** replay cascades the same way: its triggers must record nothing */
+static void test_drop_table_cascade(void) {
+    TEST("DROP TABLE cascading through foreign keys (Alembic batch rebuild, FKs on): replica equal");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_node(DIR "/alembic.db", l1);
+    if (!w) FAIL("open");
+    const char *sql[] = {
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE comments(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, body TEXT)",
+        "INSERT INTO comments VALUES(1, NULL, 'root'), (2, 1, 'reply'), (3, 2, 'reply to reply')",
+        "BEGIN",
+        "CREATE TABLE _alembic_tmp_comments(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE, "
+        "body VARCHAR(500), edited INTEGER NOT NULL DEFAULT 0)",
+        "INSERT INTO _alembic_tmp_comments(id, parent_id, body) SELECT id, parent_id, body FROM comments",
+        "DROP TABLE comments",
+        "ALTER TABLE _alembic_tmp_comments RENAME TO comments",
+        "COMMIT",
+        "INSERT INTO comments(parent_id, body) VALUES(NULL, 'after')",
+        NULL };
+    if (run(w, sql) != 0) FAIL("writer SQL");
+    const char *why = replica_matches(w, l1, "alembic_r.db");
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
     srand(1);
@@ -558,6 +620,8 @@ int main(void) {
     test_vacuum();
     test_trigger_guard();
     test_text_history_then_rows();
+    test_drop_column();
+    test_drop_table_cascade();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

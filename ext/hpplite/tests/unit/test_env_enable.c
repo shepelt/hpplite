@@ -94,11 +94,11 @@ static void test_uri_still_wins(void) {
 }
 
 static void test_truncating_sqlite_refused(void) {
-    TEST("a SQLite that truncates bound values in expanded SQL (better-sqlite3) is refused at open");
+    TEST("a SQLite that truncates bound values in expanded SQL (better-sqlite3): statement capture is refused at open");
     reset_dir();
     setenv("HPPLITE_TEST_TRUNCATING_EXPAND", "1", 1);      /* as SQLITE_TRACE_SIZE_LIMIT=32 builds do */
     sqlite3 *db = NULL;
-    int rc = sqlite3_open_v2("file:" DIR "/trunc.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &db,
+    int rc = sqlite3_open_v2("file:" DIR "/trunc.db?hpplite=on&capture=text&privkey=" KEY "&datadir=" DIR, &db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     const char *msg = db ? sqlite3_errmsg(db) : "";
     int named = strstr(msg, "SQLITE_TRACE_SIZE_LIMIT") != NULL;
@@ -109,12 +109,55 @@ static void test_truncating_sqlite_refused(void) {
     PASS();
 }
 
+/* #62: row capture does not read bound values back from expanded SQL, so
+** such a SQLite serves it; what it still logs as text may bind nothing */
+static void test_truncating_sqlite_rows(void) {
+    TEST("the same SQLite with row capture: opens, records long bound values whole, refuses a bound text-logged write");
+    reset_dir();
+    setenv("HPPLITE_TEST_TRUNCATING_EXPAND", "1", 1);
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char longv[301];
+    memset(longv, 'x', 300); longv[300] = 0;
+    int rc = sqlite3_open_v2("file:" DIR "/trunc_rows.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    int created = 0, bound = 0, ftsRefused = 0, ftsLiteral = 0;
+    long long recBytes = -1;
+    if (rc == SQLITE_OK) {
+        created = sqlite3_exec(db, "CREATE TABLE t(v); CREATE VIRTUAL TABLE f USING fts5(body)", NULL, NULL, NULL) == SQLITE_OK;
+        if (sqlite3_prepare_v2(db, "INSERT INTO t VALUES(?1)", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, longv, -1, SQLITE_STATIC);
+            bound = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+        if (sqlite3_prepare_v2(db, "INSERT INTO f VALUES(?1)", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, longv, -1, SQLITE_STATIC);
+            ftsRefused = sqlite3_step(st) == SQLITE_INTERRUPT;
+            sqlite3_finalize(st);
+        }
+        ftsLiteral = sqlite3_exec(db, "INSERT INTO f VALUES('values in the text')", NULL, NULL, NULL) == SQLITE_OK;
+        if (sqlite3_prepare_v2(db, "SELECT max(length(rec)) FROM _hpplite_pending WHERE tbl = 't'", -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) recBytes = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+    }
+    sqlite3_close(db);
+    unsetenv("HPPLITE_TEST_TRUNCATING_EXPAND");
+    if (rc != SQLITE_OK) FAIL("row capture refused at open");
+    if (!created || !bound) FAIL("schema or the bound insert failed");
+    if (recBytes < 300) { printf("(%lld) ", recBytes); FAIL("the record does not carry the whole value"); }
+    if (!ftsRefused) FAIL("a bound write logged as text ran: it would replay cut");
+    if (!ftsLiteral) FAIL("a text-logged write without bound values must run");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite enabled from the environment (#55) ===\n");
     test_plain_path_enabled();
     test_others_untouched();
     test_uri_still_wins();
     test_truncating_sqlite_refused();
+    test_truncating_sqlite_rows();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

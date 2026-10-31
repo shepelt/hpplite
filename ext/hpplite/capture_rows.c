@@ -640,6 +640,42 @@ static int writeTarget(const char *z, char *zOut, int nOut) {
   return zOut[0] != 0;
 }
 
+/* ALTER TABLE [schema.]name DROP [COLUMN] ...: the table, else 0. SQLite
+** checks every trigger on the table after it drops a column, ours too: one
+** that names the column makes the ALTER fail ("error in trigger ... after
+** drop column"). RENAME and ADD need nothing: SQLite rewrites TEMP triggers. */
+int hpplite_rows_drop_column_target(const char *z, char *zOut, int nOut) {
+  z = skipSpace(z);
+  if (!isWord(z, "ALTER")) return 0;
+  z = skipSpace(z + 5);
+  if (!isWord(z, "TABLE")) return 0;
+  z = skipSpace(readName(skipSpace(z + 5), zOut, nOut));
+  if (*z == '.') z = skipSpace(readName(skipSpace(z + 1), zOut, nOut));
+  return zOut[0] && isWord(z, "DROP");
+}
+
+/* Drop the capture triggers of one table (they are built again after the
+** statement: the schema moved) */
+int hpplite_rows_drop_triggers_for(HppliteCtx *pCtx, const char *zTab) {
+  sqlite3_stmt *q = NULL;
+  char *zDrop = NULL;
+  int rc, savedInternal = pCtx->bInternal;
+  pCtx->bInternal = 1;
+  rc = sqlite3_prepare_v2(pCtx->db, "SELECT name FROM temp.sqlite_schema WHERE type = 'trigger'"
+                          " AND name LIKE 'hpplite\\_cap\\_%' ESCAPE '\\' AND tbl_name = ?1 COLLATE NOCASE", -1, &q, NULL);
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_text(q, 1, zTab, -1, SQLITE_STATIC);
+    while (sqlite3_step(q) == SQLITE_ROW)
+      zDrop = sqlite3_mprintf("%zDROP TRIGGER temp.\"%w\";", zDrop, (const char *)sqlite3_column_text(q, 0));
+  }
+  sqlite3_finalize(q);
+  if (rc == SQLITE_OK && zDrop) rc = sqlite3_exec(pCtx->db, zDrop, NULL, NULL, NULL);
+  sqlite3_free(zDrop);
+  pCtx->rowsBuiltFor = -1;
+  pCtx->bInternal = savedInternal;
+  return rc;
+}
+
 /* A write reaches a virtual table when the table it writes is one, or has
 ** triggers or foreign key actions that reach one. Text that does not say
 ** plainly what it writes is judged by every name it mentions. */

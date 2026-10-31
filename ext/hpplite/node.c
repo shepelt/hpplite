@@ -256,7 +256,8 @@ static int node_init_tracking(HppliteNode *node) {
         sqlite3_busy_timeout(node->db, 5000);
     }
 
-    rc = hpplite_init(node->db, &node->ctx);
+    /* a SQLite that cuts bound values in expanded SQL serves row capture (#62) */
+    rc = hpplite_init_ex(node->db, &node->ctx, !node->config.captureText);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
     if (node->config.dbName && node->config.dbName[0]) {

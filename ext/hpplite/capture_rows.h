@@ -31,6 +31,11 @@ int hpplite_rows_covered_for_write(struct HppliteCtx *pCtx);
 ** or view whose triggers reach one) */
 int hpplite_rows_text_only(struct HppliteCtx *pCtx, const char *zSql);
 
+/* ALTER TABLE x DROP COLUMN: x (else 0); and dropping one table's triggers
+** before it, which would make it fail (they are rebuilt after) */
+int hpplite_rows_drop_column_target(const char *zSql, char *zOut, int nOut);
+int hpplite_rows_drop_triggers_for(struct HppliteCtx *pCtx, const char *zTab);
+
 /* After a statement, at a point where DDL is allowed: rebuild the triggers
 ** if the schema moved */
 void hpplite_rows_after_statement(struct HppliteCtx *pCtx);

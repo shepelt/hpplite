@@ -3,20 +3,20 @@
 # fresh anvil chain (tests/l1/anvil_test.sh), then a replica rebuilt from
 # the chain must match the writer row for row and root for root.
 #   tests/orm/run_orm.sh <path/to/hpplite.(dylib|so)> [suite ...]
-# Suites: sqlalchemy django drizzle knex env_open. Needs network for the first pip/npm install
+# Suites: sqlalchemy django drizzle knex env_open better_sqlite3. Needs network for the first pip/npm install
 # (cached in $HPPLITE_ORM_CACHE, default $TMPDIR/hpplite-orm); not in CI.
 set -eu
 ext=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); shift
 here=$(cd "$(dirname "$0")" && pwd)
 cache=${HPPLITE_ORM_CACHE:-${TMPDIR:-/tmp}/hpplite-orm}
-suites=${*:-sqlalchemy django drizzle knex env_open}
+suites=${*:-sqlalchemy django drizzle knex env_open better_sqlite3}
 mkdir -p "$cache"
 case " $suites " in *" "*)    # the Node suites use the venv for the replica check
     [ -x "$cache/venv/bin/python" ] || python3 -m venv "$cache/venv"
     "$cache/venv/bin/python" -c 'import sqlalchemy, alembic, django' 2>/dev/null \
         || "$cache/venv/bin/pip" -q install sqlalchemy alembic django ;;
 esac
-case " $suites " in *" drizzle "*|*" knex "*|*" env_open "*)
+case " $suites " in *" drizzle "*|*" knex "*|*" env_open "*|*" better_sqlite3 "*)
     [ -d "$cache/node/node_modules/better-sqlite3" ] || (mkdir -p "$cache/node" && cd "$cache/node" \
         && { [ -f package.json ] || npm init -y >/dev/null; } && npm install -s drizzle-orm knex sqlite3 better-sqlite3) ;;
 esac

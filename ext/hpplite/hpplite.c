@@ -1222,21 +1222,35 @@ static void noteNoClock(HppliteCtx *pCtx, sqlite3_int64 id, sqlite3_int64 now) {
 ** itself; our row stays; the rerun runs in the same transaction, which
 ** HPPLite commits at its end.
 */
+/* Track pS as a statement SQLite may rerun stale: in autocommit inside a
+** transaction of HPPLite's (the failed first run would take our row with
+** it), in the application's transaction as it is (only the failed run's own
+** statement rolls back there - but its PROFILE must not unlog the row) */
+static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  if (pCtx->pRerunStmt) return 0;
+  if (sqlite3_get_autocommit(pCtx->db)) {
+    if (internalExec(pCtx, pCtx->db, "BEGIN") != SQLITE_OK) return 0;
+    pCtx->rerunOwnTxn = 1;
+  } else {
+    pCtx->rerunOwnTxn = 0;
+  }
+  pCtx->pRerunStmt = pS;
+  pCtx->rerunStage = 1;
+  return 1;
+}
 static void rerunBegin(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   int v;
-  if (pCtx->pRerunStmt || !sqlite3_get_autocommit(pCtx->db)) return;
+  if (pCtx->pRerunStmt) return;
   v = schemaVersion(pCtx);
-  if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema
-      && internalExec(pCtx, pCtx->db, "BEGIN") == SQLITE_OK) {
-    pCtx->pRerunStmt = pS;
-    pCtx->rerunStage = 1;
-  }
+  if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema) rerunTrack(pCtx, pS);
   pCtx->seenSchema = v;
 }
 static void rerunCommit(HppliteCtx *pCtx) {
+  int own = pCtx->rerunOwnTxn;
   pCtx->pRerunStmt = NULL;
   pCtx->rerunStage = 0;
-  if (!sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
+  pCtx->rerunOwnTxn = 0;
+  if (own && !sqlite3_get_autocommit(pCtx->db) && internalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
     /* what the commit hook does for an application commit (ours it skips) */
     pCtx->curTxn = 0;
     pCtx->bRootDirty = 1;
@@ -1384,7 +1398,13 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
       /* a safe point for DDL: the statement is over (not a reset mid-run).
       ** Only after a write: a read cannot move the schema, and another
       ** connection's change is caught at the next write (text, then this) */
-      if (!sqlite3_stmt_readonly(pS) && !sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0) hpplite_rows_after_statement(pCtx);
+      /* ...and not a first run that failed stale (SQLITE_SCHEMA): SQLite
+      ** reruns it now, and triggers rebuilt in between would be the ones it
+      ** was rid of (a DROP COLUMN, below). A schema change that ran expires
+      ** itself too: that one is the reason to rebuild */
+      if (!sqlite3_stmt_readonly(pS) && !sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0
+          && sqlite3_errcode(pCtx->db) != SQLITE_SCHEMA)
+        hpplite_rows_after_statement(pCtx);
     }
     /* Its row carries the time pinned for it (#56). One clock read is
     ** SQLite's own: with PROFILE tracing on it times every statement, the
@@ -1398,6 +1418,19 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   /* SQLite's own verdict: a statement that cannot write is never logged, so
   ** nothing in it needs to replay (WITH ... SELECT random() included) */
   if (pS && sqlite3_stmt_readonly(pS)) return 0;
+  /* Row capture: a column dropped from a table our triggers name it in */
+  if (pCtx->bRows) {
+    char zTab[256];
+    if (hpplite_rows_drop_column_target(zSql, zTab, (int)sizeof(zTab))) {
+      /* Dropping triggers expires this statement: SQLite reruns it inside
+      ** this step (as for any stale statement). In autocommit the failed
+      ** first run would roll the drop back with it, so the statement runs
+      ** in a transaction of HPPLite's, committed at its end (the rerun
+      ** machinery of a07891ef34) */
+      rerunTrack(pCtx, pS);
+      hpplite_rows_drop_triggers_for(pCtx, zTab);
+    }
+  }
   {
     const char *z = zSql;
     while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
@@ -1414,8 +1447,12 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
   ** logged as text, the v1 way, its triggers silent; rebuilt after it. So
   ** is a write that may reach a virtual table (FTS5, R*Tree): what those
   ** store cannot carry triggers. */
-  if (pCtx->bRows && isRowsDml(zSql)) {
-    if (hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
+  if (pCtx->bRows) {
+    if (isRowsDml(zSql) && hpplite_rows_covered_for_write(pCtx) && !hpplite_rows_text_only(pCtx, zSql)) return 0;
+    /* Everything else is text, and a statement's text replays all it does:
+    ** its triggers record nothing - a DROP TABLE's implicit delete cascades
+    ** through foreign keys too (Alembic rebuilding a self-referencing table
+    ** with them on), and replaying the DROP cascades the same way */
     pCtx->pRowsTextStmt = pS;
     pCtx->bRowsCapOff = 1;
   }
@@ -1481,6 +1518,16 @@ static int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX
     }
   }
 
+  /* A SQLite that cuts bound values in the expansion (below) is used with
+  ** row capture only (#62): the few statements still logged as text are
+  ** refused when they bind anything, which would replay cut */
+  if (pCtx->bExpandTruncates && pS && sqlite3_bind_parameter_count(pS) > 0) {
+    refuseStatement(pCtx, "this SQLite truncates bound values in sqlite3_expanded_sql() (better-sqlite3's "
+                    "bundled SQLite), and this statement is logged as text (a schema change, a write that "
+                    "reaches a virtual table, or the first write to a table another connection just "
+                    "created): put the values in its text, or run it on a stock SQLite", zSql);
+    return 0;
+  }
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
   if (!zExpanded) {
@@ -1649,16 +1696,19 @@ static int expandedSqlIsFaithful(sqlite3 *db) {
   return ok;
 }
 
-int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
+int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) { return hpplite_init_ex(db, ppCtx, 0); }
+
+int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   HppliteCtx *pCtx;
-  int rc;
+  int rc, bTruncates;
 
   gInitError = NULL;
-  if (!expandedSqlIsFaithful(db)) {
+  bTruncates = !expandedSqlIsFaithful(db);
+  if (bTruncates && !bRowsCapture) {
     gInitError = "this SQLite truncates bound values in sqlite3_expanded_sql() (built with "
-                 "SQLITE_TRACE_SIZE_LIMIT, as better-sqlite3's bundled SQLite is): writes would replay "
-                 "with cut strings. Use a driver on a stock SQLite (Node: node:sqlite or the sqlite3 "
-                 "package; Python: sqlite3)";
+                 "SQLITE_TRACE_SIZE_LIMIT, as better-sqlite3's bundled SQLite is): statement capture "
+                 "would replay cut strings. Use row capture (the default; not capture=text), or a "
+                 "driver on a stock SQLite (Node: node:sqlite or the sqlite3 package; Python: sqlite3)";
     fprintf(stderr, "hpplite: %s\n", gInitError);
     return SQLITE_ERROR;
   }
@@ -1666,6 +1716,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
   if (!pCtx) return SQLITE_NOMEM;
   memset(pCtx, 0, sizeof(HppliteCtx));
+  pCtx->bExpandTruncates = bTruncates;
   pCtx->seenSchema = -1;
 
   pCtx->db = db;

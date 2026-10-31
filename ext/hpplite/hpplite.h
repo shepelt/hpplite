@@ -81,6 +81,8 @@ struct HppliteCtx {
   sqlite3_stmt *pRerunStmt;      /* a statement prepared on a stale schema, logged in a transaction
                                  ** HPPLite opened for it: SQLite reruns it without a STMT trace */
   int rerunStage;                /* 1 logged, 2 its first run failed (SQLITE_SCHEMA) and the rerun runs */
+  int rerunOwnTxn;               /* ...in a transaction HPPLite opened (autocommit), committed at its
+                                 ** end; else the application's, left alone */
   volatile int bAppTxnOpen;   /* The application connection is inside a transaction (app thread
                               ** writes, the timer thread reads: no bookkeeping commit then) */
   struct HppliteNoClock { sqlite3_int64 id, now; } *aNoClock; /* Log rows whose statement did not read
@@ -112,6 +114,8 @@ struct HppliteCtx {
   int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */
   char zDropTable[128];       /* The table the statement being prepared drops (its triggers go with it) */
   char *zDbName;              /* This database's name among its wallet's rollups (#61), or NULL */
+  int bExpandTruncates;       /* sqlite3_expanded_sql() cuts bound values (better-sqlite3): row
+                              ** capture only, statements logged as text may bind nothing (#62) */
   char *zRowsTextOnly;        /* Names a write must not mention to be captured as rows: virtual
                               ** tables and what reaches them through triggers ('\0'-separated,
                               ** ends with an empty name) */
@@ -164,6 +168,9 @@ void hpplite_internal_open_end(void);
 int hpplite_internal_open_active(void);
 
 int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
+/* ...for a connection that will capture rows: a SQLite whose sqlite3_expanded_sql()
+** cuts bound values (better-sqlite3) is accepted, its text statements may bind nothing (#62) */
+int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture);
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */
 #define HPPLITE_POSTED_KEEP 32
 /* A statement cut into pieces (#59): what the flag adds to an entry, what an
