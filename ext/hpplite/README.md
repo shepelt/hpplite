@@ -412,7 +412,8 @@ holds the log and the roots, the key holder is the one who checks them.
 
 ## Versions
 
-Scope is tied to versions. v0.1.1 is tagged; the current branch is **v0.2 in progress**.
+Scope is tied to versions. v0.1.1 is tagged and is the last of the v0.1 line;
+the current branch is **v0.2 in progress**.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
@@ -426,6 +427,17 @@ computation (~9 ms/MB), computed once per checkpoint interval (default 100 batch
 see [doc/architecture.md](doc/architecture.md#state-root).
 Beyond that, shard per tenant (the factory can create several rollups per wallet)
 until v0.3.
+
+**v0.1.x is end-of-life.** There will be no v0.1.2: everything v0.1 did, v0.2
+does with `capture=text`, and the bugs found in code the two share (`PRAGMA
+count_changes` refusing every write, the rerun of a refused statement, a
+rerun transaction left open after a `CREATE VIRTUAL TABLE`, configuration
+errors ignored at open, among others - #96 lists them) are fixed only on
+v0.2. Upgrading: a v0.2 replica reads v0.1 history, so upgrade the
+replicas first, then the writer. A v0.2 writer logs records by default,
+which v0.1 replicas cannot read; give it `capture=text` until every replica
+is on v0.2. Do not run a v0.1 binary on a file that has records pending
+(#81, below).
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
 
