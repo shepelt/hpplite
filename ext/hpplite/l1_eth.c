@@ -708,9 +708,17 @@ int hpplite_l1_factory_create_rollup(
     tx_hash = eth_client_send_tx(eth, factory, calldata, sizeof(calldata), 15000000, 0);
     if (!tx_hash) { eth_client_destroy(eth); return 0; }
     keccak256((const uint8_t *)sig, strlen(sig), topic0);
-    for (i = 0; i < 240 && rc == 0; i++) {          /* up to a minute */
+    for (i = 0; i < 240 && (rc == 0 || rc == -2); i++) {   /* up to a minute; an RPC error is not an answer (#68) */
         rc = eth_client_receipt_topic(eth, tx_hash, topic0, 1, word);
-        if (rc == 0) usleep(250000);
+        if (rc != 1 && rc != -1) usleep(250000);
+    }
+    if (rc != 1) {
+        /* the transaction may still land: the wallet would then own a
+        ** rollup no database is bound to, and the next open creates another */
+        char *zHash = eth_hex_encode(tx_hash, 32);
+        fprintf(stderr, "hpplite: createRollup transaction %s %s; if it lands, this wallet gets a rollup no database"
+                " is bound to\n", zHash ? zHash : "?", rc == -1 ? "reverted or raised no RollupCreated event" : "not confirmed within a minute");
+        free(zHash);
     }
     free(tx_hash);
     eth_client_destroy(eth);

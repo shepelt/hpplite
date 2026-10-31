@@ -629,7 +629,7 @@ int eth_client_receipt_topic(EthClient *client, const uint8_t tx_hash[32],
     cJSON_AddItemToArray(params, cJSON_CreateString(hash_hex));
     free(hash_hex);
     response = rpc_call(client, "eth_getTransactionReceipt", params);
-    if (!response) { free(want); return -1; }
+    if (!response) { free(want); return -2; }         /* the RPC, not the transaction: ask again (#68) */
     result = cJSON_GetObjectItem(response, "result");
     if (!result || cJSON_IsNull(result)) { cJSON_Delete(response); free(want); return 0; }
     logs = cJSON_GetObjectItem(result, "logs");

@@ -68,7 +68,8 @@ uint8_t *eth_client_send_tx(EthClient *client,
 /* Get transaction receipt, returns 1 if mined, 0 if pending, -1 on error
    If mined, fills in status (1 = success, 0 = reverted) */
 /* Mined: the given topic of the first log whose topic 0 is topic0 -> out;
-** 1 found, 0 not mined yet, -1 error or no such log */
+** 1 found, 0 not mined yet, -1 mined without such a log (reverted), -2 the
+** RPC call failed (the transaction may still land: ask again) */
 int eth_client_receipt_topic(EthClient *client, const uint8_t tx_hash[32],
                              const uint8_t topic0[32], int index, uint8_t out[32]);
 
