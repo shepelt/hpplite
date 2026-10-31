@@ -417,14 +417,10 @@ static int loadTextOnly(HppliteCtx *pCtx, const char *zSeed) {
 ** one too wide for this SQLite's function argument limit (127 before 3.48,
 ** on distribution SQLites; a record passes every column as an argument, an
 ** update record two per column, #65). */
-static int rebuild(HppliteCtx *pCtx) {
+static int dropAllTriggers(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
-  char **azName = NULL, *zDrop = NULL, *zSkip = NULL;
-  int n = 0, cap = 0, nSkip = 0, i, rc, v, savedInternal = pCtx->bInternal;
-  int argLimit = sqlite3_limit(pCtx->db, SQLITE_LIMIT_FUNCTION_ARG, -1);
-  pCtx->bInternal = 1;
-  v = schemaVersionOf(pCtx);
-  rc = sqlite3_prepare_v2(pCtx->db,
+  char *zDrop = NULL;
+  int rc = sqlite3_prepare_v2(pCtx->db,
     "SELECT name FROM temp.sqlite_schema WHERE type = 'trigger' AND name LIKE 'hpplite_cap_%'", -1, &q, NULL);
   while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
     zDrop = sqlite3_mprintf("%zDROP TRIGGER temp.\"%w\";", zDrop, (const char *)sqlite3_column_text(q, 0));
@@ -432,6 +428,17 @@ static int rebuild(HppliteCtx *pCtx) {
   sqlite3_finalize(q);
   if (rc == SQLITE_OK && zDrop) rc = sqlite3_exec(pCtx->db, zDrop, NULL, NULL, NULL);
   sqlite3_free(zDrop);
+  return rc;
+}
+
+static int rebuild(HppliteCtx *pCtx) {
+  sqlite3_stmt *q = NULL;
+  char **azName = NULL, *zSkip = NULL;
+  int n = 0, cap = 0, nSkip = 0, i, rc, v, savedInternal = pCtx->bInternal;
+  int argLimit = sqlite3_limit(pCtx->db, SQLITE_LIMIT_FUNCTION_ARG, -1);
+  pCtx->bInternal = 1;
+  v = schemaVersionOf(pCtx);
+  rc = dropAllTriggers(pCtx);
   /* every ordinary table of main but SQLite's and ours. Not virtual tables,
   ** which cannot carry triggers, nor their shadow tables: a trigger there
   ** makes the module's own flush open a savepoint that flushes again,
@@ -576,6 +583,22 @@ int hpplite_rows_enable(HppliteCtx *pCtx) {
   pCtx->bRows = 1;
   hpplite_rows_seq_take(pCtx, db);
   return rebuild(pCtx);
+}
+
+/* The connection as it was before hpplite_rows_enable(): no triggers, no
+** functions - they hold pCtx, which hpplite_shutdown() frees while the
+** connection lives on (#66) */
+void hpplite_rows_disable(HppliteCtx *pCtx) {
+  static const char *aFn[] = { "hpplite_rec", "hpplite_upd", "hpplite_cap", "hpplite_grp", "hpplite_note", "hpplite_mode" };
+  static const int aArg[] = { -1, -1, 0, 0, 1, 0 };
+  int i, savedInternal = pCtx->bInternal;
+  if (!pCtx->bRows) return;
+  pCtx->bInternal = 1;
+  dropAllTriggers(pCtx);
+  for (i = 0; i < 6; i++) sqlite3_create_function(pCtx->db, aFn[i], aArg[i], SQLITE_UTF8, NULL, NULL, NULL, NULL);
+  pCtx->bRows = 0;
+  pCtx->rowsBuiltFor = -1;
+  pCtx->bInternal = savedInternal;
 }
 
 int hpplite_rows_covered(HppliteCtx *pCtx) {

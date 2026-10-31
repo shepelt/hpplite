@@ -1869,6 +1869,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     sqlite3_rollback_hook(pCtx->db, NULL, NULL);
     sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
     sqlite3_set_authorizer(pCtx->db, NULL, NULL);
+    hpplite_rows_disable(pCtx);           /* its triggers and functions hold pCtx (#66) */
     finalizeOwnStatements(pCtx);
   }
   freeFunctionChecks(pCtx);

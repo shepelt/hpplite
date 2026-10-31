@@ -562,6 +562,27 @@ static void test_sqlite_tables_are_text(void) {
     PASS();
 }
 
+/* hpplite_shutdown() on a connection that lives on: the triggers and
+** functions that held the context go with it (#66) */
+static void test_shutdown_leaves_connection_usable(void) {
+    TEST("after hpplite_shutdown() the connection writes on, with no capture trigger or function left");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/shut.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(x)");
+    exec(w.db, "INSERT INTO t VALUES(1)");
+    hpplite_shutdown(w.ctx);
+    if (!exec(w.db, "INSERT INTO t VALUES(2)")) FAIL("a write after shutdown failed");
+    sqlite3_int64 trig = scalar(w.db, "SELECT count(*) FROM temp.sqlite_schema WHERE name LIKE 'hpplite_cap_%'");
+    int fn = exec(w.db, "SELECT hpplite_cap()");
+    sqlite3_int64 rows = scalar(w.db, "SELECT count(*) FROM t");
+    sqlite3_close(w.db);
+    if (trig != 0) FAILF("%lld capture triggers left", (long long)trig);
+    if (fn) FAIL("hpplite_cap() still registered");
+    if (rows != 2) FAILF("%lld rows, want 2", (long long)rows);
+    PASS();
+}
+
 static void test_groups(void) {
     TEST("records of one transaction share its group, as v1 names them");
     reset_dir();
@@ -595,6 +616,7 @@ int main(void) {
     test_wide_table();
     test_rowid_named_columns();
     test_sqlite_tables_are_text();
+    test_shutdown_leaves_connection_usable();
     test_groups();
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

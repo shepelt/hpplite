@@ -20,6 +20,8 @@ struct HppliteCtx;
 
 /* Turn row capture on for the connection: functions, log columns, triggers */
 int hpplite_rows_enable(struct HppliteCtx *pCtx);
+/* Undo it on a connection that lives on after hpplite_shutdown() (#66) */
+void hpplite_rows_disable(struct HppliteCtx *pCtx);
 
 /* Do the triggers cover the database's current schema? (a statement on a
 ** table they do not cover is logged as text instead) */
