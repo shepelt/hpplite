@@ -111,7 +111,9 @@ static int sameValue(sqlite3_value *a, sqlite3_value *b) {
 /* hpplite_upd(nKey, old key..., new key..., old c1, new c1, ...): an update record */
 static void fnUpd(sqlite3_context *c, int n, sqlite3_value **v) {
   Rec r = {0};
-  int nKey = sqlite3_value_int(v[0]), i, nCol, keyChanged = 0;
+  int nKey, i, nCol, keyChanged = 0;
+  if (n < 1) { sqlite3_result_error(c, "hpplite_upd: arguments", -1); return; }   /* callable from any SQL (#70) */
+  nKey = sqlite3_value_int(v[0]);
   if (nKey < 0 || 1 + 2 * nKey > n || (n - 1 - 2 * nKey) % 2) { sqlite3_result_error(c, "hpplite_upd: arguments", -1); return; }
   nCol = (n - 1 - 2 * nKey) / 2;
   recVarint(&r, (sqlite3_uint64)nKey);

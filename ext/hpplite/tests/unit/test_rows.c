@@ -586,7 +586,7 @@ static void test_shutdown_leaves_connection_usable(void) {
 /* A record is bytes from the chain: malformed ones are refused, never
 ** read past (#69) */
 static void test_malformed_records(void) {
-    TEST("a malformed record is refused, not read past");
+    TEST("a malformed record is refused, not read past; the capture functions refuse bad calls");
     reset_dir();
     sqlite3 *db;
     if (sqlite3_open(DIR "/mal.db", &db) != SQLITE_OK) FAIL("open");
@@ -602,6 +602,14 @@ static void test_malformed_records(void) {
     sqlite3_free(err);
     if (rc == SQLITE_OK) FAIL("a record with a short value was applied");
     sqlite3_close(db);
+    /* the capture functions are callable from any SQL: no argument count is trusted (#70) */
+    W w;
+    if (!open_writer(DIR "/mal2.db", &w)) FAIL("open writer");
+    if (exec(w.db, "SELECT hpplite_upd()")) FAIL("hpplite_upd() with no arguments succeeded");
+    if (exec(w.db, "SELECT hpplite_upd(2, 1)")) FAIL("hpplite_upd() with too few arguments succeeded");
+    if (exec(w.db, "SELECT hpplite_upd(-1)")) FAIL("hpplite_upd() with a negative key count succeeded");
+    if (!exec(w.db, "SELECT hpplite_rec()")) FAIL("hpplite_rec() with no arguments failed (an empty record is one)");
+    close_writer(&w);
     PASS();
 }
 
