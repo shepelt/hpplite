@@ -19,7 +19,7 @@
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
 **   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
 **   HPPLITE_DETERMINISM       - strict (default: refuse SQL replay cannot reproduce) | warn
-**   HPPLITE_CAPTURE           - text (default: statements) | rows (what each write changed, #19)
+**   HPPLITE_CAPTURE           - rows (default: what each write changed, #19) | text (each write statement, v0.1)
 **   HPPLITE_ROLE              - sequencer|observer
 **   HPPLITE_NODE_ID           - Node identifier (status output only)
 */
@@ -118,7 +118,7 @@ typedef struct HppliteConfig {
     int encrypt;                     /* Seal batches before posting (default 1) */
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
-    int captureRows;                 /* 1: capture rows, not statements (#19) */
+    int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */
     size_t maxTxBytes;               /* Largest batch per transaction (0 = by chain id, else unknown) */
     uint64_t maxTxGas;               /* Gas cap per transaction (0 = by chain id, else unknown) */
 

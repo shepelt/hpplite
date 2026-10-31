@@ -275,13 +275,13 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME smoke_python_cli
                  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
         set_tests_properties(smoke_python_cli PROPERTIES SKIP_RETURN_CODE 77)
-        add_test(NAME smoke_python_cli_rows
+        add_test(NAME smoke_python_cli_text
                  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
-        set_tests_properties(smoke_python_cli_rows PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=rows)
-        set_tests_properties(smoke_python_cli smoke_python_cli_rows PROPERTIES RESOURCE_LOCK smoke)
+        set_tests_properties(smoke_python_cli_text PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=text)
+        set_tests_properties(smoke_python_cli smoke_python_cli_text PROPERTIES RESOURCE_LOCK smoke)
         if(CMAKE_C_FLAGS MATCHES "sanitize")
             # an instrumented module cannot be loaded into a stock python/sqlite3 process
-            set_tests_properties(smoke_python_cli smoke_python_cli_rows PROPERTIES DISABLED TRUE)
+            set_tests_properties(smoke_python_cli smoke_python_cli_text PROPERTIES DISABLED TRUE)
         endif()
     endif()
 
@@ -303,18 +303,18 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_rows_e2e COMMAND test_rows_e2e)
         add_test(NAME test_crash COMMAND crash_hpplite)
 
-        # Every suite above again with row capture on (#19): what it checks
-        # about statement capture skips, the rest must hold for records too
+        # Every suite above again with statement capture (capture=text, v0.1's;
+        # rows are the default, #19): the cases about statement text run there
         foreach(t test_checkpoint_flow test_durability test_keys test_abuse test_foreign_keys
                   test_big_txn test_clock test_reorg test_big_stmt test_concurrency)
-            add_test(NAME ${t}_rows COMMAND ${t})
+            add_test(NAME ${t}_text COMMAND ${t})
             # the same scratch directory: never at once (ctest -j)
-            set_tests_properties(${t} ${t}_rows PROPERTIES RESOURCE_LOCK ${t})
-            set_tests_properties(${t}_rows PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=rows)
+            set_tests_properties(${t} ${t}_text PROPERTIES RESOURCE_LOCK ${t})
+            set_tests_properties(${t}_text PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=text)
         endforeach()
-        add_test(NAME test_crash_rows COMMAND crash_hpplite)
-        set_tests_properties(test_crash test_crash_rows PROPERTIES RESOURCE_LOCK test_crash)
-        set_tests_properties(test_crash_rows PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=rows)
+        add_test(NAME test_crash_text COMMAND crash_hpplite)
+        set_tests_properties(test_crash test_crash_text PROPERTIES RESOURCE_LOCK test_crash)
+        set_tests_properties(test_crash_text PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=text)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address

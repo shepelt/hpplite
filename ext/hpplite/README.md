@@ -114,7 +114,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root (default 100). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
-| `capture` | No | `text` (default): log each write statement; `rows`: log what each write changed (#19, below). Also `HPPLITE_CAPTURE` |
+| `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
 
@@ -405,13 +405,13 @@ holds the log and the roots, the key holder is the one who checks them.
 
 ## Versions
 
-Scope is tied to versions. The current branch is **v0.1 in progress**.
+Scope is tied to versions. v0.1.1 is tagged; the current branch is **v0.2 in progress**.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
 | **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches, one writer process | per-tenant / single-tenant, up to ~100 MB | on-chain (contract storage) |
-| v0.2 | `hpplite verify` CLI, per-table divergence reporting, key roles and viewing keys (#17, #15), batch compression (#12) | same | same |
-| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, row-level capture (#19) | GB range | S3 + L1 commitments |
+| v0.2 | Row capture by default (#19), validated on suites and real applications (WordPress, Ghost, Rails 8), several writers per file, `hpplite verify` (#5) | same | same |
+| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, batch compression (#12), key roles and viewing keys (#17, #15) | GB range | S3 + L1 commitments |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
@@ -422,10 +422,14 @@ until v0.3.
 
 Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
 
-## Unsupported in v0.1
+## What is refused
 
-HPPLite v0.1 replays SQL *text*, so a statement must produce the same rows
-wherever it runs. What cannot be reproduced is **refused at the write**
+By default (row capture, below) a replica applies what each write changed,
+so what a statement computed - random values, the clock, application
+functions - does not matter. What is still logged as SQL *text* must produce
+the same rows wherever it runs: schema changes, writes that reach a virtual
+table, and every write with `capture=text` (v0.1's capture). For those, what
+cannot be reproduced is **refused at the write**
 (`SQLITE_INTERRUPT`, a line on stderr, counted in
 `hpplite_status.nondeterministic`) rather than discovered as a root mismatch
 a hundred batches later:
@@ -461,7 +465,7 @@ never refused: they are not logged (#54).
 `tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
 look-alikes it must let through.
 
-**Row capture (`capture=rows`, preview; #19).** Instead of each write's
+**Row capture (the default since v0.2; #19).** Instead of each write's
 text, HPPLite logs what it changed: one record per inserted, updated or
 deleted row, written by TEMP triggers inside the application's transaction.
 A replica applies the records, so `random()`, the clock, `'localtime'`,
@@ -470,7 +474,8 @@ defaults all replay exactly and are no longer refused. Schema changes, and
 writes that reach a virtual table (FTS5, R*Tree - directly, or through the
 sync triggers of the table written), are still logged as statements, under
 the rules above. Batches with records cannot be read by v0.1 (they say so
-and stop). Design and measurements: `doc/design-row-capture.md`.
+and stop); a v0.2 replica reads v0.1 history. `capture=text` keeps v0.1's
+capture. Design and measurements: `doc/design-row-capture.md`.
 
 **The clock is supported.** `CURRENT_TIMESTAMP`, `datetime('now')`,
 `unixepoch()`, `strftime('%f', 'now')` and columns with `DEFAULT

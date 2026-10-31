@@ -41,8 +41,8 @@ INSERT INTO t(v) VALUES('d');
 SQL
 )
     echo "$out" | tr '\n' ' '
-    # the CREATE and the INSERT; with row capture (#19), the CREATE and three rows
-    want=2; [ "${HPPLITE_CAPTURE:-}" = rows ] && want=4
+    # the CREATE and three rows (row capture, #19); with capture=text the CREATE and the INSERT
+    want=4; [ "${HPPLITE_CAPTURE:-}" = text ] && want=2
     echo "$out" | grep -q "^pending=$want\$" || { echo "cli: expected pending=$want"; exit 1; }
     echo "$out" | grep -q '^flush=1$' || { echo "cli: expected flush=1"; exit 1; }
     echo "$out" | grep -q '^height=2,pending=0$' || { echo "cli: expected height 2"; exit 1; }

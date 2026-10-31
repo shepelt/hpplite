@@ -163,10 +163,10 @@ detected.
    entry whose text is base64 of (op, table, record), marked by mode bit 4,
    so pieces (#59) and open transactions (#57) work unchanged and v0.1
    refuses such a batch. Replay applies records with triggers off, under the
-   writer's foreign keys, deferred to the end of the group. `capture=rows`
-   turns it on; every node-level suite also runs with it
-   (`HPPLITE_CAPTURE=rows`, the `_rows` tests), and `test_rows_e2e` covers
-   what only records make possible.
+   writer's foreign keys, deferred to the end of the group. The default
+   since 2026-10-31; `capture=text` keeps statement capture, and
+   every node-level suite runs in both modes (the `_text` tests).
+   `test_rows_e2e` covers what only records make possible.
 4. Validation: all current suites, agent apps, Ghost, WordPress concurrent;
    then SQLite's TCL suite with HPPLite on every connection, Rails 8,
    Home Assistant.

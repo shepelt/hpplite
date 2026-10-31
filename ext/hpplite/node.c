@@ -113,10 +113,10 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
-    node->config.captureRows = config->captureRows;
-    /* the environment turns it on for any node, however its configuration
-    ** was made (every suite can run in either mode) */
-    if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "rows") == 0) node->config.captureRows = 1;
+    node->config.captureText = config->captureText;
+    /* the environment chooses for any node, however its configuration was
+    ** made (every suite runs in both modes) */
+    if (getenv("HPPLITE_CAPTURE")) node->config.captureText = strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0;
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
     ** file's own, node_take_file_lock) */
@@ -258,10 +258,10 @@ static int node_init_tracking(HppliteNode *node) {
     rc = hpplite_init(node->db, &node->ctx);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
-    if (node->config.captureRows) {
+    if (!node->config.captureText) {
         rc = hpplite_rows_enable(node->ctx);
         if (rc != SQLITE_OK) {
-            fprintf(stderr, "hpplite: capture=rows: cannot set up row capture (%s)\n", sqlite3_errmsg(node->db));
+            fprintf(stderr, "hpplite: cannot set up row capture (%s); capture=text captures statements\n", sqlite3_errmsg(node->db));
             return rc;
         }
     }

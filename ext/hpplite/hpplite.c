@@ -3374,7 +3374,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
     nc->determinismWarn = cfg->determinismWarn;
-    nc->captureRows = cfg->captureRows;
+    nc->captureText = cfg->captureText;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
     nc->checkpointInterval = cfg->checkpointInterval;

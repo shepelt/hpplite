@@ -129,7 +129,7 @@ static void check(const char *what) {
     /* one INSERT per row; the CREATE TABLE IF NOT EXISTS of every restart is
     ** kept too (an autocommit no-op stays logged), so it is not counted */
     sqlite3_int64 pending = scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE sql LIKE 'INSERT%'");
-    if (n->config.captureRows)
+    if (!n->config.captureText)
         pending += scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE op = 1 AND tbl = 't'");
     CHECK(onL1 + pending == rows, "%s: INSERTs on L1 (%lld) + pending (%lld) != rows (%lld)",
           what, (long long)onL1, (long long)pending, (long long)rows);

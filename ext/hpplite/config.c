@@ -206,7 +206,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_DETERMINISM);
     if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
     val = getenv(HPPLITE_ENV_CAPTURE);
-    if (val) cfg->captureRows = (strcasecmp(val, "rows") == 0);
+    if (val) cfg->captureText = (strcasecmp(val, "text") == 0);
     val = getenv(HPPLITE_ENV_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = getenv(HPPLITE_ENV_MAX_TX_GAS);
@@ -396,7 +396,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->determinismWarn = (strcasecmp(buf, "warn") == 0);
     }
     if (get_uri_param(uri, HPPLITE_URI_CAPTURE, buf, sizeof(buf))) {
-        cfg->captureRows = (strcasecmp(buf, "rows") == 0);
+        cfg->captureText = (strcasecmp(buf, "text") == 0);
     }
     if (get_uri_param(uri, HPPLITE_URI_MAX_TX, buf, sizeof(buf)) && atol(buf) > 0) {
         cfg->maxTxBytes = (size_t)atol(buf);
@@ -525,7 +525,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DETERMINISM);
     if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CAPTURE);
-    if (val) cfg->captureRows = (strcasecmp(val, "rows") == 0);
+    if (val) cfg->captureText = (strcasecmp(val, "text") == 0);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX_GAS);

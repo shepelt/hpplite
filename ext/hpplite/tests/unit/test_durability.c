@@ -24,8 +24,9 @@ static int tests_run = 0, tests_passed = 0;
 #define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
 #define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
 
-/* Row capture (#19, HPPLITE_CAPTURE=rows): cases about statement capture skip */
-static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return v && strcasecmp(v, "rows") == 0; }
+/* Row capture (#19) is the default; cases about statement capture run with
+** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
+static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
 #define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 

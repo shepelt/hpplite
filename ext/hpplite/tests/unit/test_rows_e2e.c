@@ -60,7 +60,6 @@ static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBa
     config.checkpointInterval = 1000;
     config.maxBatchBytes = maxBatch;
     config.noEncrypt = noEncrypt;
-    config.captureRows = 1;
     node = hpplite_node_create(&config);
     if (node && l1) {
         /* the DA limit is the contract's; the mock stands in for it */
