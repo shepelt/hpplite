@@ -49,8 +49,12 @@ def probe(name, fn):
         print(f"  refused {name}: {msg}")
 
 def _snapshot(c):
+    # sqlite_stat*: the query planner's statistics (ANALYZE, PRAGMA optimize -
+    # Home Assistant runs it after every purge). They change plans, never
+    # results, are not replicated, and the state root leaves them out too.
     objs = c.execute("SELECT type, name, sql FROM sqlite_master "
                      "WHERE name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite\\_autoindex%' ESCAPE '\\' "
+                     "AND name NOT LIKE 'sqlite\\_stat%' ESCAPE '\\' "
                      "ORDER BY type, name").fetchall()
     data = {}
     for t, n, _ in objs:

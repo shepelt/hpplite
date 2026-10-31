@@ -46,3 +46,9 @@ c = sqlite3.connect(uri, uri=True)
 assert c.execute("SELECT height, pending, (SELECT count(*) FROM notes) FROM hpplite_status").fetchone() == (h + 2, 0, 290)
 c.close()
 print("python smoke: ok")
+# a connection left to the interpreter's exit: some Pythons clear its
+# callbacks as they close it then, which is not another component taking
+# them over (smoke.sh fails on the warning; test_loadable covers it in C)
+left = sqlite3.connect(uri, uri=True)
+left.execute("INSERT INTO notes(body, n) VALUES('left open', 0)")
+left.commit()

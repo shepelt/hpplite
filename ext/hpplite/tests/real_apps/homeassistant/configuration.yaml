@@ -1,0 +1,48 @@
+homeassistant:
+  name: HPPLite
+  latitude: 37.5
+  longitude: 127.0
+  elevation: 0
+  unit_system: metric
+  time_zone: Asia/Seoul
+  country: KR
+http:
+  server_port: 8124
+recorder:
+  db_url: !env_var HA_DB_URL
+  commit_interval: 1
+  purge_keep_days: 1
+counter:
+  ticks:
+    initial: 0
+input_number:
+  level:
+    min: 0
+    max: 1000
+    step: 0.1
+input_boolean:
+  lamp:
+template:
+  - sensor:
+      - name: "Doubled"
+        state: "{{ (states('input_number.level') | float(0) * 2) | round(1) }}"
+automation:
+  - alias: tick
+    triggers:
+      - trigger: time_pattern
+        seconds: "/1"
+    actions:
+      - action: counter.increment
+        target: { entity_id: counter.ticks }
+      - action: input_number.set_value
+        target: { entity_id: input_number.level }
+        data:
+          value: "{{ range(0, 10000) | random / 10 }}"
+      - action: input_boolean.toggle
+        target: { entity_id: input_boolean.lamp }
+      - if:
+          - condition: template
+            value_template: "{{ states('counter.ticks') | int(0) % 60 == 0 }}"
+        then:
+          - action: recorder.purge
+            data: { keep_days: 0, repack: true }

@@ -1720,7 +1720,7 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) {
   return SQLITE_OK;
 }
 
-void hpplite_rearm_hooks(HppliteCtx *pCtx) {
+static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   void *prevCommit, *prevRollback;
   int lost = 0;
   if (!pCtx || pCtx->bDbClosed) return;
@@ -1728,6 +1728,10 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx) {
   prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
   prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
   if (prevCommit != pCtx || prevRollback != pCtx) lost = 1;
+  /* A driver clearing the connection's callbacks as it closes it (Python's
+  ** sqlite3 does) is not another component taking them over: nothing runs
+  ** after it */
+  if (bClosing && (prevCommit == pCtx || !prevCommit) && (prevRollback == pCtx || !prevRollback)) lost = 0;
   /* the trace API returns no previous value: re-arm it unconditionally and
   ** rely on the commit hook as the canary (a library that replaces one
   ** usually replaces the others; the data_version check in #37 covers the rest) */
@@ -1741,6 +1745,7 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx) {
     }
   }
 }
+void hpplite_rearm_hooks(HppliteCtx *pCtx) { rearmHooks(pCtx, 0); }
 
 /*
 ** Finalize the statements HPPLite keeps prepared on the application
@@ -3324,7 +3329,7 @@ static void hpplite_on_close(sqlite3 *db) {
 
     /* Our own prepared statements would make the close fail; the trace
     ** callback re-prepares them if the connection lives on */
-    if (node->ctx) { hpplite_rearm_hooks(node->ctx); finalizeOwnStatements(node->ctx); }
+    if (node->ctx) { rearmHooks(node->ctx, 1); finalizeOwnStatements(node->ctx); }
 
     /* SQLite disconnects virtual tables before it checks for unfinalized
     ** statements. If the application still has one, this close is about to

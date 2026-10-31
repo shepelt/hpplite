@@ -107,12 +107,36 @@ static void test_load_and_use(void) {
     sqlite3_close(db);
     PASS();
 
+    TEST("a driver clearing the connection's hooks as it closes it is not a takeover (Python at exit)");
+    {
+        char path[] = "/tmp/hpplite_test_loadable_err.XXXXXX";
+        int fd = mkstemp(path), saved = dup(2), found;
+        char buf[4096] = "";
+        FILE *f;
+        rc = sqlite3_open_v2(DB_URI, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+        if (rc != SQLITE_OK || fd < 0) FAIL("open");
+        sqlite3_exec(db, "INSERT INTO t VALUES(5,'e')", NULL, NULL, NULL);
+        fflush(stderr); dup2(fd, 2);
+        sqlite3_commit_hook(db, NULL, NULL);          /* what the driver does as it closes */
+        sqlite3_rollback_hook(db, NULL, NULL);
+        sqlite3_trace_v2(db, 0, NULL, NULL);
+        rc = sqlite3_close(db);
+        fflush(stderr); dup2(saved, 2); close(saved);
+        f = fopen(path, "r");
+        if (f) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
+        unlink(path); close(fd);
+        found = strstr(buf, "replaced the connection") != NULL;
+        if (rc != SQLITE_OK) FAIL("close");
+        if (found) { printf("(%s) ", buf); FAIL("reported as another component's takeover"); }
+    }
+    PASS();
+
     TEST("a plain connection (no hpplite=on) is untouched");
     rc = sqlite3_open("/tmp/hpplite_test_loadable.db", &db);
     if (rc != SQLITE_OK) FAIL("plain open");
     scalar(db, "SELECT height FROM hpplite_status", &ok);
     if (ok) FAIL("hpplite_status should not exist on a plain connection");
-    if (scalar(db, "SELECT count(*) FROM t", &ok) != 4) FAIL("plain read");
+    if (scalar(db, "SELECT count(*) FROM t", &ok) != 5) FAIL("plain read");
     sqlite3_close(db);
     PASS();
 }

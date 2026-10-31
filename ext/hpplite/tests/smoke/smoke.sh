@@ -16,7 +16,9 @@ ran=0
 for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
     command -v "$py" >/dev/null 2>&1 || continue
     "$py" -c 'import sqlite3; sqlite3.connect(":memory:").enable_load_extension(True)' >/dev/null 2>&1 || continue
-    "$py" "$here/smoke_py.py" "$ext" "$dir"
+    "$py" "$here/smoke_py.py" "$ext" "$dir" 2> "$dir/py.err" || { cat "$dir/py.err"; exit 1; }
+    # Python clears a connection's callbacks as it closes it: not a takeover
+    if grep -q "replaced the connection" "$dir/py.err"; then cat "$dir/py.err"; echo "python: false hooks_replaced at close"; exit 1; fi
     ran=1
     break
 done
